@@ -1,28 +1,66 @@
-# 🚀 Browser extension to display striff diagrams on GitHub
+# Striffs GitHub Extension
 
-## Getting Started
+A cross-browser GitHub extension that adds a **"Striffs"** tab to pull request pages. This tab displays architectural diffs as interactive SVG diagrams, making code review more transparent and insightful.
 
-1. Install extension from chrome webstore, if you haven't.
-2. Go to https://github.com/settings/tokens to generate your personal access token.
+---
 
-- Check `repo` scope to enable this extension on private repo.
+## ✨ Features
+- Detects GitHub PR pages automatically
+- Adds a new `Striffs` tab next to "Conversation", "Commits", and "Files changed"
+- Displays zoomable, pannable SVG diagrams
+- Supports GitHub tokens for private repo access
 
-3. Click on the Github striff extension (this extension)'s icon aside the address bar.
-4. Paste your access token there in the prompt box.
+---
 
-## Temporarily override then token
+## 🧰 Setup
 
-You can set `x-github-token` in `localStorage` to your access token, and the extension will use this value even if you've previously set token.
+1. **Install the extension in development mode:**
+   - Chrome: `chrome://extensions` → Enable dev mode → "Load unpacked"
+   - Firefox: `about:debugging` → "Load Temporary Add-on"
+   - Edge: `edge://extensions` → Enable dev mode → "Load unpacked"
+   - Safari: Use Xcode with `safari-web-extension-converter`
 
-    localStorage.setItem('x-github-token', '<token>')
+2. **Configure GitHub Token:**
+   - Go to extension options (`chrome://extensions > Striffs > Details > Options`)
+   - Paste your GitHub token to allow access to private repos
+---
 
-and then remove it to use previously set token;
+## 📦 Folder Structure
 
-    localStorage.removeItem('x-github-token')
+```
+StriffsExtension/
+├── manifest.json
+├── background.js
+├── content-script.js
+├── options.html
+├── popup.html
+├── panzoom.min.js
+└── README.md
+```
 
-## Development
+---
 
-1. Clone this repo
-2. Go to chrome extensions [chrome://extensions](chrome://extensions)
-3. Enable developer mode
-4. Click on load unpacked extension and select this cloned repo
+## 🔒 Permissions
+| Permission        | Reason                                       |
+|------------------|----------------------------------------------|
+| `storage`        | Store GitHub token                           |
+| `tabs`           | Interact with GitHub PR tabs                 |
+| `webRequest`     | (Required by some extensions for zip fetch)  |
+| `webNavigation`  | Detect tab and history changes               |
+| `host_permissions` | GitHub domains + `codeload.github.com`     |
+
+---
+
+## 🛠 Future Improvements
+- Diagram grouping by language
+- SVG download/export button
+- Retry/backoff logic for failed requests
+
+---
+
+## 📬 Feedback
+Submit suggestions or bugs at [striff.io](https://striff.io)
+
+---
+
+© 2025 Hadii Technologies — All rights reserved.

@@ -1,34 +1,33 @@
 {
-  "name": "Striff Report Browser Extension",
-  "version": "1.0.0",
-  "manifest_version": 2,
-  "description": "Automatically generates striffs for GitHub pull requests.",
-  "homepage_url": "https://github.com/clarity-org/structure-diff-chrome-app",
-  "author": "HADII Technology",
-  "icons": {
-    "16": "icons/clarity-bot16.png",
-    "48": "icons/clarity-bot48.png",
-    "128": "icons/clarity-bot128.png"
-  },
-  "permissions": ["storage", "tabs", "activeTab"],
+  "manifest_version": 3,
+  "name": "Striffs for GitHub",
+  "description": "Adds an architectural diff tab to GitHub pull requests.",
+  "version": "1.0",
+  "permissions": ["storage", "tabs", "scripting", "webRequest", "webNavigation"],
+  "host_permissions": ["*://*.github.com/*", "https://codeload.github.com/*"],
   "background": {
-    "scripts": ["src/background.js"]
+    "service_worker": "background.js"
   },
   "content_scripts": [
     {
-      "matches": ["*://github.com/*"],
-      "js": ["src/inject.js"],
-      "css": ["css/style.css"],
-      "run_at": "document_end"
+      "matches": ["*://*.github.com/*/pull/*"],
+      "js": ["content-script.js"],
+      "run_at": "document_idle"
     }
   ],
-  "web_accessible_resources": ["icons/clarity-bot.svg", "templates/*"],
-  "browser_action": {
+  "web_accessible_resources": [
+    {
+      "resources": ["panzoom.min.js"],
+      "matches": ["<all_urls>"]
+    }
+  ],
+  "options_page": "options.html",
+  "action": {
+    "default_popup": "popup.html",
     "default_icon": {
       "16": "icons/clarity-bot16.png",
       "48": "icons/clarity-bot48.png",
       "128": "icons/clarity-bot128.png"
-    },
-    "default_title": "Striff-bot browser extension: Click to set/remove access token"
+    }
   }
 }
