@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Striffs</title>
+  <style>
+    body { font-family: sans-serif; padding: 10px; width: 220px; }
+    button { margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <h3>Striffs Extension</h3>
+  <p id="status">Checking token...</p>
+  <button onclick="openOptions()">Open Settings</button>
+
+  <script>
+    chrome.storage.sync.get(["ghToken"], function (result) {
+      document.getElementById("status").textContent = result.ghToken
+        ? "✅ Token set"
+        : "⚠️ No token set";
+    });
+
+    function openOptions() {
+      if (chrome.runtime.openOptionsPage) {
+        chrome.runtime.openOptionsPage();
+      } else {
+        window.open(chrome.runtime.getURL("options.html"));
+      }
+    }
+  </script>
+</body>
+</html>
