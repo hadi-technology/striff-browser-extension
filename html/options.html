@@ -1,33 +1,71 @@
-<!-- File: options.html -->
 <!DOCTYPE html>
 <html>
 <head>
+  <meta charset="utf-8" />
   <title>Striffs Extension Settings</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, sans-serif; padding: 16px; max-width: 760px; }
+    h1 { margin: 0 0 12px; display:flex; align-items:center; gap:10px; }
+    .badge {
+      display:inline-flex; align-items:center; gap:6px;
+      font-size:12px; line-height:1; padding:6px 8px; border-radius: 999px;
+      border:1px solid #d0d7de; background:#f6f8fa; color:#24292f;
+    }
+    .badge.ok { border-color:#1a7f37; color:#1a7f37; background: #eef7f0; }
+    .badge.none { border-color:#d0d7de; color:#57606a; background:#f6f8fa; }
+
+    .req { background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 8px; padding: 12px; margin: 12px 0; }
+    .req b { white-space: nowrap; }
+    label { display:block; margin: 10px 0 6px; font-weight: 600; }
+    #row { display:flex; gap:8px; align-items:center; flex-wrap: wrap; }
+    #ghToken { flex: 1; min-width: 360px; padding: 8px; }
+    button { padding: 8px 12px; cursor: pointer; }
+    #status { margin-top:12px; min-height: 1.2em; }
+    .note { color:#57606a; font-size: 13px; margin-top: 6px; }
+    a { color:#0969da; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .section { margin-top: 18px; padding-top: 12px; border-top: 1px solid #eaeef2; }
+    .muted { color:#57606a; font-size: 13px; }
+    .danger { color:#d1242f; }
+  </style>
 </head>
 <body>
-  <h1>Striffs Settings</h1>
+  <h1>
+    Striffs Settings
+    <span id="tokenBadge" class="badge none" title="Shows whether a token is currently saved">No token saved</span>
+  </h1>
 
-  <label for="ghToken">GitHub Token:</label><br />
-  <input type="text" id="ghToken" placeholder="ghp_..." style="width: 400px;" />
-  <button id="save">Save</button>
+  <div class="req">
+    <div><b>Token requirements (read-only):</b></div>
+    <ul>
+      <li><b>Contents</b>: Read-only</li>
+      <li><b>Pull requests</b>: Read-only</li>
+      <li><b>Repository access</b>: <b>All repositories</b></li>
+    </ul>
+    <div class="note">
+      Create a token with these settings
+      <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noreferrer noopener">here</a>
+      (must be logged in).
+    </div>
+  </div>
 
-  <p id="status" style="margin-top:10px; color:green;"></p>
+  <label for="ghToken">GitHub Token</label>
+  <div id="row">
+    <input type="password" id="ghToken" placeholder="Paste token here..." autocomplete="off" />
+    <button id="save"  type="button">Save</button>
+    <button id="clear" type="button" title="Clear from storage and memory">Clear token</button>
+  </div>
 
-  <script>
-    // Load stored token
-    chrome.storage.sync.get(["ghToken"], (result) => {
-      if (result.ghToken) {
-        document.getElementById("ghToken").value = result.ghToken;
-      }
-    });
+  <div class="section">
+    <b>Cache</b>
+    <div class="muted">Clear all saved diagrams and Striffs cache/state. <span class="danger">This does not remove your token.</span></div>
+    <div style="margin-top:8px">
+      <button id="clearCache" type="button" title="Clear Striffs caches across open GitHub tabs">Clear cache</button>
+    </div>
+  </div>
 
-    // Save new token
-    document.getElementById("save").onclick = () => {
-      const token = document.getElementById("ghToken").value.trim();
-      chrome.storage.sync.set({ ghToken: token }, () => {
-        document.getElementById("status").textContent = "Token saved!";
-      });
-    };
-  </script>
+  <p id="status" aria-live="polite"></p>
+
+  <script src="options.js" defer></script>
 </body>
 </html>

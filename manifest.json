@@ -4,24 +4,20 @@
   "description": "Adds an architectural diff tab to GitHub pull requests.",
   "version": "1.0",
   "permissions": ["storage", "tabs", "scripting", "webRequest", "webNavigation", "downloads"],
-  "host_permissions": ["*://*.github.com/*", "https://codeload.github.com/*", "*://localhost:8081/*"],
+  "host_permissions": ["*://*.github.com/*", "https://codeload.github.com/*"],
   "background": {
     "service_worker": "src/background.js"
   },
   "content_scripts": [
     {
       "matches": [
-        "*://*.github.com/*/*/pull/*/files",
-        "*://*.github.com/*/*/pull/*/files*"
+        "*://github.com/*",
+        "*://*.github.com/*"
       ],
       "js": [
         "lib/fflate.min.js",
         "lib/panzoom.min.js",
-        "src/striffs-core.js",
-        "src/striffs-dom-ui.js",
-        "src/striffs-pr.js",
-        "src/striffs-render-cache.js",
-        "src/striffs-events-boot.js"
+        "src/striffs.js"
       ],
       "run_at": "document_idle"
     }

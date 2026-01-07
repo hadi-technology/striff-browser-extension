@@ -1,31 +1,24 @@
 <!DOCTYPE html>
 <html>
 <head>
+  <meta charset="utf-8" />
   <title>Striffs</title>
   <style>
-    body { font-family: sans-serif; padding: 10px; width: 220px; }
-    button { margin-top: 10px; }
+    body { font-family: system-ui, sans-serif; padding: 12px; width: 240px; }
+    h3 { margin: 0 0 8px; font-size: 16px; }
+    #status { margin: 6px 0 10px; }
+    button { margin-top: 6px; padding: 6px 10px; cursor: pointer; }
+    small { color: #666; display: block; margin-top: 8px; }
   </style>
 </head>
 <body>
   <h3>Striffs Extension</h3>
-  <p id="status">Checking token...</p>
-  <button onclick="openOptions()">Open Settings</button>
+  <p id="status" aria-live="polite">Checking token...</p>
+  <button id="openOptionsBtn" type="button">Open Settings</button>
+  <button id="resetCacheBtn" type="button">Reset Striffs Cache</button>
+  <small>Tip: set your GitHub token in Settings.</small>
 
-  <script>
-    chrome.storage.sync.get(["ghToken"], function (result) {
-      document.getElementById("status").textContent = result.ghToken
-        ? "✅ Token set"
-        : "⚠️ No token set";
-    });
-
-    function openOptions() {
-      if (chrome.runtime.openOptionsPage) {
-        chrome.runtime.openOptionsPage();
-      } else {
-        window.open(chrome.runtime.getURL("options.html"));
-      }
-    }
-  </script>
+  <!-- MV3: no inline scripts; use external file -->
+  <script src="popup.js" defer></script>
 </body>
 </html>
