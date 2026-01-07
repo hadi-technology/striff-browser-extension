@@ -25,6 +25,54 @@
   S.__lastFetchedUpdatedAt = null;
   S.__styleInjected = false;
 
+  // ---------- GitHub DOM selectors (centralized for drift resilience) ----------
+  const SELECTORS = S.SELECTORS = S.SELECTORS || Object.freeze({
+    toolbar: [
+      '.pr-toolbar[data-target="diff-layout.diffToolbar"]',
+      '.js-pr-toolbar',
+      '[data-testid="pr-toolbar"]',
+      'div[role="toolbar"][data-view-component="true"]',
+      'div[aria-label="Pull request toolbar"]',
+    ],
+    filesNode: [
+      '#files',
+      'div[data-testid="files-changed"]',
+      'div[data-view-component="true"][data-testid="pull-requests-files"]',
+      'main[aria-label="Content"] #files',
+      'div[data-hpc] #files',
+      '#pr-file-tree',
+      'div[class*="Diff-module__diff"]',
+      '.js-diff-progressive-container',
+      '[data-testid="file-diff-split"]',
+      '[data-testid="file-diff-unified"]',
+      'div.js-file[data-file-type="file"]'
+    ],
+    filesRoot: [
+      'div[data-view-component="true"][data-testid="pull-requests-files"]',
+      'div[data-testid="files-changed"]',
+      'div[data-target="diff-layout.sidebarContainer"]',
+      'div.diff-sidebar[data-view-component="true"]',
+      'file-tree'
+    ],
+    diffContainers: [
+      '[data-testid="file-diff-split"]',
+      '[data-testid="file-diff-unified"]',
+      'div[class*="Diff-module__diff"]',
+      '.js-diff-progressive-container',
+      'div.js-file[data-file-type="file"]'
+    ],
+    newUiDiff: 'div[class*="Diff-module__diff"], .js-diff-progressive-container, div.js-file[data-file-type="file"]',
+    fileLinks: [
+      ".file-info a.Link--primary",
+      '[data-testid="file-header"] a.Link--primary',
+      'a[data-testid="file-name"], a[data-hovercard-type="file"]'
+    ],
+    fileTreeItems: [
+      "[data-testid='file-tree'] li [data-testid='file-tree-item-text']",
+      "[data-testid='file-tree'] li a.ActionListContent"
+    ]
+  });
+
   // ---------- Logging ----------
   S.clog = (...a) => { try { console.log('[Striffs]', ...a); } catch { } };
   S.cinfo = (...a) => { try { console.info('[Striffs]', ...a); } catch { } };
@@ -307,6 +355,7 @@
 // Striffs — DOM & UI
 (() => {
     const S = (window.Striffs = window.Striffs || {});
+    const SELECTORS = S.SELECTORS || {};
     const { cwarn } = S;
 
     S.__lastStriffsButtonState = S.__lastStriffsButtonState || null;
@@ -336,15 +385,8 @@
 
     const isToolbarNode = (node) => {
         if (!(node instanceof Element)) return false;
-        const selectors = [
-            '.pr-toolbar[data-target="diff-layout.diffToolbar"]',
-            '.js-pr-toolbar',
-            '[data-testid="pr-toolbar"]',
-            'div[role="toolbar"][data-view-component="true"]',
-            'div[aria-label="Pull request toolbar"]'
-        ];
-        if (node.matches?.(selectors.join(','))) return true;
-        if (selectors.some(sel => node.querySelector?.(sel))) return true;
+        if (node.matches?.(SELECTORS.toolbar.join(','))) return true;
+        if (SELECTORS.toolbar.some(sel => node.querySelector?.(sel))) return true;
 
         const section = node.matches?.('section') ? node : node.querySelector?.('section');
         if (section) {
@@ -383,21 +425,8 @@
 
     const isFilesNode = (node) => {
         if (!(node instanceof Element)) return false;
-        const selectors = [
-            '#files',
-            'div[data-testid="files-changed"]',
-            'div[data-view-component="true"][data-testid="pull-requests-files"]',
-            'main[aria-label="Content"] #files',
-            'div[data-hpc] #files',
-            '#pr-file-tree',
-            'div[class*="Diff-module__diff"]',
-            '.js-diff-progressive-container',
-            '[data-testid="file-diff-split"]',
-            '[data-testid="file-diff-unified"]',
-            'div.js-file[data-file-type="file"]'
-        ];
-        if (node.matches?.(selectors.join(','))) return true;
-        return selectors.some(sel => node.querySelector?.(sel));
+        if (node.matches?.(SELECTORS.filesNode.join(','))) return true;
+        return SELECTORS.filesNode.some(sel => node.querySelector?.(sel));
     };
 
     const scheduleFilesCheck = () => {
@@ -566,31 +595,16 @@
 
     S.waitForFilesRoot = async (maxMs = 15000) => {
         const start = Date.now();
-        const candidates = [
-            'div[data-view-component="true"][data-testid="pull-requests-files"]',
-            'div[data-testid="files-changed"]',
-            'div[data-target="diff-layout.sidebarContainer"]',
-            'div.diff-sidebar[data-view-component="true"]',
-            'file-tree'
-        ];
         while (Date.now() - start < maxMs) {
-            const el = S.$$first(candidates);
+            const el = S.$$first(SELECTORS.filesRoot);
             if (el) return el;
             await S.sleep(250);
         }
-        return S.$$first(candidates);
+        return S.$$first(SELECTORS.filesRoot);
     };
 
     // ---------- Toolbar discovery ----------
     S.getMainToolbar = () => {
-        const selectors = [
-            '[data-testid="pr-toolbar"]',
-            'div[aria-label="Pull request toolbar"]',
-            'div[role="toolbar"][data-view-component="true"]',
-            '.pr-toolbar[data-target="diff-layout.diffToolbar"]',
-            '.js-pr-toolbar',
-        ];
-
         const seen = new Set();
         const matches = [];
         const push = (el) => {
@@ -599,7 +613,7 @@
             matches.push(el);
         };
 
-        selectors.forEach(sel => {
+        SELECTORS.toolbar.forEach(sel => {
             document.querySelectorAll(sel).forEach(push);
         });
 
@@ -1047,14 +1061,8 @@
         return striffView;
     };
 
-    const DIFF_CONTAINERS_SELECTORS = [
-        '[data-testid="file-diff-split"]',
-        '[data-testid="file-diff-unified"]',
-        'div[class*="Diff-module__diff"]',
-        '.js-diff-progressive-container',
-        'div.js-file[data-file-type="file"]'
-    ];
-    const NEW_UI_DIFF_SELECTOR = 'div[class*="Diff-module__diff"], .js-diff-progressive-container, div.js-file[data-file-type="file"]';
+    const DIFF_CONTAINERS_SELECTORS = SELECTORS.diffContainers;
+    const NEW_UI_DIFF_SELECTOR = SELECTORS.newUiDiff;
 
     S.hideAllDiffs = () => {
         const newDiffs = Array.from(document.querySelectorAll(NEW_UI_DIFF_SELECTOR));
@@ -1153,6 +1161,7 @@
 // Striffs — PR helpers & mapping
 (() => {
   const S = (window.Striffs = window.Striffs || {});
+  const SELECTORS = S.SELECTORS || {};
   const { cwarn } = S;
 
   const getCachedUpdatedAtFor = (owner, repo, pull_number) => {
@@ -1234,12 +1243,8 @@
   };
 
   // ---------- Files in PR ----------
-  S.getFilesInPR = () => {
-    const els = S.$$all([
-      ".file-info a.Link--primary",
-      '[data-testid="file-header"] a.Link--primary',
-      'a[data-testid="file-name"], a[data-hovercard-type="file"]'
-    ]);
+    S.getFilesInPR = () => {
+        const els = S.$$all(SELECTORS.fileLinks);
     const titles = els
       .map(el => el.getAttribute("title") || el.textContent || "")
       .map(t => S.stripRenamePath(t).trim())
@@ -1337,15 +1342,12 @@
     return false;
   };
 
-  S.getFilterFilesFromNav = () => {
-    const paths = new Set();
-    const strip = (txt) => S.stripRenamePath(txt || "");
+    S.getFilterFilesFromNav = () => {
+        const paths = new Set();
+        const strip = (txt) => S.stripRenamePath(txt || "");
 
-    // File tree entries (modern)
-    const treeItems = S.$$all([
-      "[data-testid='file-tree'] li [data-testid='file-tree-item-text']",
-      "[data-testid='file-tree'] li a.ActionListContent",
-    ]);
+        // File tree entries (modern)
+        const treeItems = S.$$all(SELECTORS.fileTreeItems);
     treeItems.forEach(span => {
       if (isDirectoryNode(span)) return;
       const txt = strip(span?.textContent)?.trim();
@@ -1355,11 +1357,7 @@
     });
 
     // Diff headers (works even if the tree isn't rendered yet)
-    const headerLinks = S.$$all([
-      "[data-testid='file-header'] a.Link--primary",
-      "a[data-testid='file-name']",
-      "a[data-hovercard-type='file']"
-    ]);
+        const headerLinks = S.$$all(SELECTORS.fileLinks);
     headerLinks.forEach(el => {
       const txt = strip(el.getAttribute("title") || el.textContent || "").trim();
       if (!txt) return;
@@ -1378,12 +1376,10 @@
     return Array.from(paths);
   };
 
-  S.buildFilePathToDiffIdMapAsync = () => {
-    Promise.resolve().then(() => {
-      const map = new Map();
-      const items = S.$$all([
-        "[data-testid='file-tree'] li",
-      ]);
+    S.buildFilePathToDiffIdMapAsync = () => {
+        Promise.resolve().then(() => {
+            const map = new Map();
+            const items = S.$$all(["[data-testid='file-tree'] li"]);
       for (const li of items) {
         const span = li.querySelector("[data-testid='file-tree-item-text']");
         const a = li.querySelector("a.ActionListContent, a[href^='#diff-'], a[href*='#diff-']");
@@ -2069,8 +2065,6 @@
   const toolbar = await S.waitForToolbar?.();
   if (toolbar) S.mountMainBarButtons?.();
 
-  S.setDefaultButtonIfIdle();
-
   await S.ensureSupportedExtensionsReady?.();
 
   const filesRoot = await S.waitForFilesRoot();
@@ -2081,6 +2075,7 @@
   S.buildFilePathToDiffIdMapAsync?.();
   S.primeDiagramFromCache();
 
+  S.setDefaultButtonIfIdle();
   S.setActiveButtons("diffs");
   S.showDiffView();
   S.saveActiveTab("diffs");
@@ -2106,7 +2101,6 @@
       S.addSpinAnimation?.();
       await S.waitForToolbar?.();
       S.mountMainBarButtons?.();
-      S.setDefaultButtonIfIdle?.();
       await S.ensureSupportedExtensionsReady?.();
 
       const filesRoot = await S.waitForFilesRoot?.();
@@ -2115,6 +2109,7 @@
       S.buildFilePathToDiffIdMapAsync?.();
 
       S.primeDiagramFromCache?.();
+      S.setDefaultButtonIfIdle?.();
       S.setActiveButtons?.("diffs");
       S.showDiffView?.();
       S.saveActiveTab?.("diffs");

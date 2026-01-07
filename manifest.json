@@ -17,6 +17,7 @@
       "js": [
         "lib/fflate.min.js",
         "lib/panzoom.min.js",
+        "src/webext-shim.js",
         "src/striffs.js"
       ],
       "run_at": "document_idle"

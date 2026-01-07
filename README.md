@@ -63,4 +63,4 @@ Submit suggestions or bugs at [striff.io](https://striff.io)
 
 ---
 
-© 2025 Hadii Technologies — All rights reserved.
+© 2026 Hadii Technologies — All rights reserved.

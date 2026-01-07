@@ -1,3 +1,6 @@
+// Ensure chrome-style callbacks exist when only browser.* is available (Firefox/Safari).
+try { importScripts('./webext-shim.js'); } catch (_) {}
+
 // background.js (MV3 service worker) — robust onMessage router + timeouts
 
 // ------------------------------------------------------------
@@ -138,6 +141,236 @@ chrome.storage.onChanged.addListener((changes, area) => {
 // ------------------------------------------------------------
 // Message Router (always safeReply + return true for async)
 // ------------------------------------------------------------
+const handlers = {
+  ping: (msg, { safeReply }) => {
+    safeReply({ ok: true, pong: true, ts: Date.now() });
+  },
+  keepAlive: (msg, { safeReply }) => {
+    setTimeout(() => safeReply({ ok: true, msg: 'kept alive' }), 2500);
+  },
+  getLanguages: async (msg, { safeReply }) => {
+    const candidates = [
+      'http://localhost:8080/api/v1/languages',
+    ];
+
+    for (const u of candidates) {
+      const r = await fetchText(u, { timeoutMs: 8000 });
+      if (r.ok) {
+        log('getLanguages OK from', u);
+        safeReply({ ok: true, body: r.text });
+        return;
+      }
+      warn('getLanguages failed', u, r.error || r.status);
+    }
+
+    // Fallback quick answer to verify message path even if API is down
+    safeReply({
+      ok: true,
+      body: 'java, go, javascript, typescript, python, csharp, cpp, ruby, rust, php, kotlin'
+    });
+  },
+  getToken: async (msg, { safeReply }) => {
+    try {
+      if (tokenCache !== null) {
+        safeReply({ ok: true, token: tokenCache });
+        return;
+      }
+      const t = await readTokenFromStorage();
+      tokenCache = t;
+      safeReply({ ok: true, token: t });
+    } catch (e) {
+      safeReply({ ok: false, error: String(e?.message || e) });
+    }
+  },
+  forgetToken: async (msg, { safeReply }) => {
+    try {
+      tokenCache = null;
+      await clearTokenFromStorage();
+      safeReply({ ok: true });
+    } catch (e) {
+      safeReply({ ok: false, error: String(e?.message || e) });
+    }
+  },
+  fetchStriffsWithToken: async (msg, { safeReply }) => {
+    const { owner, repo, pull_number, updated_at, token } = msg;
+    if (!owner || !repo || !pull_number || !token) {
+      safeReply({ ok: false, error: 'missing args (owner/repo/pull_number/token)' });
+      return;
+    }
+    const apiBase = await getApiBase();
+    log('fetchStriffsWithToken using base', apiBase);
+    const url = `${apiBase}/api/v1/github/striffs/owners/${owner}/repos/${repo}/pulls/${pull_number}?updated_at=${encodeURIComponent(updated_at || '')}`;
+
+    const t = abortableTimeout(180000);
+    const started = Date.now();
+    let lastStatus = null;
+    try {
+      const res = await fetch(url, { headers: { Authorization: `token ${token}` }, signal: t.signal, cache: 'no-cache' });
+      lastStatus = res.status;
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        log('fetchStriffsWithToken timings', {
+          owner, repo, pull_number,
+          durationMs: Date.now() - started,
+          status: res.status,
+          ok: false
+        });
+        safeReply({ ok: false, error: `API request failed: ${res.status}`, detail: text });
+        return;
+      }
+      const json = await res.json();
+      log('fetchStriffsWithToken timings', {
+        owner, repo, pull_number,
+        durationMs: Date.now() - started,
+        status: res.status,
+        ok: true
+      });
+      safeReply({ ok: true, json, timings: { type: 'token', durationMs: Date.now() - started, status: res.status } });
+    } catch (e) {
+      log('fetchStriffsWithToken error', { durationMs: Date.now() - started, status: lastStatus, error: String(e?.message || e) });
+      safeReply({ ok: false, error: String(e?.message || e) });
+    } finally {
+      t.cancel();
+    }
+  },
+  generateStriffs: async (msg, { safeReply }) => {
+    const {
+      baseOwner, baseRepo, baseBranch,
+      headOwner, headRepo, headBranch,
+      filterFiles = []
+    } = msg;
+
+    if (!baseOwner || !baseRepo || !baseBranch || !headOwner || !headRepo || !headBranch) {
+      safeReply({ ok: false, error: 'missing repo/ref args' });
+      return;
+    }
+
+    log('generateStriffs start', {
+      baseOwner, baseRepo, baseBranch, headOwner, headRepo, headBranch,
+      filterFilesCount: filterFiles.length,
+      filterFilesPreview: Array.isArray(filterFiles) ? filterFiles.slice(0, 30) : []
+    });
+
+    const overallStart = Date.now();
+    const downloadStart = Date.now();
+    const beforePromise = (async () => {
+      const s = Date.now();
+      const r = await downloadRepoZipAsArrayBuffer(baseOwner, baseRepo, baseBranch);
+      return { ...r, durationMs: Date.now() - s };
+    })();
+    const afterPromise = (async () => {
+      const s = Date.now();
+      const r = await downloadRepoZipAsArrayBuffer(headOwner, headRepo, headBranch);
+      return { ...r, durationMs: Date.now() - s };
+    })();
+
+    const [before, after] = await Promise.all([beforePromise, afterPromise]);
+    const downloadDurationMs = Date.now() - downloadStart;
+
+    if (!before.ok || !after.ok) {
+      log('generateStriffs download error', {
+        baseOk: before.ok, headOk: after.ok,
+        baseDurationMs: before.durationMs, headDurationMs: after.durationMs,
+        totalDownloadMs: downloadDurationMs,
+        baseError: before.error, headError: after.error
+      });
+      if (!before.ok) { safeReply({ ok: false, error: `Failed downloading base zip: ${before.error}` }); return; }
+      if (!after.ok)  { safeReply({ ok: false, error: `Failed downloading head zip: ${after.error}` }); return; }
+    }
+
+    log('generateStriffs download timings', {
+      baseDownloadMs: before.durationMs,
+      headDownloadMs: after.durationMs,
+      totalDownloadMs: downloadDurationMs,
+      filterFilesCount: filterFiles.length
+    });
+
+    const postStart = Date.now();
+    const apiBase = await getApiBase();
+    log('generateStriffs using base', apiBase);
+    const posted = await postZipsToLocal(
+      `${apiBase}/api/v1/github/striffs`,
+      before.arrayBuffer,
+      after.arrayBuffer,
+      filterFiles,
+      { timeoutMs: 180000 }
+    );
+    const postDurationMs = Date.now() - postStart;
+    const totalDurationMs = Date.now() - overallStart;
+
+    log('generateStriffs timings', {
+      baseDownloadMs: before.durationMs,
+      headDownloadMs: after.durationMs,
+      totalDownloadMs: downloadDurationMs,
+      postDurationMs,
+      totalMs: totalDurationMs,
+      filterFilesCount: filterFiles.length,
+      ok: posted.ok === true
+    });
+
+    if (!posted.ok) { safeReply({ ok: false, error: posted.error, timings: { baseDownloadMs: before.durationMs, headDownloadMs: after.durationMs, totalDownloadMs: downloadDurationMs, postDurationMs, totalMs: totalDurationMs, filterFilesCount: filterFiles.length } }); return; }
+    safeReply({
+      ok: true,
+      json: posted.json,
+      timings: {
+        type: 'generate',
+        baseDownloadMs: before.durationMs,
+        headDownloadMs: after.durationMs,
+        totalDownloadMs: downloadDurationMs,
+        postDurationMs,
+        totalMs: totalDurationMs,
+        filterFilesCount: filterFiles.length
+      }
+    });
+  },
+  downloadZip: async (msg, { safeReply }) => {
+    const { url } = msg || {};
+    if (!url) { safeReply({ success: false, error: 'missing url' }); return; }
+    try {
+      const r = await fetch(url, { cache: 'no-cache' });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const ab = await r.arrayBuffer();
+      safeReply({ success: true, buffer: Array.from(new Uint8Array(ab)) });
+    } catch (e) {
+      safeReply({ success: false, error: String(e?.message || e) });
+    }
+  },
+  proxyFetch: async (msg, { safeReply }) => {
+    // ADDED: returnHeaders support to surface OAuth scopes from GitHub responses
+    const { url, method = 'GET', headers = {}, bodyType = 'text', body, timeoutMs = 20000, returnHeaders = false } = msg;
+    if (!url) { safeReply({ ok: false, error: 'missing url' }); return; }
+
+    const t = abortableTimeout(timeoutMs);
+    try {
+      const init = { method, headers, signal: t.signal, cache: 'no-cache' };
+      if (method !== 'GET' && body != null) init.body = body;
+      const res = await fetch(url, init);
+      const status = res.status;
+
+      let hdrs = undefined;
+      if (returnHeaders) {
+        const wanted = ['x-oauth-scopes','x-accepted-oauth-scopes','x-ratelimit-remaining','x-ratelimit-reset'];
+        hdrs = {};
+        for (const [k, v] of res.headers.entries()) {
+          if (wanted.includes(k.toLowerCase())) hdrs[k] = v;
+        }
+      }
+
+      if (bodyType === 'json') {
+        const json = await res.json().catch(() => null);
+        safeReply({ ok: res.ok, status, json, headers: hdrs });
+      } else {
+        const text = await res.text().catch(() => '');
+        safeReply({ ok: res.ok, status, text, headers: hdrs });
+      }
+    } catch (e) {
+      safeReply({ ok: false, error: String(e?.message || e) });
+    } finally {
+      t.cancel();
+    }
+  },
+};
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const safeReply = (payload) => {
     try { sendResponse(payload); }
@@ -145,280 +378,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   };
 
   try {
-    if (!msg || !msg.type) {
-      safeReply({ ok: false, error: 'missing message type' });
+    const type = msg?.type;
+    if (!type || !handlers[type]) {
+      safeReply({ ok: false, error: type ? `unknown message type ${type}` : 'missing message type' });
       return true;
     }
-
-    // --- Tiny plumbing test ---
-    if (msg.type === 'ping') {
-      safeReply({ ok: true, pong: true, ts: Date.now() });
-      return true;
-    }
-
-    // --- Keep the worker alive briefly (warmup/hold) ---
-    if (msg.type === 'keepAlive') {
-      setTimeout(() => safeReply({ ok: true, msg: 'kept alive' }), 2500);
-      return true;
-    }
-
-    // --- Text list of languages from local API (fast & robust) ---
-    if (msg.type === 'getLanguages') {
-      (async () => {
-        const candidates = [
-          'http://localhost:8080/api/v1/languages',
-        ];
-
-        for (const u of candidates) {
-          const r = await fetchText(u, { timeoutMs: 8000 });
-          if (r.ok) {
-            log('getLanguages OK from', u);
-            safeReply({ ok: true, body: r.text });
-            return;
-          }
-          warn('getLanguages failed', u, r.error || r.status);
-        }
-
-        // Fallback quick answer to verify message path even if API is down
-        safeReply({
-          ok: true,
-          body: 'java, go, javascript, typescript, python, csharp, cpp, ruby, rust, php, kotlin'
-        });
-      })().catch(e => safeReply({ ok: false, error: String(e?.message || e) }));
-      return true;
-    }
-
-    // --- Token utilities (ADDED) ---
-    if (msg.type === 'getToken') {
-      (async () => {
-        try {
-          if (tokenCache !== null) {
-            safeReply({ ok: true, token: tokenCache });
-            return;
-          }
-          const t = await readTokenFromStorage();
-          tokenCache = t;
-          safeReply({ ok: true, token: t });
-        } catch (e) {
-          safeReply({ ok: false, error: String(e?.message || e) });
-        }
-      })();
-      return true;
-    }
-
-    if (msg.type === 'forgetToken') {
-      (async () => {
-        try {
-          tokenCache = null;
-          await clearTokenFromStorage();
-          safeReply({ ok: true });
-        } catch (e) {
-          safeReply({ ok: false, error: String(e?.message || e) });
-        }
-      })();
-      return true;
-    }
-
-    // --- Tokened GET to local API (Striffs) ---
-    if (msg.type === 'fetchStriffsWithToken') {
-      (async () => {
-        const { owner, repo, pull_number, updated_at, token } = msg;
-        if (!owner || !repo || !pull_number || !token) {
-          safeReply({ ok: false, error: 'missing args (owner/repo/pull_number/token)' });
-          return;
-        }
-        const apiBase = await getApiBase();
-        log('fetchStriffsWithToken using base', apiBase);
-        const url = `${apiBase}/api/v1/github/striffs/owners/${owner}/repos/${repo}/pulls/${pull_number}?updated_at=${encodeURIComponent(updated_at || '')}`;
-
-        const t = abortableTimeout(180000);
-        const started = Date.now();
-        let lastStatus = null;
-        try {
-          const res = await fetch(url, { headers: { Authorization: `token ${token}` }, signal: t.signal, cache: 'no-cache' });
-          lastStatus = res.status;
-          if (!res.ok) {
-            const text = await res.text().catch(() => '');
-            log('fetchStriffsWithToken timings', {
-              owner, repo, pull_number,
-              durationMs: Date.now() - started,
-              status: res.status,
-              ok: false
-            });
-            safeReply({ ok: false, error: `API request failed: ${res.status}`, detail: text });
-            return;
-          }
-          const json = await res.json();
-          log('fetchStriffsWithToken timings', {
-            owner, repo, pull_number,
-            durationMs: Date.now() - started,
-            status: res.status,
-            ok: true
-          });
-          safeReply({ ok: true, json, timings: { type: 'token', durationMs: Date.now() - started, status: res.status } });
-        } catch (e) {
-          log('fetchStriffsWithToken error', { durationMs: Date.now() - started, status: lastStatus, error: String(e?.message || e) });
-          safeReply({ ok: false, error: String(e?.message || e) });
-        } finally {
-          t.cancel();
-        }
-      })().catch(e => safeReply({ ok: false, error: String(e?.message || e) }));
-      return true;
-    }
-
-    // --- No-token path: download two zips + POST to local API ---
-    if (msg.type === 'generateStriffs') {
-      (async () => {
-        const {
-          baseOwner, baseRepo, baseBranch,
-          headOwner, headRepo, headBranch,
-          filterFiles = []
-        } = msg;
-
-        if (!baseOwner || !baseRepo || !baseBranch || !headOwner || !headRepo || !headBranch) {
-          safeReply({ ok: false, error: 'missing repo/ref args' });
-          return;
-        }
-
-        log('generateStriffs start', {
-          baseOwner, baseRepo, baseBranch, headOwner, headRepo, headBranch,
-          filterFilesCount: filterFiles.length,
-          filterFilesPreview: Array.isArray(filterFiles) ? filterFiles.slice(0, 30) : []
-        });
-
-        const overallStart = Date.now();
-        const downloadStart = Date.now();
-        const beforePromise = (async () => {
-          const s = Date.now();
-          const r = await downloadRepoZipAsArrayBuffer(baseOwner, baseRepo, baseBranch);
-          return { ...r, durationMs: Date.now() - s };
-        })();
-        const afterPromise = (async () => {
-          const s = Date.now();
-          const r = await downloadRepoZipAsArrayBuffer(headOwner, headRepo, headBranch);
-          return { ...r, durationMs: Date.now() - s };
-        })();
-
-        const [before, after] = await Promise.all([beforePromise, afterPromise]);
-        const downloadDurationMs = Date.now() - downloadStart;
-
-        if (!before.ok || !after.ok) {
-          log('generateStriffs download error', {
-            baseOk: before.ok, headOk: after.ok,
-            baseDurationMs: before.durationMs, headDurationMs: after.durationMs,
-            totalDownloadMs: downloadDurationMs,
-            baseError: before.error, headError: after.error
-          });
-          if (!before.ok) { safeReply({ ok: false, error: `Failed downloading base zip: ${before.error}` }); return; }
-          if (!after.ok)  { safeReply({ ok: false, error: `Failed downloading head zip: ${after.error}` }); return; }
-        }
-
-        log('generateStriffs download timings', {
-          baseDownloadMs: before.durationMs,
-          headDownloadMs: after.durationMs,
-          totalDownloadMs: downloadDurationMs,
-          filterFilesCount: filterFiles.length
-        });
-
-        const postStart = Date.now();
-        const apiBase = await getApiBase();
-        log('generateStriffs using base', apiBase);
-        const posted = await postZipsToLocal(
-          `${apiBase}/api/v1/github/striffs`,
-          before.arrayBuffer,
-          after.arrayBuffer,
-          filterFiles,
-          { timeoutMs: 180000 }
-        );
-        const postDurationMs = Date.now() - postStart;
-        const totalDurationMs = Date.now() - overallStart;
-
-        log('generateStriffs timings', {
-          baseDownloadMs: before.durationMs,
-          headDownloadMs: after.durationMs,
-          totalDownloadMs: downloadDurationMs,
-          postDurationMs,
-          totalMs: totalDurationMs,
-          filterFilesCount: filterFiles.length,
-          ok: posted.ok === true
-        });
-
-        if (!posted.ok) { safeReply({ ok: false, error: posted.error, timings: { baseDownloadMs: before.durationMs, headDownloadMs: after.durationMs, totalDownloadMs: downloadDurationMs, postDurationMs, totalMs: totalDurationMs, filterFilesCount: filterFiles.length } }); return; }
-        safeReply({
-          ok: true,
-          json: posted.json,
-          timings: {
-            type: 'generate',
-            baseDownloadMs: before.durationMs,
-            headDownloadMs: after.durationMs,
-            totalDownloadMs: downloadDurationMs,
-            postDurationMs,
-            totalMs: totalDurationMs,
-            filterFilesCount: filterFiles.length
-          }
-        });
-      })().catch(e => safeReply({ ok: false, error: String(e?.message || e) }));
-      return true;
-    }
-
-    // --- Legacy downloader (keeps { success, buffer } shape) ---
-    if (msg.type === 'downloadZip') {
-      (async () => {
-        const { url } = msg || {};
-        if (!url) { safeReply({ success: false, error: 'missing url' }); return; }
-        try {
-          const r = await fetch(url, { cache: 'no-cache' });
-          if (!r.ok) throw new Error(`HTTP ${r.status}`);
-          const ab = await r.arrayBuffer();
-          safeReply({ success: true, buffer: Array.from(new Uint8Array(ab)) });
-        } catch (e) {
-          safeReply({ success: false, error: String(e?.message || e) });
-        }
-      })().catch(e => safeReply({ success: false, error: String(e?.message || e) }));
-      return true;
-    }
-
-    // --- Optional generic proxy (use sparingly) ---
-    if (msg.type === 'proxyFetch') {
-      (async () => {
-        // ADDED: returnHeaders support to surface OAuth scopes from GitHub responses
-        const { url, method = 'GET', headers = {}, bodyType = 'text', body, timeoutMs = 20000, returnHeaders = false } = msg;
-        if (!url) { safeReply({ ok: false, error: 'missing url' }); return; }
-
-        const t = abortableTimeout(timeoutMs);
-        try {
-          const init = { method, headers, signal: t.signal, cache: 'no-cache' };
-          if (method !== 'GET' && body != null) init.body = body;
-          const res = await fetch(url, init);
-          const status = res.status;
-
-          let hdrs = undefined;
-          if (returnHeaders) {
-            const wanted = ['x-oauth-scopes','x-accepted-oauth-scopes','x-ratelimit-remaining','x-ratelimit-reset'];
-            hdrs = {};
-            for (const [k, v] of res.headers.entries()) {
-              if (wanted.includes(k.toLowerCase())) hdrs[k] = v;
-            }
-          }
-
-          if (bodyType === 'json') {
-            const json = await res.json().catch(() => null);
-            safeReply({ ok: res.ok, status, json, headers: hdrs });
-          } else {
-            const text = await res.text().catch(() => '');
-            safeReply({ ok: res.ok, status, text, headers: hdrs });
-          }
-        } catch (e) {
-          safeReply({ ok: false, error: String(e?.message || e) });
-        } finally {
-          t.cancel();
-        }
-      })().catch(e => safeReply({ ok: false, error: String(e?.message || e) }));
-      return true;
-    }
-
-    // --- Fallback ---
-    safeReply({ ok: false, error: `unknown message type ${msg.type}` });
+    const handler = handlers[type];
+    Promise.resolve(handler(msg, { sender, safeReply })).catch(e => safeReply({ ok: false, error: String(e?.message || e) }));
     return true;
   } catch (e) {
     safeReply({ ok: false, error: String(e?.message || e) });
