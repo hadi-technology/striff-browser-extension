@@ -24,6 +24,10 @@
   S.__striffsReady = false;
   S.__lastFetchedUpdatedAt = null;
   S.__styleInjected = false;
+  S.REMOTE_CONFIG_URL = 'https://striffs-config.tor1.digitaloceanspaces.com/config.json';
+  S.__remoteConfig = null;
+  S.__remoteDisableMessage = null;
+  S.__disabledByRemote = false;
 
   // ---------- GitHub DOM selectors (centralized for drift resilience) ----------
   const SELECTORS = S.SELECTORS = S.SELECTORS || Object.freeze({
@@ -78,6 +82,75 @@
   S.cinfo = (...a) => { try { console.info('[Striffs]', ...a); } catch { } };
   S.cwarn = (...a) => { try { console.warn('[Striffs]', ...a); } catch { } };
   S.cerr = (...a) => { try { console.error('[Striffs]', ...a); } catch { } };
+
+  // ---------- Remote config / kill-switch ----------
+  S.getRemoteConfigUrl = async function getRemoteConfigUrl() {
+    let override = null;
+    try {
+      const stored = await chrome?.storage?.local?.get?.(['striffsConfigUrl']);
+      const v = stored?.striffsConfigUrl;
+      if (typeof v === 'string' && v.trim()) override = v.trim();
+    } catch {}
+    return override || S.REMOTE_CONFIG_URL;
+  };
+
+  S.fetchRemoteConfig = async function fetchRemoteConfig() {
+    const url = await S.getRemoteConfigUrl();
+    if (!url) return null;
+    try {
+      const resp = await S.bgRequest?.(
+        { type: 'fetchRemoteConfig', url },
+        (S.TIMEOUTS?.message) || 7000
+      );
+      if (resp && resp.ok && resp.json) {
+        S.__remoteConfig = resp.json;
+        return resp.json;
+      }
+      S.cwarn?.('Remote config fetch failed', resp?.status || resp?.error);
+      return null;
+    } catch (e) {
+      S.cwarn?.('Remote config unreachable', e);
+      return null;
+    }
+  };
+
+  S.disableStriffsButton = function disableStriffsButton(message) {
+    S.__disabledByRemote = true;
+    S.__remoteDisableMessage = message || S.__remoteDisableMessage;
+    const btn = document.getElementById('striffs-btn');
+    const tooltip = message || S.__remoteDisableMessage || 'Striffs temporarily disabled';
+    if (btn) {
+      btn.disabled = true;
+      btn.classList.add('is-disabled');
+      btn.style.opacity = '0.6';
+      btn.title = tooltip;
+    }
+    S.updateStriffButton?.({ neutral: true, disabled: true, tooltip });
+  };
+
+  S.enableStriffsButton = function enableStriffsButton() {
+    const btn = document.getElementById('striffs-btn');
+    if (btn) {
+      btn.disabled = false;
+      btn.classList.remove('is-disabled');
+      btn.style.opacity = '';
+      if (!btn.title) btn.title = 'Click to generate Striffs';
+    }
+    S.__disabledByRemote = false;
+    S.__remoteDisableMessage = null;
+  };
+
+  S.applyRemoteDisableIfNeeded = function applyRemoteDisableIfNeeded(cfg) {
+    if (cfg && cfg.disableStriffs) {
+      S.__remoteDisableMessage = cfg.message || 'Striffs temporarily disabled';
+      S.disableStriffsButton(S.__remoteDisableMessage);
+      return true;
+    }
+    if (S.__disabledByRemote) {
+      S.enableStriffsButton();
+    }
+    return false;
+  };
 
   // ---------- API base override helpers (for testing) ----------
   S.setApiBaseOverride = async (base) => new Promise((resolve) => {
@@ -738,6 +811,10 @@
         };
 
         const onStriffClick = async () => {
+            if (S.__disabledByRemote) {
+                S.disableStriffsButton();
+                return;
+            }
             // FIRST PHASE: diagram not ready yet → generate only, stay on diffs.
             if (!S.__striffsReady || !S.__striffsSvg || !S.__striffsPanzoom) {
                 S.updateStriffButton({
@@ -775,6 +852,9 @@
 
         S.restoreStriffButtonState?.();
         S.setActiveButtons?.(S.getCurrentView());
+        if (S.__disabledByRemote) {
+            S.disableStriffsButton();
+        }
     };
 
     S.restoreStriffButtonState = () => {
@@ -1915,6 +1995,10 @@
   }
 
   S.autoFetchStriffs = async () => {
+    if (S.__disabledByRemote) {
+      S.disableStriffsButton();
+      return false;
+    }
     const token = await S.getStoredToken();
     const meta = S.extractPRMetadata();
     const { updated_at } = meta;
@@ -1959,6 +2043,7 @@
   };
 
   S.ensureSupportedExtensionsReady = S.ensureSupportedExtensionsReady || async function ensureSupportedExtensionsReady() {
+    if (S.__disabledByRemote) return;
     if (Array.isArray(S.__supportedExtensionsForUi) && S.__supportedExtensionsForUi.length > 0) return;
     if (typeof S.fetchSupportedExtensions !== 'function' || typeof S.registerSupportedExtensions !== 'function') return;
     try {
@@ -2050,6 +2135,9 @@
 
   console.log('[Striffs] content script boot', location.href);
 
+  const remoteCfg = await S.fetchRemoteConfig?.();
+  const remoteDisabled = S.applyRemoteDisableIfNeeded?.(remoteCfg);
+
   try {
     S.addSpinAnimation?.();
   } catch (e) {
@@ -2064,6 +2152,10 @@
 
   const toolbar = await S.waitForToolbar?.();
   if (toolbar) S.mountMainBarButtons?.();
+  if (remoteDisabled) {
+    S.disableStriffsButton();
+    return;
+  }
 
   await S.ensureSupportedExtensionsReady?.();
 
@@ -2098,9 +2190,17 @@
     try {
       if (!isPRFiles(location.pathname)) return;
 
+      const cfg = await S.fetchRemoteConfig?.();
+      const disabled = S.applyRemoteDisableIfNeeded?.(cfg);
+
       S.addSpinAnimation?.();
       await S.waitForToolbar?.();
       S.mountMainBarButtons?.();
+      if (disabled) {
+        S.disableStriffsButton();
+        return;
+      }
+
       await S.ensureSupportedExtensionsReady?.();
 
       const filesRoot = await S.waitForFilesRoot?.();

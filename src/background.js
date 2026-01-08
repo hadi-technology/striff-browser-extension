@@ -369,6 +369,26 @@ const handlers = {
       t.cancel();
     }
   },
+  fetchRemoteConfig: async (msg, { safeReply }) => {
+    const { url, timeoutMs = 7000 } = msg || {};
+    if (!url) { safeReply({ ok: false, error: 'missing url' }); return; }
+    const t = abortableTimeout(timeoutMs);
+    try {
+      const res = await fetch(url, { cache: 'no-cache', signal: t.signal });
+      const status = res.status;
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        safeReply({ ok: false, status, error: `HTTP ${status}`, body: text });
+        return;
+      }
+      const json = await res.json().catch(() => null);
+      safeReply({ ok: true, status, json });
+    } catch (e) {
+      safeReply({ ok: false, error: String(e?.message || e) });
+    } finally {
+      t.cancel();
+    }
+  },
 };
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {

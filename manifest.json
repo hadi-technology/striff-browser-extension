@@ -4,7 +4,11 @@
   "description": "Adds an architectural diff tab to GitHub pull requests.",
   "version": "1.0",
   "permissions": ["storage", "tabs", "scripting", "webRequest", "webNavigation", "downloads"],
-  "host_permissions": ["*://*.github.com/*", "https://codeload.github.com/*"],
+  "host_permissions": [
+    "*://*.github.com/*",
+    "https://codeload.github.com/*",
+    "https://striffs-config.tor1.digitaloceanspaces.com/*"
+  ],
   "background": {
     "service_worker": "src/background.js"
   },

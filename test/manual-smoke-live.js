@@ -7,15 +7,35 @@ const log = (...args) => console.log(`[${ts()}]`, ...args);
 const warn = (...args) => console.warn(`[${ts()}]`, ...args);
 const err = (...args) => console.error(`[${ts()}]`, ...args);
 
-const PR_URL = 'https://github.com/Zir0-93/junit5/pull/1/files';
-const PR_CONVERSATION_URL = 'https://github.com/Zir0-93/junit5/pull/1';
+const envOr = (key, fallback) => {
+  const v = (process.env[key] || '').trim();
+  return v || fallback;
+};
+
+const REMOTE_CONFIG_URL = 'https://striffs-config.tor1.digitaloceanspaces.com/config.json';
+const TEST_REMOTE_CONFIG_URL = 'https://striffs-config.tor1.digitaloceanspaces.com/config-test.json';
+const BAD_REMOTE_CONFIG_URL = 'https://striffs-config.tor1.digitaloceanspaces.com/config-missing.json';
+const DEFAULT_PR_URL = 'https://github.com/Zir0-93/junit5/pull/1/files';
+const PR_URL = envOr('PR_URL', DEFAULT_PR_URL);
+const PR_CONVERSATION_URL = envOr('PR_CONVERSATION_URL', PR_URL.replace(/\/files$/, ''));
 const EXT_PATH = path.resolve(__dirname, '..'); // repo root with manifest.json
 const PROFILE = path.join(__dirname, '.pw-profile');
 const tokenProvided = !!(process.env.GH_TOKEN && process.env.GH_TOKEN.trim());
 
+log(`Target PR: ${PR_URL}`);
 log(`GH_TOKEN supplied: ${tokenProvided ? 'yes (will use token-backed API path)' : 'no (zip-based flow expected)'}`);
 
 const bgLogs = [];
+const fetchWithTimeout = async (url, { timeoutMs = 5000 } = {}) => {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { cache: 'no-cache', signal: ctrl.signal });
+    return res;
+  } finally {
+    clearTimeout(t);
+  }
+};
 
 // Start fresh: remove any prior persistent profile to avoid cached state/token/api base.
 try {
@@ -34,6 +54,22 @@ try {
   const pass = (msg) => log('✓', msg);
   let filesRootMissing = false;
 
+  // Verify remote config is reachable and capture expected message
+  let expectedRemoteMessage = '';
+  try {
+    const res = await fetchWithTimeout(TEST_REMOTE_CONFIG_URL, { timeoutMs: 5000 });
+    if (!res || !res.ok) {
+      fail(`Remote test config unreachable or non-200 (${res?.status || 'no response'})`);
+      return;
+    }
+    const json = await res.json().catch(() => null);
+    expectedRemoteMessage = (json && json.message) || 'Striffs temporarily disabled';
+    pass('Remote test config reachable');
+  } catch (e) {
+    fail(`Remote test config fetch failed: ${e?.message || e}`);
+    return;
+  }
+
   // Extensions require a persistent context and headful mode.
   const context = await chromium.launchPersistentContext(PROFILE, {
     headless: false,
@@ -43,6 +79,14 @@ try {
       `--load-extension=${EXT_PATH}`
     ]
   });
+
+  const getServiceWorker = async () => {
+    let sw = context.serviceWorkers()[0];
+    if (!sw) {
+      try { sw = await context.waitForEvent('serviceworker', { timeout: 10000 }); } catch {}
+    }
+    return sw;
+  };
 
   // Relay background/service worker console logs to stdout for debugging.
   const wireWorkerLogs = (worker) => {
@@ -59,20 +103,14 @@ try {
 
   // Helpers to set/clear API base override via service worker storage.
   const setApiBaseOverride = async (base) => {
-    let sw = context.serviceWorkers()[0];
-    if (!sw) {
-      try { sw = await context.waitForEvent('serviceworker', { timeout: 10000 }); } catch {}
-    }
+    const sw = await getServiceWorker();
     if (!sw) return;
     await sw.evaluate((b) => {
       try { chrome.storage.local.set({ striffsApiBase: b }); } catch {}
     }, base);
   };
   const clearApiBaseOverride = async () => {
-    let sw = context.serviceWorkers()[0];
-    if (!sw) {
-      try { sw = await context.waitForEvent('serviceworker', { timeout: 10000 }); } catch {}
-    }
+    const sw = await getServiceWorker();
     if (!sw) return;
     await sw.evaluate(() => {
       try { chrome.storage.local.remove('striffsApiBase'); } catch {}
@@ -82,14 +120,18 @@ try {
   // Helper to set GitHub token in extension storage via service worker.
   const setGhToken = async (token) => {
     if (!token) return;
-    let sw = context.serviceWorkers()[0];
-    if (!sw) {
-      try { sw = await context.waitForEvent('serviceworker', { timeout: 10000 }); } catch {}
-    }
+    const sw = await getServiceWorker();
     if (!sw) return;
     await sw.evaluate((t) => {
       try { chrome.storage.local.set({ ghToken: t }); } catch {}
     }, token);
+  };
+  const setRemoteConfigUrl = async (url) => {
+    const sw = await getServiceWorker();
+    if (!sw) return;
+    await sw.evaluate((u) => {
+      try { chrome.storage.local.set({ striffsConfigUrl: u }); } catch {}
+    }, url);
   };
 
   const page = await context.newPage();
@@ -107,6 +149,52 @@ try {
     }
   });
 
+  const ensureButtonsRendered = async (label) => {
+    // Ensure Striffs is bootstrapped by checking observable output: the buttons it renders.
+    await page.evaluate(() => {
+      try { window.Striffs?.mountMainBarButtons?.(); } catch {}
+    });
+    const buttonsHandle = await page
+      .waitForFunction(
+        () => {
+          const striffs = document.querySelector('#striffs-btn');
+          const diffs = document.querySelector('#diffs-btn');
+          return striffs && diffs ? { striffs: true, diffs: true } : null;
+        },
+        { timeout: 10000, polling: 300 }
+      )
+      .catch(() => null);
+
+    const buttonsReady = buttonsHandle ? await buttonsHandle.jsonValue() : null;
+    if (!buttonsReady) {
+      fail(`Striffs bootstrap check failed (${label}) (buttons not rendered)`);
+      try {
+        const diag = await page.evaluate(() => {
+          const S = window.Striffs;
+          return {
+            hasStriffs: !!S,
+            striffsKeys: S ? Object.keys(S) : [],
+            waitForToolbar: !!S?.waitForToolbar,
+            ensureStriffContainer: !!S?.ensureStriffContainer,
+            styleInjected: !!document.querySelector('style#striffs-style'),
+            toolbarSlotPresent: !!document.querySelector('#striffs-toolbar-slot'),
+            lastErrors: window.__striffsErrors || null
+          };
+        });
+        log('Striffs diag', JSON.stringify(diag, null, 2));
+      } catch (e) {
+        warn('Striffs diag failed', e);
+      }
+      log('Leaving browser open for inspection (Striffs buttons missing).');
+      return false;
+    } else {
+      pass(`Striffs buttons rendered (${label})`);
+      return true;
+    }
+  };
+
+  await setRemoteConfigUrl(BAD_REMOTE_CONFIG_URL);
+
   try {
     await page.goto(PR_URL, { waitUntil: 'domcontentloaded', timeout: 10000 });
   } catch (e) {
@@ -115,45 +203,112 @@ try {
     return;
   }
 
-  // Ensure Striffs is bootstrapped by checking observable output: the buttons it renders.
+  const initialButtonsOk = await ensureButtonsRendered('initial (bad config)');
+  if (!initialButtonsOk) return;
+
+  // Bad config should not disable the plugin
+  const initialState = await page.evaluate(() => {
+    const btn = document.querySelector('#striffs-btn');
+    if (!btn) return null;
+    const style = window.getComputedStyle(btn);
+    return {
+      disabled: btn.disabled === true,
+      classDisabled: btn.classList.contains('is-disabled'),
+      opacity: style.opacity,
+      title: btn.title || ''
+    };
+  });
+  if (!initialState) {
+    fail('Striffs button not found under bad config');
+    return;
+  }
+  if (initialState.disabled || initialState.classDisabled) {
+    fail('Bad/unreachable config improperly disabled Striffs button');
+    return;
+  } else {
+    pass('Bad/unreachable config does not disable Striffs button');
+  }
+
+  // Switch to test config (disable Striffs)
+  await setRemoteConfigUrl(TEST_REMOTE_CONFIG_URL);
+  await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
+
+  const testButtonsOk = await ensureButtonsRendered('after test config');
+  if (!testButtonsOk) return;
+
+  // Remote disable expectations
+  const disableState = await page.evaluate(() => {
+    const btn = document.querySelector('#striffs-btn');
+    if (!btn) return null;
+    const style = window.getComputedStyle(btn);
+    return {
+      disabled: btn.disabled === true,
+      classDisabled: btn.classList.contains('is-disabled'),
+      opacity: style.opacity,
+      title: btn.title || ''
+    };
+  });
+
+  if (!disableState) {
+    fail('Striffs button not found for disable check');
+    return;
+  }
+
+  if (!disableState.disabled || !disableState.classDisabled) {
+    fail('Striffs button is not disabled by remote config');
+    return;
+  } else {
+    pass('Striffs button disabled by remote config');
+  }
+
+  if (Number(disableState.opacity || 1) > 0.7) {
+    fail(`Striffs button opacity not reduced (got ${disableState.opacity})`);
+    return;
+  } else {
+    pass('Striffs button greyed out');
+  }
+
+  if (!disableState.title || disableState.title !== expectedRemoteMessage) {
+    fail(`Striffs button tooltip mismatch (got "${disableState.title}", expected "${expectedRemoteMessage}")`);
+    return;
+  } else {
+    pass('Striffs button tooltip matches remote message');
+  }
+
+  // Switch back to production config and continue normal flow
+  await setRemoteConfigUrl(REMOTE_CONFIG_URL);
+  try {
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 10000 });
+  } catch (e) {
+    fail(`Reload after restoring config timed out: ${e.message || e}`);
+    return;
+  }
+
   await page.evaluate(() => {
     try { window.Striffs?.mountMainBarButtons?.(); } catch {}
   });
-  const buttonsHandle = await page
-    .waitForFunction(
-      () => {
-        const striffs = document.querySelector('#striffs-btn');
-        const diffs = document.querySelector('#diffs-btn');
-        return striffs && diffs ? { striffs: true, diffs: true } : null;
-      },
-      { timeout: 10000, polling: 300 }
-    )
-    .catch(() => null);
 
-  const buttonsReady = buttonsHandle ? await buttonsHandle.jsonValue() : null;
-  if (!buttonsReady) {
-    fail('Striffs bootstrap check failed (buttons not rendered)');
-    try {
-      const diag = await page.evaluate(() => {
-        const S = window.Striffs;
-        return {
-          hasStriffs: !!S,
-          striffsKeys: S ? Object.keys(S) : [],
-          waitForToolbar: !!S?.waitForToolbar,
-          ensureStriffContainer: !!S?.ensureStriffContainer,
-          styleInjected: !!document.querySelector('style#striffs-style'),
-          toolbarSlotPresent: !!document.querySelector('#striffs-toolbar-slot'),
-          lastErrors: window.__striffsErrors || null
-        };
-      });
-      log('Striffs diag', JSON.stringify(diag, null, 2));
-    } catch (e) {
-      warn('Striffs diag failed', e);
-    }
-    log('Leaving browser open for inspection (Striffs buttons missing).');
+  const enabledState = await page.waitForFunction(() => {
+    const btn = document.querySelector('#striffs-btn');
+    if (!btn) return null;
+    const style = window.getComputedStyle(btn);
+    return {
+      disabled: btn.disabled === true,
+      classDisabled: btn.classList.contains('is-disabled'),
+      opacity: style.opacity,
+      title: btn.title || ''
+    };
+  }, { timeout: 10000 }).catch(() => null);
+
+  if (!enabledState) {
+    fail('Striffs button not found after restoring config');
+    return;
+  }
+  if (enabledState.disabled || enabledState.classDisabled) {
+    fail('Striffs button remained disabled after restoring production config');
     return;
   } else {
-    pass('Striffs buttons rendered (observable output)');
+    pass('Striffs button re-enabled after restoring production config');
   }
 
   // Verify we are on the PR files tab.
