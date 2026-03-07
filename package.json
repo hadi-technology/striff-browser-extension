@@ -1,0 +1,30 @@
+{
+  "name": "striff-browser-extension",
+  "version": "1.0.0",
+  "description": "A cross-browser GitHub extension that adds a **\"Striffs\"** tab to pull request pages. This tab displays architectural diffs as interactive SVG diagrams, making code review more transparent and insightful.",
+  "main": "index.js",
+  "directories": {
+    "lib": "lib",
+    "test": "test"
+  },
+  "scripts": {
+    "test": "node test/extract-pr-metadata.test.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hadii-tech/striff-browser-extension.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/hadii-tech/striff-browser-extension/issues"
+  },
+  "homepage": "https://github.com/hadii-tech/striff-browser-extension#readme",
+  "devDependencies": {
+    "playwright": "^1.58.1"
+  },
+  "dependencies": {
+    "svg-pan-zoom": "^3.6.2"
+  }
+}

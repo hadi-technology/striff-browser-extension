@@ -100,8 +100,22 @@ async function validateToken(token) {
 // ---- Cache clearing (keeps token) ----
 async function clearExtensionCaches() {
   const all = await local.get(null);
+  const prefixes = ["striffs:", "StriffsCache:", "striffsCache:", "striffsCacheMeta:", "StriffsCacheMeta:"];
+  const keys = [
+    "striffsActiveTab",
+    "striffsRemoteConfig",
+    "striffsRemoteConfigFetchedAt",
+    "striffsRemoteConfigUrl",
+    "striffsSupportedLangs",
+    "striffsSupportedLangsFetchedAt",
+    "striffsSupportedLangsBase",
+    "striffsConfigUrl",
+    "striffsApiBase"
+  ];
   const toRemove = Object.keys(all).filter(k =>
-    k === "striffsActiveTab" || k.startsWith("striffs:") || k.startsWith("StriffsCache:")
+    (k !== "striffsCacheClearAt") &&
+    (String(k).toLowerCase() !== "striffsdebug") &&
+    (keys.includes(k) || prefixes.some(p => k.startsWith(p)))
   );
   if (toRemove.length) await local.remove(toRemove);
 }

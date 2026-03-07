@@ -44,9 +44,6 @@ StriffsExtension/
 | Permission        | Reason                                       |
 |------------------|----------------------------------------------|
 | `storage`        | Store GitHub token                           |
-| `tabs`           | Interact with GitHub PR tabs                 |
-| `webRequest`     | (Required by some extensions for zip fetch)  |
-| `webNavigation`  | Detect tab and history changes               |
 | `host_permissions` | GitHub domains + `codeload.github.com`     |
 
 ---
@@ -55,6 +52,52 @@ StriffsExtension/
 - Diagram grouping by language
 - SVG download/export button
 - Retry/backoff logic for failed requests
+
+---
+
+## ✅ Manual Smoke Test Coverage
+
+The manual Playwright smoke test (`test/manual-smoke-live.js`) validates observable behavior only:
+
+1. **Remote config behavior**
+   - Bad/unreachable config does **not** disable the Striffs button
+   - Test config disables Striffs (button disabled, greyed out, tooltip matches)
+   - Production config re-enables Striffs
+
+2. **Buttons & mounting**
+   - Striffs/Diffs buttons render on PR Files tab
+   - Toolbar slot is present
+
+3. **Failure phase**
+   - With a bad API base, Striffs shows an error state
+
+4. **Normal flow**
+   - Striffs view renders and is visible
+   - File tree availability reflects Striffs mapping
+   - Clicking a known component navigates to the expected diff hash
+   - Clicking any diagram entity switches to diffs view
+   - Resize keeps diagram visible
+   - Diffs view toggles and content is visible
+
+5. **Mapping integrity**
+   - Path→component map size > 0
+   - Component→file map size > 0
+   - DiffId→component map size > 0
+
+6. **Reload & cache behavior**
+   - Buttons persist after reload
+   - Striffs renders after reload
+   - If a cached diagram exists, the test validates it reports a cache hit
+
+7. **Navigation**
+   - Striffs/Diffs buttons are hidden on the conversation tab
+
+### Optional override for component hash test
+You can override the specific component/hash assertions with:
+
+```
+CLICK_COMPONENT=... CLICK_DIFF_ID=... node test/manual-smoke-live.js
+```
 
 ---
 

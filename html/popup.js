@@ -1,5 +1,6 @@
 // Use local storage for reliability in MV3 popups
 const storageArea = chrome.storage?.local;
+const DEBUG_KEY = "striffsDebug";
 
 // Minimal safe render
 function renderStatus(hasToken, fallbackText) {
@@ -42,39 +43,59 @@ function resetCache() {
   const statusEl = document.getElementById("status");
   const setMsg = (msg) => { if (statusEl) statusEl.textContent = msg; };
 
-  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-    const tab = tabs && tabs[0];
-    if (!tab?.id) {
-      setMsg("⚠️ No active tab to reset.");
-      return;
-    }
-    try {
-      chrome.tabs.sendMessage(tab.id, { type: "clearStriffsCaches" }, (resp) => {
-        if (chrome.runtime.lastError) {
-          setMsg("⚠️ Could not reset cache on this page.");
-          return;
-        }
-        if (resp?.ok) {
-          setMsg("✅ Striffs cache cleared on this page.");
-        } else {
-          setMsg("⚠️ Could not reset cache on this page.");
-        }
-      });
-    } catch (e) {
-      setMsg("⚠️ Could not reset cache.");
-    }
-  });
+  setMsg("Clearing caches…");
+  try {
+    chrome.runtime.sendMessage({ type: "clearStriffsCaches" }, (resp) => {
+      if (chrome.runtime.lastError) {
+        setMsg("⚠️ Could not reset cache.");
+        return;
+      }
+      if (resp?.ok) {
+        setMsg("✅ Striffs cache cleared.");
+      } else {
+        setMsg("⚠️ Could not reset cache.");
+      }
+    });
+  } catch (e) {
+    setMsg("⚠️ Could not reset cache.");
+  }
+}
+
+function readDebugOnce() {
+  if (!storageArea) {
+    return;
+  }
+  try {
+    storageArea.get([DEBUG_KEY], (items) => {
+      const enabled = items?.[DEBUG_KEY] === true;
+      const toggle = document.getElementById("debugToggle");
+      if (toggle) toggle.checked = enabled;
+    });
+  } catch (e) {
+    console.error("Debug storage read error:", e);
+  }
+}
+
+function setDebug(enabled) {
+  if (!storageArea) return;
+  storageArea.set({ [DEBUG_KEY]: !!enabled });
 }
 
 document.addEventListener("DOMContentLoaded", () => {
   // Initial read
   readTokenOnce();
+  readDebugOnce();
 
   // Live update if Options changes the token while popup is open
   chrome.storage.onChanged.addListener((changes, areaName) => {
     if (areaName !== "local") return;
     if ("ghToken" in changes) {
       renderStatus(!!changes.ghToken.newValue);
+    }
+    if (DEBUG_KEY in changes) {
+      const enabled = changes[DEBUG_KEY]?.newValue === true;
+      const toggle = document.getElementById("debugToggle");
+      if (toggle) toggle.checked = enabled;
     }
   });
 
@@ -84,6 +105,13 @@ document.addEventListener("DOMContentLoaded", () => {
 
   const resetBtn = document.getElementById("resetCacheBtn");
   if (resetBtn) resetBtn.addEventListener("click", resetCache);
+
+  const debugToggle = document.getElementById("debugToggle");
+  if (debugToggle) {
+    debugToggle.addEventListener("change", () => {
+      setDebug(debugToggle.checked);
+    });
+  }
 
   // Fallback retry in rare cases
   setTimeout(() => {

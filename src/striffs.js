@@ -6,29 +6,96 @@
 
   // ---------- Constants / State ----------
   S.MAX_UNAUTH_ZIP_SIZE_MB = 50;
-  S.CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
+  S.CACHE_TTL_MS = 60 * 60 * 1000; // 1h
   S.TIMEOUTS = Object.freeze({
     message: 7000,
     ping: 1000,
-    getLanguages: 12000,
     waitForToolbar: 8000,
     bgGenerate: 180000,
     bgToken: 180000,
   });
 
+  S.DEFAULT_SUPPORTED_EXTS = ['java', 'go', 'js', 'ts', 'py', 'cs', 'cpp', 'rb', 'rs', 'php', 'kt'];
+
   S.__striffsSvg = null;
-  S.__striffsPanzoom = null;
   S.__striffsPathToComponentId = new Map();
   S.__striffsComponentIdToFile = new Map();
   S.__filePathToDiffId = new Map(); // "/path" -> diffId (no '#')
   S.__striffsReady = false;
   S.__lastFetchedUpdatedAt = null;
-  S.__styleInjected = false;
-  S.REMOTE_CONFIG_URL = 'https://striffs-config.tor1.digitaloceanspaces.com/config.json';
+  S.__styleInjected = false; 
+  S.__striffsZoom = 1;
+  S.__recentPanAt = 0;
+  S.__supportedExtensionsForUi = S.__supportedExtensionsForUi ||
+    (Array.isArray(S.DEFAULT_SUPPORTED_EXTS) ? [...S.DEFAULT_SUPPORTED_EXTS] : []);
+  S.PAN_CLICK_DEBOUNCE_MS = 250;
+  S.ZOOM_MIN = 0.1;
+  S.ZOOM_MAX = 50;
+  S.ZOOM_IN = 1.2;
+  S.ZOOM_OUT = 0.85;
+  S.FOCUS_MIN_ZOOM = 0.8;
+  S.FOCUS_MAX_ZOOM = 2.5;
+  S.FOCUS_GLOW_DURATION_MS = 2000;
+  S.REMOTE_CONFIG_URL = 'https://striffs-config.tor1.cdn.digitaloceanspaces.com/config.json';
+  S.REMOTE_CONFIG_TTL_MS = 2 * 60 * 1000;
+  S.SUPPORTED_LANGS_TTL_MS = 24 * 60 * 60 * 1000;
+  S.ENGAGEMENT_SCHEMA_VERSION = 1;
+  S.ENGAGEMENT_COMPONENT_IDS_LIMIT = 80;
+  S.ENGAGEMENT_ZOOM_IDLE_MS = 220;
   S.__remoteConfig = null;
+  S.__remoteConfigFetchedAt = 0;
+  S.__remoteConfigUrl = null;
   S.__remoteDisableMessage = null;
   S.__disabledByRemote = false;
-
+  S.__debugEnabled = false;
+  S.__engagementCtx = S.__engagementCtx || {
+    sessionId: null,
+    operationId: null,
+    engagementWriteToken: null
+  };
+  S.__engagementSentCount = Number(S.__engagementSentCount || 0);
+  S.__engagementAckCount = Number(S.__engagementAckCount || 0);
+  S.__engagementFailedCount = Number(S.__engagementFailedCount || 0);
+  S.__engagementSkippedCount = Number(S.__engagementSkippedCount || 0);
+  S.loadDebugFlag = S.loadDebugFlag || (async () => {
+    try {
+      const store = chrome?.storage?.local;
+      if (!store || typeof store.get !== 'function') {
+        S.__debugEnabled = false;
+        return S.__debugEnabled;
+      }
+      const stored = await new Promise((resolve) => {
+        try {
+          const maybe = store.get(['striffsDebug'], (res) => resolve(res || null));
+          if (maybe && typeof maybe.then === 'function') {
+            maybe.then((res) => resolve(res || null)).catch(() => resolve(null));
+          }
+        } catch {
+          resolve(null);
+        }
+      });
+      S.__debugEnabled = stored?.striffsDebug === true;
+    } catch {
+      S.__debugEnabled = false;
+    }
+    return S.__debugEnabled;
+  });
+  S.isDebug = S.isDebug || (() => {
+    try {
+      if (window.__STRIFFS_DEBUG === true) return true;
+      if (S.__debugEnabled === true) return true;
+      return localStorage.getItem('striffsDebug') === '1';
+    } catch {
+      return false;
+    }
+  });
+  S.isTest = S.isTest || (() => {
+    try {
+      return localStorage.getItem('striffsTest') === '1';
+    } catch {
+      return false;
+    }
+  });
   // ---------- GitHub DOM selectors (centralized for drift resilience) ----------
   const SELECTORS = S.SELECTORS = S.SELECTORS || Object.freeze({
     toolbar: [
@@ -52,6 +119,7 @@
       'div.js-file[data-file-type="file"]'
     ],
     filesRoot: [
+      '#files',
       'div[data-view-component="true"][data-testid="pull-requests-files"]',
       'div[data-testid="files-changed"]',
       'div[data-target="diff-layout.sidebarContainer"]',
@@ -69,49 +137,450 @@
     fileLinks: [
       ".file-info a.Link--primary",
       '[data-testid="file-header"] a.Link--primary',
-      'a[data-testid="file-name"], a[data-hovercard-type="file"]'
+      'a[data-testid="file-name"], a[data-hovercard-type="file"]',
+      "a.ActionList-content[href^='#diff-']"
     ],
     fileTreeItems: [
+      // New GitHub ActionList tree (2025)
+      "li[data-tree-entry-type='file'] span[data-filterable-item-text]",
+      "li[id^='file-tree-item-diff-'] span[data-filterable-item-text]",
+      "li[data-tree-entry-type='file'] span.ActionList-item-label",
+      "li[id^='file-tree-item-diff-'] span.ActionList-item-label",
+      // Older tree (fallbacks)
       "[data-testid='file-tree'] li [data-testid='file-tree-item-text']",
       "[data-testid='file-tree'] li a.ActionListContent"
     ]
   });
 
+  S.clampZoom = (value) => Math.min(S.ZOOM_MAX, Math.max(S.ZOOM_MIN, value));
+
+  S.applyZoomAtPoint = (view, svg, next, clientX, clientY) => {
+    if (!view || !svg || !Number.isFinite(next)) return false;
+    const rect = view.getBoundingClientRect();
+    const current = Number(S.__striffsZoom) || 1;
+    if (!rect || !Number.isFinite(current) || current <= 0) return false;
+    const safeNext = S.clampZoom(next);
+    if (safeNext === current) return false;
+    const x = clientX - rect.left + view.scrollLeft;
+    const y = clientY - rect.top + view.scrollTop;
+    const scaleRatio = safeNext / current;
+    S.__striffsZoom = safeNext;
+    svg.style.transformOrigin = '0 0';
+    svg.style.transform = `scale(${safeNext})`;
+    view.scrollLeft = (x * scaleRatio) - (clientX - rect.left);
+    view.scrollTop = (y * scaleRatio) - (clientY - rect.top);
+    return true;
+  };
+
+  S.getStriffScrollEl = () =>
+    document.getElementById("striffs-scroll") ||
+    document.getElementById("striff-diagram-view");
+
+  S.getElementCenterClientPoint = (elem) => {
+    try {
+      const view = S.getStriffScrollEl();
+      if (!elem || !view) return null;
+      const rect = view.getBoundingClientRect();
+      if (!rect) return null;
+      const current = Number(S.__striffsZoom) || 1;
+      const bbox = elem.getBBox();
+      const centerX = (bbox.x + bbox.width / 2) * current;
+      const centerY = (bbox.y + bbox.height / 2) * current;
+      return {
+        clientX: rect.left + centerX - view.scrollLeft,
+        clientY: rect.top + centerY - view.scrollTop
+      };
+    } catch (e) {
+      return null;
+    }
+  };
+
+  S.ensureFocusZoom = (elem) => {
+    const point = S.getElementCenterClientPoint(elem);
+    if (!point) return false;
+    const view = S.getStriffScrollEl();
+    const svg = (S.__striffsSvg || view?.querySelector('svg'));
+    if (!view || !svg) return false;
+    const current = Number(S.__striffsZoom) || 1;
+    const target = S.clampZoom(Math.max(current, S.FOCUS_MIN_ZOOM));
+    if (target === current) return S.applyZoomAtPoint(view, svg, target, point.clientX, point.clientY);
+    return S.applyZoomAtPoint(view, svg, target, point.clientX, point.clientY);
+  };
+
+  S.fitStriffsToView = (view, svg) => {
+    try {
+      if (!view || !svg) return false;
+      const pad = 24;
+      const viewW = Math.max(0, (view.clientWidth || 0) - pad);
+      const viewH = Math.max(0, (view.clientHeight || 0) - pad);
+      if (!viewW || !viewH) return false;
+      let svgW = 0;
+      let svgH = 0;
+      const vb = svg.viewBox?.baseVal;
+      if (vb && vb.width && vb.height) {
+        svgW = vb.width;
+        svgH = vb.height;
+      } else {
+        try {
+          const bbox = svg.getBBox();
+          svgW = bbox?.width || 0;
+          svgH = bbox?.height || 0;
+        } catch {}
+      }
+      if (!svgW || !svgH) return false;
+      const scale = Math.min(viewW / svgW, viewH / svgH, 1);
+      const fit = S.clampZoom(scale);
+      S.__striffsZoom = fit;
+      svg.style.transformOrigin = '0 0';
+      svg.style.transform = `scale(${fit})`;
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const makeClientSessionId = () => {
+    try {
+      if (window.crypto && typeof window.crypto.randomUUID === "function") {
+        return window.crypto.randomUUID();
+      }
+    } catch {}
+    return `sess-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  };
+
+  S.ensureEngagementSessionId = () => {
+    const existing = S.__engagementCtx?.sessionId;
+    if (existing) return existing;
+    let stored = "";
+    try {
+      stored = sessionStorage.getItem("striffsEngagementSessionId") || "";
+    } catch {}
+    const next = stored || makeClientSessionId();
+    try {
+      sessionStorage.setItem("striffsEngagementSessionId", next);
+    } catch {}
+    S.__engagementCtx.sessionId = next;
+    return next;
+  };
+
+  S.updateEngagementContextFromResult = (result) => {
+    const opId = String(
+      result?.operationId || result?.operationID || result?.operation_id || ""
+    ).trim();
+    if (!opId) return false;
+    const providedToken = String(
+      result?.engagementWriteToken || result?.engagementToken || result?.engagement_write_token || ""
+    ).trim();
+    const prev = S.__engagementCtx || {};
+    const reuseToken = prev.operationId === opId ? prev.engagementWriteToken : null;
+    S.__engagementCtx = {
+      sessionId: S.ensureEngagementSessionId?.() || prev.sessionId || null,
+      operationId: opId,
+      engagementWriteToken: providedToken || reuseToken || null
+    };
+    return Boolean(S.__engagementCtx.engagementWriteToken);
+  };
+
+  S.getViewableComponents = (limit = S.ENGAGEMENT_COMPONENT_IDS_LIMIT || 80) => {
+    const max = Number.isFinite(Number(limit)) ? Math.max(1, Number(limit)) : 80;
+    const view = S.getStriffScrollEl?.();
+    const svg = S.__striffsSvg || view?.querySelector?.("svg");
+    if (!view || !svg) {
+      return { ids: [], total: 0, truncated: false };
+    }
+    const viewport = view.getBoundingClientRect?.();
+    if (!viewport) {
+      return { ids: [], total: 0, truncated: false };
+    }
+    const out = [];
+    const uniq = new Set();
+    let total = 0;
+    const nodes = svg.querySelectorAll?.("g.entity[data-qualified-name]") || [];
+    for (const node of nodes) {
+      const id = node.getAttribute?.("data-qualified-name");
+      if (!id || uniq.has(id)) continue;
+      const rect = node.getBoundingClientRect?.();
+      if (!rect) continue;
+      const offscreen =
+        rect.right < viewport.left ||
+        rect.left > viewport.right ||
+        rect.bottom < viewport.top ||
+        rect.top > viewport.bottom;
+      if (offscreen) continue;
+      total += 1;
+      uniq.add(id);
+      if (out.length < max) out.push(id);
+    }
+    return { ids: out, total, truncated: total > out.length };
+  };
+
+  S.capturePanZoomSnapshot = (limit = S.ENGAGEMENT_COMPONENT_IDS_LIMIT || 80) => {
+    const view = S.getStriffScrollEl?.();
+    const visible = S.getViewableComponents?.(limit) || { ids: [], total: 0, truncated: false };
+    const x = Number(view?.scrollLeft || 0);
+    const y = Number(view?.scrollTop || 0);
+    return {
+      coordinates: { x, y },
+      zoom: Number(S.__striffsZoom) || 1,
+      viewport: {
+        width: Number(view?.clientWidth || 0),
+        height: Number(view?.clientHeight || 0)
+      },
+      viewableComponentIds: visible.ids || [],
+      viewableComponentCount: Number(visible.total || 0),
+      viewableComponentIdsTruncated: Boolean(visible.truncated)
+    };
+  };
+
   // ---------- Logging ----------
-  S.clog = (...a) => { try { console.log('[Striffs]', ...a); } catch { } };
-  S.cinfo = (...a) => { try { console.info('[Striffs]', ...a); } catch { } };
+  S.clog = (...a) => { try { if (S.isDebug?.()) console.log('[Striffs]', ...a); } catch { } };
+  S.cinfo = (...a) => { try { if (S.isDebug?.()) console.info('[Striffs]', ...a); } catch { } };
   S.cwarn = (...a) => { try { console.warn('[Striffs]', ...a); } catch { } };
   S.cerr = (...a) => { try { console.error('[Striffs]', ...a); } catch { } };
+  S.debugDump = (label, payload) => {
+    try {
+      if (!S.isDebug?.()) return;
+      console.log(`[Striffs][debug] ${label}`, payload);
+    } catch {}
+  };
+
+  try {
+    chrome?.storage?.onChanged?.addListener?.((changes, areaName) => {
+      if (areaName !== 'local' || !changes || !Object.prototype.hasOwnProperty.call(changes, 'striffsDebug')) return;
+      S.__debugEnabled = changes?.striffsDebug?.newValue === true;
+    });
+  } catch {}
+
+  S.loadDebugFlag?.();
+
+  S.emitEngagementEvent = (eventType, eventPayload = {}, metadataPayload = {}) => {
+    try {
+      const type = String(eventType || "").trim();
+      if (!type) return false;
+      const ctx = S.__engagementCtx || {};
+      const operationId = String(ctx.operationId || "").trim();
+      const engagementWriteToken = String(ctx.engagementWriteToken || "").trim();
+      if (!operationId || !engagementWriteToken) {
+        S.__engagementSkippedCount = Number(S.__engagementSkippedCount || 0) + 1;
+        S.debugDump?.("engagement skipped (missing operation/token)", {
+          type,
+          hasOperationId: Boolean(operationId),
+          hasToken: Boolean(engagementWriteToken)
+        });
+        return false;
+      }
+      const meta = S.extractPRMetadata?.() || {};
+      const payload = {
+        schemaVersion: S.ENGAGEMENT_SCHEMA_VERSION || 1,
+        eventType: type,
+        event: { type, ...(eventPayload || {}) },
+        metadata: {
+          pageUrl: location.href,
+          owner: meta.owner || null,
+          repo: meta.repo || null,
+          pull_number: meta.pull_number || null,
+          currentView: S.getCurrentView?.() || null,
+          zoom: Number(S.__striffsZoom) || 1,
+          ...(metadataPayload || {})
+        },
+        sessionId: S.ensureEngagementSessionId?.() || null,
+        source: "striff-browser-extension",
+        clientTimestamp: Date.now()
+      };
+      if (typeof S.bgRequest !== "function") {
+        S.__engagementSkippedCount = Number(S.__engagementSkippedCount || 0) + 1;
+        return false;
+      }
+      S.__engagementSentCount = Number(S.__engagementSentCount || 0) + 1;
+      S.__engagementLastEventType = type;
+      S.bgRequest({
+        type: "recordEngagementEvent",
+        operationId,
+        engagementToken: engagementWriteToken,
+        payload
+      }, S.TIMEOUTS?.message || 7000).then((resp) => {
+        if (resp?.ok === true || resp?.success === true) {
+          S.__engagementAckCount = Number(S.__engagementAckCount || 0) + 1;
+          return;
+        }
+        S.__engagementFailedCount = Number(S.__engagementFailedCount || 0) + 1;
+        S.debugDump?.("engagement send returned non-ok", {
+          type,
+          response: resp || null
+        });
+      }).catch((err) => {
+        S.__engagementFailedCount = Number(S.__engagementFailedCount || 0) + 1;
+        S.debugDump?.("engagement send failed", { type, error: String(err?.message || err) });
+      });
+      return true;
+    } catch (e) {
+      S.debugDump?.("engagement emit failed", { error: String(e?.message || e) });
+      return false;
+    }
+  };
+
+  S.getEngagementCounters = () => ({
+    sent: Number(S.__engagementSentCount || 0),
+    ack: Number(S.__engagementAckCount || 0),
+    failed: Number(S.__engagementFailedCount || 0),
+    skipped: Number(S.__engagementSkippedCount || 0),
+    lastEventType: S.__engagementLastEventType || null
+  });
 
   // ---------- Remote config / kill-switch ----------
+  S.storageGet = S.storageGet || ((area, keys) => new Promise((resolve) => {
+    try {
+      const store = chrome?.storage?.[area];
+      if (!store || typeof store.get !== 'function') return resolve(null);
+      const maybe = store.get(keys, (res) => resolve(res || null));
+      if (maybe && typeof maybe.then === 'function') {
+        maybe.then((res) => resolve(res || null)).catch(() => resolve(null));
+      }
+    } catch {
+      resolve(null);
+    }
+  }));
+
   S.getRemoteConfigUrl = async function getRemoteConfigUrl() {
     let override = null;
     try {
-      const stored = await chrome?.storage?.local?.get?.(['striffsConfigUrl']);
+      const stored = await S.storageGet('local', ['striffsConfigUrl']);
       const v = stored?.striffsConfigUrl;
       if (typeof v === 'string' && v.trim()) override = v.trim();
     } catch {}
     return override || S.REMOTE_CONFIG_URL;
   };
 
-  S.fetchRemoteConfig = async function fetchRemoteConfig() {
+  S.fetchRemoteConfig = async function fetchRemoteConfig({ force = false } = {}) {
     const url = await S.getRemoteConfigUrl();
     if (!url) return null;
-    try {
-      const resp = await S.bgRequest?.(
-        { type: 'fetchRemoteConfig', url },
-        (S.TIMEOUTS?.message) || 7000
-      );
-      if (resp && resp.ok && resp.json) {
-        S.__remoteConfig = resp.json;
-        return resp.json;
-      }
-      S.cwarn?.('Remote config fetch failed', resp?.status || resp?.error);
-      return null;
-    } catch (e) {
-      S.cwarn?.('Remote config unreachable', e);
-      return null;
+    const now = Date.now();
+    const urlChanged = S.__remoteConfigUrl && S.__remoteConfigUrl !== url;
+    S.__remoteConfigUrl = url;
+    if (S.__remoteConfigPromise && !force) return S.__remoteConfigPromise;
+    // Try persisted cache (chrome.storage.local) before network.
+    if (!force && !urlChanged) {
+      try {
+        const cached = await S.storageGet('local', ['striffsRemoteConfig', 'striffsRemoteConfigFetchedAt', 'striffsRemoteConfigUrl']);
+        const cachedCfg = cached?.striffsRemoteConfig || null;
+        const cachedAt = Number(cached?.striffsRemoteConfigFetchedAt || 0);
+        const cachedUrl = cached?.striffsRemoteConfigUrl || null;
+        if (
+          cachedCfg &&
+          cachedAt &&
+          cachedUrl === url &&
+          (now - cachedAt) < S.REMOTE_CONFIG_TTL_MS
+        ) {
+          S.__remoteConfig = cachedCfg;
+          S.__remoteConfigFetchedAt = cachedAt;
+          S.__remoteConfigUrl = cachedUrl;
+          try {
+            const exts = S.extractSupportedExtensionsFromConfig?.(cachedCfg) || [];
+            if (exts.length) {
+              S.registerSupportedExtensions?.(exts);
+              S.__supportedExtensionsFetchedAt = cachedAt;
+            }
+          } catch {}
+          return cachedCfg;
+        }
+      } catch {}
     }
+    if (
+      !force &&
+      !urlChanged &&
+      S.__remoteConfig &&
+      S.__remoteConfigFetchedAt &&
+      (now - S.__remoteConfigFetchedAt) < S.REMOTE_CONFIG_TTL_MS
+    ) {
+      return S.__remoteConfig;
+    }
+    if (!force && S.__remoteConfigFetchAttemptAt && (now - S.__remoteConfigFetchAttemptAt) < 5000) {
+      return S.__remoteConfig || null;
+    }
+    S.__remoteConfigFetchAttemptAt = now;
+    S.__remoteConfigFetchFailed = false;
+    S.__remoteConfigFetchError = null;
+    S.__remoteConfigPromise = (async () => {
+      try {
+        const resp = await S.bgRequest?.(
+          { type: 'fetchRemoteConfig', url },
+          (S.TIMEOUTS?.message) || 7000
+        );
+        if (resp && resp.ok && resp.json) {
+          S.__remoteConfig = resp.json;
+          S.__remoteConfigFetchedAt = Date.now();
+          S.__remoteConfigUrl = url;
+          S.__remoteConfigFetchFailed = false;
+          S.__remoteConfigFetchError = null;
+          try {
+            chrome?.storage?.local?.set?.({
+              striffsRemoteConfig: resp.json,
+              striffsRemoteConfigFetchedAt: S.__remoteConfigFetchedAt,
+              striffsRemoteConfigUrl: url
+            }, () => {});
+          } catch {}
+          S.applyRemoteDisableIfNeeded?.(resp.json);
+          try {
+            const exts = S.extractSupportedExtensionsFromConfig?.(resp.json) || [];
+            if (exts.length) {
+              S.registerSupportedExtensions?.(exts);
+              S.__supportedExtensionsFetchedAt = Date.now();
+            }
+          } catch {}
+          return resp.json;
+        }
+        S.__remoteConfigFetchFailed = true;
+        S.__remoteConfigFetchError = resp?.status || resp?.error || 'fetch failed';
+        S.cwarn?.('Remote config fetch failed', resp?.status || resp?.error);
+        return null;
+      } catch (e) {
+        S.__remoteConfigFetchFailed = true;
+        S.__remoteConfigFetchError = String(e?.message || e);
+        S.cwarn?.('Remote config unreachable', e);
+        return null;
+      } finally {
+        S.__remoteConfigPromise = null;
+      }
+    })();
+    return S.__remoteConfigPromise;
+  };
+
+  S.fetchSupportedLanguagesFromApi = async function fetchSupportedLanguagesFromApi({ force = false } = {}) {
+    try {
+      const now = Date.now();
+      const messageTimeoutMs = (S.TIMEOUTS?.message) || 7000;
+      if (!force) {
+        try {
+          const cached = await S.storageGet('local', ['striffsSupportedLangs', 'striffsSupportedLangsFetchedAt']);
+          const cachedText = cached?.striffsSupportedLangs || '';
+          const cachedAt = Number(cached?.striffsSupportedLangsFetchedAt || 0);
+          if (cachedText && cachedAt && (now - cachedAt) < S.SUPPORTED_LANGS_TTL_MS) {
+            return String(cachedText);
+          }
+        } catch {}
+        try {
+          const resp = await S.bgRequest?.({ type: 'getSupportedLanguagesCache' }, messageTimeoutMs);
+          const cached = resp?.cached || null;
+          const cachedText = cached?.striffsSupportedLangs || '';
+          const cachedAt = Number(cached?.striffsSupportedLangsFetchedAt || 0);
+          if (cachedText && cachedAt && (now - cachedAt) < S.SUPPORTED_LANGS_TTL_MS) {
+            return String(cachedText);
+          }
+        } catch {}
+      }
+      const resp = await S.bgRequest?.({ type: 'fetchSupportedLanguages' }, messageTimeoutMs);
+      const text = resp?.text || '';
+      if (resp?.ok && typeof text === 'string' && text.trim()) {
+        try {
+          chrome.storage?.local?.set({
+            striffsSupportedLangs: text,
+            striffsSupportedLangsFetchedAt: now
+          });
+        } catch {}
+        return text;
+      }
+    } catch {}
+    return '';
   };
 
   S.disableStriffsButton = function disableStriffsButton(message) {
@@ -181,37 +650,137 @@
   S.sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
   // ---------- Cache clearing (per-page) ----------
-  S.clearLocalDiagramCaches = () => {
-    const prefixes = ["striffs:", "StriffsCache:"];
+  S.clearLocalDiagramCaches = async (opts = {}) => {
+    const preserveClearFlag = !!opts.preserveClearFlag;
+    const DEBUG_KEY_LOWER = "striffsdebug";
+    const prefixes = ["striffs:", "striffscache:", "striffscachemeta:"];
+    const chromeCacheKeys = [
+      "striffsActiveTab",
+      "striffsRemoteConfig",
+      "striffsRemoteConfigFetchedAt",
+      "striffsRemoteConfigUrl",
+      "striffsSupportedLangs",
+      "striffsSupportedLangsFetchedAt",
+      "striffsSupportedLangsBase",
+      "striffsConfigUrl",
+      "striffsApiBase"
+    ];
     const clearStore = (store) => {
       if (!store || typeof store.length !== "number") return;
       const toRemove = [];
       for (let i = 0; i < store.length; i++) {
         const key = store.key(i);
-        if (key && prefixes.some(p => key.startsWith(p))) toRemove.push(key);
+        if (!key) continue;
+        const lower = key.toLowerCase();
+        if (lower === DEBUG_KEY_LOWER) continue;
+        if (prefixes.some(p => lower.startsWith(p)) || lower.startsWith("striffs")) {
+          toRemove.push(key);
+        }
       }
       toRemove.forEach(k => { try { store.removeItem(k); } catch {} });
     };
     try { clearStore(window.localStorage); } catch {}
     try { clearStore(window.sessionStorage); } catch {}
+    try {
+      const viewKey = (typeof S.cacheKey === 'function') ? `${S.cacheKey()}:view` : null;
+      if (viewKey) {
+        try { window.localStorage.removeItem(viewKey); } catch {}
+        try { window.sessionStorage.removeItem(viewKey); } catch {}
+      }
+    } catch {}
+    try {
+      if (chrome?.storage?.local) {
+        const items = await new Promise((resolve) => {
+          try {
+            chrome.storage.local.get(null, (res) => resolve(res || {}));
+          } catch {
+            resolve({});
+          }
+        });
+        const keys = Object.keys(items || {});
+        const toRemove = keys.filter((k) => {
+          if (!k) return false;
+          if (k === "ghToken") return false;
+          if (String(k).toLowerCase() === DEBUG_KEY_LOWER) return false;
+          if (preserveClearFlag && k === "striffsCacheClearAt") return false;
+          const lower = k.toLowerCase();
+          return chromeCacheKeys.includes(k) || prefixes.some((p) => lower.startsWith(p)) || lower.startsWith("striffs");
+        });
+        if (toRemove.length) {
+          await new Promise((resolve) => {
+            try {
+              chrome.storage.local.remove(toRemove, () => resolve(true));
+            } catch {
+              resolve(false);
+            }
+          });
+        }
+      }
+    } catch {}
+
+    S.__suppressViewPersist = true;
+    try { setTimeout(() => { S.__suppressViewPersist = false; }, 2000); } catch {}
 
     S.__striffsReady = false;
     S.__striffsSvg = null;
-    S.__striffsPanzoom = null;
     S.__striffsPathToComponentId?.clear?.();
     S.__striffsComponentIdToFile?.clear?.();
     S.__filePathToDiffId?.clear?.();
     S.state?.resetPanState?.();
     S.state?.resetInitialFit?.();
     S.state?.resetTooLarge?.();
+    S.__remoteConfig = null;
+    S.__remoteConfigFetchedAt = 0;
+    S.__remoteConfigUrl = null;
+    S.__remoteConfigFetchAttemptAt = 0;
+    S.__remoteConfigFetchFailed = false;
+    S.__remoteConfigFetchError = null;
+    S.__remoteConfigPromise = null;
+    S.__supportedExtensionsForUi = [];
+    S.__supportedExtensionsFetchedAt = 0;
+    S.__supportedExtensionsPromise = null;
+    S.__suppressCacheWritesUntil = Date.now() + 2000;
+    try { delete window.__striffsCacheMeta; delete window.__striffsCacheKey; delete window.__striffsCacheTooLarge; } catch {}
+    try {
+      const d = document.documentElement?.dataset;
+      if (d) {
+        delete d.striffsCacheSavedAt;
+        delete d.striffsCacheKey;
+        delete d.striffsCacheTooLarge;
+      }
+    } catch {}
+  };
+
+  S.checkGlobalCacheClearFlag = async () => {
+    try {
+      if (!chrome?.storage?.local) return false;
+      const data = await new Promise((resolve) =>
+        chrome.storage.local.get(["striffsCacheClearAt"], (res) => resolve(res || {}))
+      );
+      const ts = Number(data?.striffsCacheClearAt || 0);
+      if (!ts) return false;
+      if (!S.__cacheClearSeenAt || ts > S.__cacheClearSeenAt) {
+        S.__cacheClearSeenAt = ts;
+        await S.clearLocalDiagramCaches({ preserveClearFlag: true });
+        return true;
+      }
+    } catch {}
+    return false;
   };
 
   if (chrome?.runtime?.onMessage?.addListener) {
     chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (msg?.type === "clearStriffsCaches") {
-        try { S.clearLocalDiagramCaches(); } catch {}
-        try { S.showDiffView?.(); } catch {}
-        sendResponse?.({ ok: true });
+        Promise.resolve()
+          .then(async () => {
+            try { await S.clearLocalDiagramCaches({ preserveClearFlag: true }); } catch {}
+            try { S.showDiffView?.(); } catch {}
+            sendResponse?.({ ok: true });
+          })
+          .catch(() => {
+            sendResponse?.({ ok: false });
+          });
+        return true;
       }
     });
   }
@@ -298,9 +867,6 @@
     return null;
   };
 
-  // ---------- Languages via background ----------
-  let __cachedExts = null;
-
   S.parseLangsToExts = (text) => {
     const langs = String(text || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
     const langToExt = {
@@ -310,117 +876,40 @@
     return langs.map(l => langToExt[l]).filter(Boolean);
   };
 
-  S.fetchSupportedExtensions = async () => {
-    if (Array.isArray(__cachedExts)) return __cachedExts;
-    await S.waitForBackgroundReady({ attempts: 5, delayMs: 150 });
-    try {
-      const resp = await S.bgRequest({ type: 'getLanguages' }, S.TIMEOUTS.getLanguages);
-      const text = resp.body ?? resp.text ?? '';
-      const exts = S.parseLangsToExts(text);
-      __cachedExts = exts;
-      S.cinfo('Supported extensions:', exts);
-      return exts;
-    } catch (err) {
-      S.cwarn('getLanguages failed:', err?.message || err);
-      return [];
-    }
+  S.normalizeExtensions = (exts) => {
+    if (!Array.isArray(exts)) return [];
+    return exts
+      .map((e) => String(e || '').trim().toLowerCase())
+      .map((e) => (e.startsWith('.') ? e.slice(1) : e))
+      .filter(Boolean);
+  };
+
+  S.extractSupportedExtensionsFromConfig = (cfg) => {
+    if (!cfg) return [];
+    const byExt = S.normalizeExtensions(cfg.supportedExtensions);
+    if (byExt.length) return byExt;
+    const byLang = typeof cfg.supportedLanguages === 'string' ? S.parseLangsToExts(cfg.supportedLanguages) : [];
+    return S.normalizeExtensions(byLang);
   };
 })();
 
 
 // ---- src/striffs-state.js ----
-// Striffs — shared state (pan/zoom, fits, storage)
+// Striffs — shared state (render flags)
 (() => {
   const S = (window.Striffs = window.Striffs || {});
-
-  const validPan = (v) =>
-    v && typeof v === 'object' &&
-    Number.isFinite(v.x) && Number.isFinite(v.y) && Number.isFinite(v.scale);
-
-  const storageKey = () => {
-    try {
-      if (typeof S.cacheKey === 'function') {
-        return `${S.cacheKey()}:pan`;
-      }
-    } catch {}
-    return null;
-  };
-
-  const state = {
-    pan: null,
-    panDirty: false,
-    initialFitDone: false,
-    tooLarge: false
-  };
-
-  const api = {
-    getPanState() {
-      if (validPan(state.pan)) return state.pan;
-      const key = storageKey();
-      if (!key) return null;
-      try {
-        const raw = localStorage.getItem(key);
-        if (!raw) return null;
-        const parsed = JSON.parse(raw);
-        if (validPan(parsed)) {
-          state.pan = parsed;
-          return state.pan;
-        }
-      } catch {}
-      return null;
-    },
-
-    setPanState(pan) {
-      if (!validPan(pan)) return;
-      state.pan = pan;
-      state.panDirty = true;
-    },
-
-    persistPanState() {
-      if (!validPan(state.pan)) return;
-      const key = storageKey();
-      if (!key) return;
-      try {
-        localStorage.setItem(key, JSON.stringify(state.pan));
-        state.panDirty = false;
-      } catch {}
-    },
-
-    resetPanState() {
-      state.pan = null;
-      state.panDirty = false;
-    },
-
-    isInitialFitDone() {
-      return state.initialFitDone;
-    },
-
-    markInitialFitDone() {
-      state.initialFitDone = true;
-    },
-
-    resetInitialFit() {
-      state.initialFitDone = false;
-    },
-
-    isPanDirty() {
-      return state.panDirty;
-    },
-
+  const state = { tooLarge: false };
+  S.state = S.state || {
     setTooLarge(flag) {
       state.tooLarge = !!flag;
     },
-
     isTooLarge() {
       return !!state.tooLarge;
     },
-
     resetTooLarge() {
       state.tooLarge = false;
     }
   };
-
-  S.state = S.state || api;
 })();
 
 
@@ -432,13 +921,15 @@
     const { cwarn } = S;
 
     S.__lastStriffsButtonState = S.__lastStriffsButtonState || null;
-    S.__supportedExtensionsForUi = S.__supportedExtensionsForUi || null;
+    S.__supportedExtensionsForUi = S.__supportedExtensionsForUi ||
+        (Array.isArray(S.DEFAULT_SUPPORTED_EXTS) ? [...S.DEFAULT_SUPPORTED_EXTS] : []);
     const State = S.state;
 
     // Observers keep buttons/files in sync with GitHub's dynamic PR UIs.
     let toolbarObserver = null;
     let toolbarMountScheduled = false;
     let filesObserver = null;
+    let filesObserverRoot = null;
     let filesCheckScheduled = false;
 
     S.isElementVisible = S.isElementVisible || ((el) => {
@@ -512,16 +1003,27 @@
     };
 
     S.refreshSupportedFilesState = () => {
-        if (!Array.isArray(S.__supportedExtensionsForUi) || S.__supportedExtensionsForUi.length === 0) return;
+        if (!Array.isArray(S.__supportedExtensionsForUi) || S.__supportedExtensionsForUi.length === 0) {
+            return;
+        }
         if (typeof S.getFilesInPR !== 'function' || typeof S.checkIfRelevantFilesExist !== 'function') return;
 
         const lastState = S.__lastStriffsButtonState || {};
-        if (lastState.loading || lastState.success || lastState.failure || S.__striffsReady) return;
+        if (lastState.loading) return;
+        if (S.__striffsReady) return;
 
         const files = S.getFilesInPR();
-        if (!Array.isArray(files) || files.length === 0) return;
+        let filesList = files;
+        if (!Array.isArray(filesList) || filesList.length === 0) {
+            const dataPathEls = document.querySelectorAll('[data-path]');
+            filesList = Array.from(dataPathEls)
+                .map(el => el.getAttribute('data-path') || '')
+                .map(t => S.stripRenamePath(t).trim().toLowerCase())
+                .filter((t) => t && (t.includes('/') || t.includes('.')));
+        }
+        if (!Array.isArray(filesList) || filesList.length === 0) return;
 
-        const hasSupported = S.checkIfRelevantFilesExist(files, S.__supportedExtensionsForUi);
+        const hasSupported = S.checkIfRelevantFilesExist(filesList, S.__supportedExtensionsForUi);
         if (hasSupported) {
             if (lastState.disabled || lastState.neutral) {
                 S.updateStriffButton({ tooltip: "Click to generate Striffs" });
@@ -531,10 +1033,16 @@
         }
     };
 
-    S.ensureFilesObserver = () => {
-        if (filesObserver || typeof MutationObserver !== 'function') return;
-        const root = document.documentElement || document.body;
+    S.ensureFilesObserver = (rootOverride) => {
+        if (typeof MutationObserver !== 'function') return;
+        const root = rootOverride || S.$$first(SELECTORS.filesRoot) || document.documentElement || document.body;
         if (!root) return;
+        if (filesObserver && filesObserverRoot === root) return;
+        if (filesObserver) {
+            try { filesObserver.disconnect(); } catch {}
+            filesObserver = null;
+            filesObserverRoot = null;
+        }
         filesObserver = new MutationObserver((mutations) => {
             for (const mut of mutations) {
                 if (mut.type !== 'childList') continue;
@@ -548,10 +1056,13 @@
             }
         });
         filesObserver.observe(root, { childList: true, subtree: true });
+        filesObserverRoot = root;
     };
 
     S.registerSupportedExtensions = (exts = []) => {
-        S.__supportedExtensionsForUi = Array.isArray(exts) ? exts : [];
+        const next = Array.isArray(exts) ? exts : [];
+        if (!next.length) return;
+        S.__supportedExtensionsForUi = next;
         S.ensureFilesObserver();
         scheduleFilesCheck();
     };
@@ -566,6 +1077,7 @@
         }
     };
     const persistView = (view) => {
+        if (S.__suppressViewPersist) return;
         const key = viewStorageKey();
         if (!key) return;
         try { localStorage.setItem(key, view); } catch {}
@@ -601,48 +1113,6 @@
     S.resetCurrentView = () => initView();
     initView();
 
-    // ---------- Pan/zoom state ----------
-    S.savePanState = (state) => {
-        State?.setPanState?.(state);
-    };
-
-    S.persistPanState = () => {
-        State?.persistPanState?.();
-    };
-
-    S.loadPanState = () => {
-        return State?.getPanState?.() || null;
-    };
-
-    S.capturePanState = () => {
-        try {
-            if (!S.__striffsPanzoom || typeof S.__striffsPanzoom.getTransform !== 'function') return;
-            const t = S.__striffsPanzoom.getTransform();
-            if (!t) return;
-            const { x, y, scale } = t;
-            if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(scale)) return;
-            S.savePanState({ x, y, scale });
-        } catch (e) {
-            cwarn('capturePanState failed', e);
-        }
-    };
-
-    S.restorePanState = () => {
-        try {
-            if (!S.__striffsPanzoom) return false;
-            const state = S.loadPanState();
-            if (!state) return false;
-            const { x, y, scale } = state;
-            if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(scale)) return false;
-            S.__striffsPanzoom.zoomAbs(0, 0, scale);
-            S.__striffsPanzoom.moveTo(x, y);
-            return true;
-        } catch (e) {
-            cwarn('restorePanState failed', e);
-            return false;
-        }
-    };
-
     // ---------- DOM utils ----------
     S.$$first = (selectors) => {
         for (const sel of selectors) {
@@ -667,13 +1137,33 @@
     };
 
     S.waitForFilesRoot = async (maxMs = 15000) => {
-        const start = Date.now();
-        while (Date.now() - start < maxMs) {
-            const el = S.$$first(SELECTORS.filesRoot);
-            if (el) return el;
-            await S.sleep(250);
+        const found = S.$$first(SELECTORS.filesRoot);
+        if (found) return found;
+        if (typeof MutationObserver !== 'function') {
+            const start = Date.now();
+            while (Date.now() - start < maxMs) {
+                const el = S.$$first(SELECTORS.filesRoot);
+                if (el) return el;
+                await S.sleep(250);
+            }
+            return S.$$first(SELECTORS.filesRoot);
         }
-        return S.$$first(SELECTORS.filesRoot);
+        return new Promise((resolve) => {
+            const root = document.documentElement || document.body;
+            if (!root) return resolve(null);
+            const obs = new MutationObserver(() => {
+                const el = S.$$first(SELECTORS.filesRoot);
+                if (el) {
+                    obs.disconnect();
+                    resolve(el);
+                }
+            });
+            obs.observe(root, { childList: true, subtree: true });
+            setTimeout(() => {
+                obs.disconnect();
+                resolve(S.$$first(SELECTORS.filesRoot));
+            }, maxMs);
+        });
     };
 
     // ---------- Toolbar discovery ----------
@@ -742,7 +1232,11 @@
             // status icons
             'check-circle': 'M8 15A7 7 0 1 0 8 1a7 7 0 0 0 0 14Zm3.78-8.72a.75.75 0 0 1 0 1.06l-4 4a.75.75 0 0 1-1.06 0l-2-2a.75.75 0 1 1 1.06-1.06L7 9.94l3.22-3.22a.75.75 0 0 1 1.06 0Z',
             alert: 'M7.53 1.21a1 1 0 0 1 1.94 0l6.17 11.94A1 1 0 0 1 14.76 15H1.24a1 1 0 0 1-.88-1.85L7.53 1.21zM8 5a.75.75 0 0 0-.75.82l.25 3a.5.5 0 0 0 1 0l.25-3A.75.75 0 0 0 8 5zm0 6a1 1 0 1 0 0 2 1 1 0 0 0 0-2z',
-            'circle-slash': 'M8 1.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13Zm3.182 2.318a5 5 0 0 1 .768 6.14L4.042 2.05A5 5 0 0 1 11.182 3.818ZM2.05 4.042l7.296 7.296A5 5 0 0 1 2.05 4.042Z'
+            'circle-slash': 'M8 1.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13Zm3.182 2.318a5 5 0 0 1 .768 6.14L4.042 2.05A5 5 0 0 1 11.182 3.818ZM2.05 4.042l7.296 7.296A5 5 0 0 1 2.05 4.042Z',
+            question: 'M8 1.75a6.25 6.25 0 1 1 0 12.5a6.25 6.25 0 0 1 0-12.5Zm0 9.75a1 1 0 1 0 0 2a1 1 0 0 0 0-2ZM8 4.5a2.5 2.5 0 0 0-2.5 2.5.75.75 0 0 0 1.5 0 1 1 0 1 1 1.5.87c0 .5-.28.75-.86 1.17-.55.4-1.39 1-1.39 2.21a.75.75 0 0 0 1.5 0c0-.45.2-.64.82-1.08.62-.44 1.93-1.36 1.93-3.05A2.5 2.5 0 0 0 8 4.5Z',
+            download: 'M8 1.75a.75.75 0 0 1 .75.75v6.19l1.72-1.72a.75.75 0 1 1 1.06 1.06l-3 3a.75.75 0 0 1-1.06 0l-3-3a.75.75 0 0 1 1.06-1.06l1.72 1.72V2.5A.75.75 0 0 1 8 1.75ZM2 12.25c0-.414.336-.75.75-.75h10.5a.75.75 0 0 1 .75.75v1.5A1.25 1.25 0 0 1 12.75 15H3.25A1.25 1.25 0 0 1 2 13.75Z',
+            reset: 'M8 1.75a6.25 6.25 0 1 1-4.42 1.83.75.75 0 1 1 1.06 1.06A4.75 4.75 0 1 0 8 3.25c-1.15 0-2.2.41-3.02 1.09l1.02 1.02a.75.75 0 1 1-1.06 1.06l-2.5-2.5a.75.75 0 0 1 0-1.06l2.5-2.5a.75.75 0 1 1 1.06 1.06l-.88.88A6.22 6.22 0 0 1 8 1.75Z',
+            save: 'M8 1.75a.75.75 0 0 1 .75.75v6.19l1.72-1.72a.75.75 0 1 1 1.06 1.06l-3 3a.75.75 0 0 1-1.06 0l-3-3a.75.75 0 0 1 1.06-1.06l1.72 1.72V2.5A.75.75 0 0 1 8 1.75ZM2 12.25c0-.414.336-.75.75-.75h10.5a.75.75 0 0 1 .75.75v1.5A1.25 1.25 0 0 1 12.75 15H3.25A1.25 1.25 0 0 1 2 13.75Z'
         };
         const d = pathMap[name] || pathMap.file;
         return `<svg aria-hidden="true" height="16" viewBox="0 0 16 16" width="16" style="vertical-align: text-bottom; fill: currentColor;"><path d="${d}"></path></svg>`;
@@ -788,7 +1282,7 @@
             slot.style.gap = '6px';
             slot.style.alignItems = 'center';
             slot.style.marginLeft = '8px';
-            slot.style.visibility = 'hidden';
+            slot.style.visibility = 'visible';
 
             const viewedCount = row.querySelector(
                 'span[class*="ViewedFileProgress-module__FilesCountText"]'
@@ -806,17 +1300,32 @@
         }
 
         const onDiffClick = () => {
+            S.emitEngagementEvent?.("diffs_button_pressed", {
+                fromView: S.getCurrentView?.() || null
+            });
             S.showDiffView();
             S.saveActiveTab('diffs');
         };
 
         const onStriffClick = async () => {
+            S.emitEngagementEvent?.("striffs_button_pressed", {
+                fromView: S.getCurrentView?.() || null,
+                ready: Boolean(S.__striffsReady && S.__striffsSvg),
+                disabledByRemote: Boolean(S.__disabledByRemote)
+            });
             if (S.__disabledByRemote) {
                 S.disableStriffsButton();
                 return;
             }
-            // FIRST PHASE: diagram not ready yet → generate only, stay on diffs.
-            if (!S.__striffsReady || !S.__striffsSvg || !S.__striffsPanzoom) {
+            // If diagram is ready, do not refetch; just show Striffs.
+            if (S.__striffsReady && S.__striffsSvg) {
+                S.showStriffView();
+                S.saveActiveTab('striffs');
+                return;
+            }
+
+            // FIRST PHASE: diagram not ready yet → generate then show Striffs.
+            if (!S.__striffsReady || !S.__striffsSvg) {
                 S.updateStriffButton({
                     loading: true,
                     tooltip: "Generating Striffs…",
@@ -828,7 +1337,9 @@
                 // updates __striffsReady / __striffsSvg.
                 if (!ok) return;
 
-                // Do NOT change view here. User stays on diffs.
+                // Show Striffs immediately after a successful generation.
+                S.showStriffView();
+                S.saveActiveTab('striffs');
                 return;
             }
 
@@ -854,6 +1365,14 @@
         S.setActiveButtons?.(S.getCurrentView());
         if (S.__disabledByRemote) {
             S.disableStriffsButton();
+        }
+        if (!S.__remoteConfigPostMountApplied) {
+            S.__remoteConfigPostMountApplied = true;
+            try {
+                S.fetchRemoteConfig?.().then((cfg) => {
+                    S.applyRemoteDisableIfNeeded?.(cfg);
+                });
+            } catch {}
         }
     };
 
@@ -989,11 +1508,13 @@
     gap: 3px;
     padding: 2px 12px;
     border-radius: 6px;
-    transition: background-color .12s ease, border-color .12s ease, color .12s ease;
+    transition: background-color .12s ease, border-color .12s ease, color .12s ease, box-shadow .12s ease;
+    box-shadow: 0 0 0 0 transparent;
   }
   .striffs-local-btn:hover {
     background: var(--button-default-bgColor-hover, var(--color-btn-hover-bg, #eef1f4));
     text-decoration: none;
+    box-shadow: 0 4px 10px rgba(15, 23, 42, 0.16);
   }
   .striffs-local-btn:disabled {
     opacity: .75;
@@ -1023,6 +1544,7 @@
     border: 1px solid var(--borderColor-muted, var(--color-border-default, #d0d7de));
     background: var(--bgColor-default, var(--color-canvas-default, #fff));
     color: var(--fgColor-default, var(--color-fg-default, #24292f));
+    font-weight: 700;
     transform: translateY(-8px);
     opacity: 0;
     transition: opacity .2s ease, transform .2s ease, background-color .18s ease, border-color .18s ease;
@@ -1069,16 +1591,106 @@
     width: 100%;
     border: 1px solid #444;
   }
+  #striffs-scroll{
+    position: relative;
+    width: 100%;
+    height: 100%;
+    overflow: auto;
+  }
+  #striffs-controls-wrap{
+    position: absolute;
+    bottom: 10px;
+    right: 10px;
+    z-index: 3;
+    display: flex;
+    justify-content: flex-end;
+    pointer-events: none;
+  }
+  #striffs-controls{
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    pointer-events: auto;
+  }
+  .striffs-ctl-btn{
+    appearance: none;
+    border: 1px solid #5a5a5a;
+    background: rgba(14,14,14,0.94);
+    color: #ffdead;
+    border-radius: 8px;
+    padding: 9px 11px;
+    font-size: 13px;
+    line-height: 1;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.12);
+    text-decoration: none;
+    transition: box-shadow .18s ease, transform .18s ease, background .18s ease;
+  }
+  .striffs-ctl-btn:hover{
+    background: rgba(28,28,28,0.98);
+    box-shadow: 0 6px 16px rgba(0,0,0,0.35);
+    transform: translateY(-1px);
+    color: #ffdead;
+  }
+  .striffs-ctl-btn:active{
+    transform: translateY(0);
+    box-shadow: 0 2px 6px rgba(0,0,0,0.16);
+  }
+  .striffs-ctl-btn svg{
+    width: 18px;
+    height: 18px;
+  }
+  .striffs-zoom-reset{
+    appearance: none;
+    border: 1px solid var(--borderColor-muted, #d0d7de);
+    background: var(--button-default-bgColor-rest, #f6f8fa);
+    color: var(--fgColor-default, #24292f);
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-size: 12px;
+    line-height: 18px;
+    cursor: pointer;
+  }
+  .striffs-zoom-reset:hover{
+    background: var(--button-default-bgColor-hover, #eef1f4);
+  }
   #striff-diagram-view .striff-svg-wrap{
     position: relative;
     width: 100%;
     height: 100%;
   }
   #striff-diagram-view svg{
-    width: 100%;
-    height: 100%;
+    width: auto;
+    height: auto;
+    max-width: none;
+    max-height: none;
     display: block;
-    cursor: move;
+    cursor: default;
+  }
+  #striff-diagram-view.is-panning{
+    cursor: grabbing;
+  }
+  #striff-diagram-view.is-panning svg{
+    cursor: grabbing;
+  }
+  #striff-diagram-view svg:active{
+    cursor: grabbing;
+  }
+  #striff-diagram-view svg g.entity[data-qualified-name]{
+    transition: filter .18s ease, stroke-width .18s ease;
+    cursor: pointer;
+  }
+  #striff-diagram-view svg g.entity[data-qualified-name]:hover{
+    filter: drop-shadow(0 6px 16px rgba(0,0,0,0.38));
+  }
+  /* File tree grayout for unmapped files */
+  .striffs-file-disabled{
+    opacity: 0.35;
+    pointer-events: none;
   }
   #striffs-toast{position:absolute;top:6px;left:8px;background:var(--bgColor-default, #fff);border:1px solid #f0a3a3;color:#b00020;padding:6px 10px;border-radius:6px;font-size:12px;box-shadow:0 1px 4px rgba(0,0,0,.08);opacity:0;transition:opacity .2s}
   #striffs-toast.show{opacity:1}
@@ -1133,10 +1745,289 @@
             striffView.id = "striff-diagram-view";
             striffView.style.marginTop = "20px";
             striffView.style.display = "none";
-            striffView.innerHTML = `<div id="striffs-toast" role="status" aria-live="polite"></div><p>Loading Striffs...</p>`;
+            striffView.tabIndex = 0;
+            striffView.innerHTML = `
+              <div id="striffs-controls-wrap">
+                <div id="striffs-controls">
+                  <button id="striffs-zoom-reset" type="button" class="striffs-ctl-btn" title="Reset">
+                    ${S.octicon('reset')}
+                  </button>
+                  <button id="striffs-download-btn" type="button" class="striffs-ctl-btn" title="Save">
+                    ${S.octicon('save')}
+                  </button>
+                  <a id="striffs-guide-btn" class="striffs-ctl-btn" href="https://google.com" target="_blank" rel="noopener noreferrer" title="Guide">
+                    ${S.octicon('question')}
+                  </a>
+                </div>
+              </div>
+              <div id="striffs-scroll">
+                <div id="striffs-toast" role="status" aria-live="polite"></div>
+                <div id="striffs-content"><p>Loading Striffs...</p></div>
+              </div>`;
             filesWrapper.appendChild(striffView);
         } else if (!striffView.querySelector("#striffs-toast")) {
-            striffView.insertAdjacentHTML("afterbegin", `<div id="striffs-toast" role="status" aria-live="polite"></div>`);
+            const scroll = striffView.querySelector("#striffs-scroll");
+            if (scroll) {
+              scroll.insertAdjacentHTML("afterbegin", `<div id="striffs-toast" role="status" aria-live="polite"></div>`);
+            } else {
+              striffView.insertAdjacentHTML("afterbegin", `<div id="striffs-toast" role="status" aria-live="polite"></div>`);
+            }
+        }
+        if (!striffView.querySelector("#striffs-scroll")) {
+            striffView.insertAdjacentHTML(
+              "beforeend",
+              `<div id="striffs-scroll">
+                <div id="striffs-toast" role="status" aria-live="polite"></div>
+                <div id="striffs-content"></div>
+              </div>`
+            );
+        }
+        if (!striffView.querySelector("#striffs-content")) {
+            striffView.querySelector("#striffs-scroll")?.insertAdjacentHTML("beforeend", `<div id="striffs-content"></div>`);
+        }
+        if (!striffView.querySelector("#striffs-controls-wrap")) {
+            striffView.insertAdjacentHTML(
+              "afterbegin",
+              `<div id="striffs-controls-wrap">
+                <div id="striffs-controls">
+                  <button id="striffs-zoom-reset" type="button" class="striffs-ctl-btn" title="Reset">
+                    ${S.octicon('reset')}
+                  </button>
+                  <button id="striffs-download-btn" type="button" class="striffs-ctl-btn" title="Save">
+                    ${S.octicon('save')}
+                  </button>
+                  <a id="striffs-guide-btn" class="striffs-ctl-btn" href="https://google.com" target="_blank" rel="noopener noreferrer" title="Guide">
+                    ${S.octicon('question')}
+                  </a>
+                </div>
+              </div>`
+            );
+        }
+        const controls = striffView.querySelector("#striffs-controls");
+        if (controls && !controls.querySelector("#striffs-guide-btn")) {
+            controls.insertAdjacentHTML(
+              "beforeend",
+              `<a id="striffs-guide-btn" class="striffs-ctl-btn" href="https://google.com" target="_blank" rel="noopener noreferrer" title="Guide">
+                ${S.octicon('question')}
+              </a>`
+            );
+        }
+        if (controls && !controls.querySelector("#striffs-download-btn")) {
+            const guide = controls.querySelector("#striffs-guide-btn");
+            const html = `<button id="striffs-download-btn" type="button" class="striffs-ctl-btn" title="Save">
+              ${S.octicon('save')}
+            </button>`;
+            if (guide) {
+              guide.insertAdjacentHTML("beforebegin", html);
+            } else {
+              controls.insertAdjacentHTML("beforeend", html);
+            }
+        }
+        if (!striffView.__striffsZoomBound) {
+            striffView.__striffsZoomBound = true;
+            const resetBtn = striffView.querySelector('#striffs-zoom-reset');
+            if (resetBtn) {
+                resetBtn.addEventListener('click', () => {
+                    const svg = S.__striffsSvg || striffView.querySelector('#striffs-content svg');
+                    const scrollEl = striffView.querySelector('#striffs-scroll') || striffView;
+                    S.__striffsZoom = 1;
+                    if (svg) {
+                        svg.style.transformOrigin = '0 0';
+                        svg.style.transform = 'scale(1)';
+                    }
+                    try {
+                        scrollEl.scrollTop = 0;
+                        scrollEl.scrollLeft = 0;
+                    } catch {}
+                });
+            }
+            const downloadBtn = striffView.querySelector('#striffs-download-btn');
+            if (downloadBtn) {
+                downloadBtn.addEventListener('click', () => {
+                    const svg = S.__striffsSvg || striffView.querySelector('#striffs-content svg');
+                    if (!svg) {
+                      S.toast?.("No SVG available to download yet.", "neutral", { timeoutMs: 3000 });
+                      return;
+                    }
+                    const sourceSvg = S.__striffsSvg || svg;
+                    const clone = sourceSvg.cloneNode(true);
+                    if (!clone.getAttribute('xmlns')) {
+                      clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+                    }
+                    if (!clone.getAttribute('xmlns:xlink')) {
+                      clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink');
+                    }
+                    let svgText = '';
+                    try {
+                      const serializer = new XMLSerializer();
+                      svgText = serializer.serializeToString(clone);
+                    } catch (err) {
+                      svgText = clone.outerHTML || '';
+                    }
+                    if (!svgText) {
+                      S.toast?.("Unable to serialize SVG for download.", "neutral", { timeoutMs: 3000 });
+                      return;
+                    }
+                    svgText = svgText.replace(/<!--[\s\S]*?-->/g, '');
+                    if (!svgText.startsWith('<?xml')) {
+                      svgText = `<?xml version="1.0" encoding="UTF-8"?>\n${svgText}`;
+                    }
+                    const blob = new Blob([svgText], { type: 'image/svg+xml;charset=utf-8' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = 'striffs-diagram.svg';
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                    setTimeout(() => URL.revokeObjectURL(url), 500);
+                });
+            }
+            let isPanning = false;
+            let panStartX = 0;
+            let panStartY = 0;
+            let panScrollLeft = 0;
+            let panScrollTop = 0;
+            let panMoved = false;
+            let panDistance = 0;
+            let lastMouseX = 0;
+            let lastMouseY = 0;
+            let panOp = null;
+            let zoomOp = null;
+            let zoomFinalizeTimer = 0;
+            const scrollEl = striffView.querySelector('#striffs-scroll') || striffView;
+            const normalizePanZoomSnapshot = (snap) => {
+                const safe = snap || {};
+                return {
+                    coordinates: safe.coordinates || { x: Number(scrollEl.scrollLeft || 0), y: Number(scrollEl.scrollTop || 0) },
+                    zoom: Number(safe.zoom || S.__striffsZoom || 1),
+                    viewport: safe.viewport || { width: Number(scrollEl.clientWidth || 0), height: Number(scrollEl.clientHeight || 0) },
+                    viewableComponentIds: Array.isArray(safe.viewableComponentIds) ? safe.viewableComponentIds : [],
+                    viewableComponentCount: Number(safe.viewableComponentCount || 0),
+                    viewableComponentIdsTruncated: Boolean(safe.viewableComponentIdsTruncated)
+                };
+            };
+            const emitPanZoomOperation = (operation, startedAt, startSnap, endSnap, extraEvent = {}) => {
+                const start = normalizePanZoomSnapshot(startSnap);
+                const end = normalizePanZoomSnapshot(endSnap);
+                const durationMs = Math.max(0, Date.now() - Number(startedAt || Date.now()));
+                S.emitEngagementEvent?.("pan_zoom_operation", {
+                    operation,
+                    durationMs,
+                    startCoordinates: start.coordinates,
+                    endCoordinates: end.coordinates,
+                    zoomStart: start.zoom,
+                    zoomEnd: end.zoom,
+                    ...extraEvent
+                }, {
+                    viewportStart: start.viewport,
+                    viewportEnd: end.viewport,
+                    initialViewableComponents: start.viewableComponentIds,
+                    initialViewableComponentCount: start.viewableComponentCount,
+                    initialViewableComponentIdsTruncated: start.viewableComponentIdsTruncated,
+                    endingViewableComponents: end.viewableComponentIds,
+                    endingViewableComponentCount: end.viewableComponentCount,
+                    endingViewableComponentIdsTruncated: end.viewableComponentIdsTruncated
+                });
+            };
+            const finalizeZoomOperation = () => {
+                if (!zoomOp) return;
+                if (zoomFinalizeTimer) {
+                    clearTimeout(zoomFinalizeTimer);
+                    zoomFinalizeTimer = 0;
+                }
+                const end = S.capturePanZoomSnapshot?.();
+                emitPanZoomOperation("zoom", zoomOp.startedAt, zoomOp.start, end, {
+                    wheelSteps: Number(zoomOp.wheelSteps || 0)
+                });
+                zoomOp = null;
+            };
+            const scheduleZoomFinalize = () => {
+                if (zoomFinalizeTimer) clearTimeout(zoomFinalizeTimer);
+                zoomFinalizeTimer = window.setTimeout(
+                    finalizeZoomOperation,
+                    Number(S.ENGAGEMENT_ZOOM_IDLE_MS || 220)
+                );
+            };
+            scrollEl.addEventListener('mousedown', (e) => {
+                if (e.button !== 0) return;
+                if (e.target && e.target.closest && e.target.closest('#striffs-controls')) return;
+                finalizeZoomOperation();
+                isPanning = true;
+                panMoved = false;
+                panDistance = 0;
+                panStartX = e.clientX;
+                panStartY = e.clientY;
+                lastMouseX = e.clientX;
+                lastMouseY = e.clientY;
+                panScrollLeft = scrollEl.scrollLeft;
+                panScrollTop = scrollEl.scrollTop;
+                panOp = {
+                    startedAt: Date.now(),
+                    start: S.capturePanZoomSnapshot?.()
+                };
+                striffView.classList.add('is-panning');
+                e.preventDefault();
+            });
+            window.addEventListener('mousemove', (e) => {
+                if (!isPanning) return;
+                const dx = e.clientX - panStartX;
+                const dy = e.clientY - panStartY;
+                scrollEl.scrollLeft = panScrollLeft - dx;
+                scrollEl.scrollTop = panScrollTop - dy;
+                const incrX = e.clientX - lastMouseX;
+                const incrY = e.clientY - lastMouseY;
+                panMoved = panMoved || (Math.abs(incrX) > 1 || Math.abs(incrY) > 1);
+                panDistance += Math.abs(incrX) + Math.abs(incrY);
+                lastMouseX = e.clientX;
+                lastMouseY = e.clientY;
+            });
+            window.addEventListener('mouseup', () => {
+                if (!isPanning) return;
+                isPanning = false;
+                striffView.classList.remove('is-panning');
+                if (panMoved && panDistance > 10) {
+                    S.__recentPanAt = Date.now();
+                    emitPanZoomOperation(
+                        "pan",
+                        panOp?.startedAt,
+                        panOp?.start,
+                        S.capturePanZoomSnapshot?.(),
+                        { distancePx: Math.round(panDistance) }
+                    );
+                }
+                panOp = null;
+                panMoved = false;
+                panDistance = 0;
+            });
+            scrollEl.addEventListener('wheel', (e) => {
+                const svg = S.__striffsSvg || striffView.querySelector('#striffs-content svg');
+                if (!svg) return;
+                e.preventDefault();
+                const viewportHeight = scrollEl.clientHeight || 0;
+                const viewportBottom = scrollEl.scrollTop + viewportHeight;
+                const maxTop = scrollEl.scrollHeight - viewportHeight;
+                const atBottom = maxTop > 0 && viewportBottom >= maxTop - 1;
+                const delta = e.deltaY || 0;
+                const factor = delta > 0 ? S.ZOOM_OUT : S.ZOOM_IN;
+                const current = Number(S.__striffsZoom) || 1;
+                const next = S.clampZoom(current * factor);
+                if (next === current) return;
+                const clientY = atBottom
+                    ? (scrollEl.getBoundingClientRect().top + viewportHeight / 2)
+                    : e.clientY;
+                if (!zoomOp) {
+                    zoomOp = {
+                        startedAt: Date.now(),
+                        start: S.capturePanZoomSnapshot?.(),
+                        wheelSteps: 0
+                    };
+                }
+                const didApply = S.applyZoomAtPoint(scrollEl, svg, next, e.clientX, clientY);
+                if (!didApply) return;
+                zoomOp.wheelSteps = Number(zoomOp.wheelSteps || 0) + 1;
+                scheduleZoomFinalize();
+            }, { passive: false });
         }
         return striffView;
     };
@@ -1182,30 +2073,28 @@
         });
     };
 
-    S.showDiffView = () => {
-        S.capturePanState?.();
-        S.persistPanState?.();
-        S.showAllDiffs();
-        const striffView = document.getElementById("striff-diagram-view");
-        if (striffView) striffView.style.display = "none";
-        S.setCurrentView('diffs');
-    };
+  S.showDiffView = () => {
+    S.resetFileTreeAvailability?.();
+    S.showAllDiffs();
+    const striffView = document.getElementById("striff-diagram-view");
+    if (striffView) striffView.style.display = "none";
+    S.setCurrentView('diffs');
+  };
 
-    S.showStriffView = () => {
-        S.hideAllDiffs();
-        const striffView = S.ensureStriffContainer();
-        if (striffView) {
-            striffView.style.display = "block";
-            S.resizeStriffView();
-            if (S.__striffsSvg && S.__striffsPanzoom) {
-                const restored = S.restorePanState?.();
-                const fitDone = State?.isInitialFitDone?.();
-                if (!restored && !fitDone) {
-                    S.fitSvgToContainer(S.__striffsSvg, S.__striffsPanzoom);
-                    S.capturePanState?.();
-                    State?.markInitialFitDone?.();
-                }
-            }
+  S.showStriffView = () => {
+    S.hideAllDiffs();
+    S.updateFileTreeAvailability?.();
+    const striffView = S.ensureStriffContainer();
+    if (striffView) {
+      striffView.style.display = "block";
+      S.resizeStriffView();
+      if (!S.__striffsSvg) {
+          const svg = striffView.querySelector('#striffs-content svg') || document.querySelector('#striffs-content svg');
+          if (svg) S.__striffsSvg = svg;
+      }
+      if (S.__striffsSvg) {
+          S.__striffsSvg.style.pointerEvents = 'auto';
+      }
         }
         S.setCurrentView('striffs');
     };
@@ -1222,15 +2111,6 @@
                 resolve("diffs");
             }
         });
-
-    // Persist pan state on tab close/visibility changes to survive PJAX/Turbo swaps
-    const persistOnHidden = () => {
-        if (document.visibilityState === 'hidden') {
-            S.persistPanState?.();
-        }
-    };
-    document.addEventListener('visibilitychange', persistOnHidden, { passive: true });
-    window.addEventListener('beforeunload', () => S.persistPanState?.());
 
     S.ensureToolbarObserver?.();
     S.ensureFilesObserver?.();
@@ -1297,6 +2177,128 @@
     document.querySelector('time')?.getAttribute('datetime') ||
     null;
 
+  S.isPrivateRepo = () => {
+    const meta = document.querySelector('meta[name="octolytics-dimension-repository_public"]')?.getAttribute('content');
+    if (typeof meta === 'string' && meta.trim().toLowerCase() === 'false') return true;
+    const label = Array.from(document.querySelectorAll('.Label, .Label--secondary, [data-view-component="true"].Label'))
+      .find(el => (el.textContent || '').trim().toLowerCase() === 'private');
+    return !!label;
+  };
+
+  // ---------- File tree availability (disable unmapped files in Striff view) ----------
+  S.resetFileTreeAvailability = () => {
+    document.querySelectorAll('.striffs-file-disabled').forEach(li => {
+      li.classList.remove('striffs-file-disabled');
+      li.removeAttribute('aria-disabled');
+      li.removeAttribute('data-striffs-mapped');
+    });
+  };
+
+  S.updateFileTreeAvailability = () => {
+    try {
+      if (!S.__striffsPathToComponentId || !S.__striffsPathToComponentId.size) return;
+      const items = S.$$all?.(["li[id^='file-tree-item-diff-']", "li[data-tree-entry-type='file']"]) || [];
+      items.forEach(li => {
+        const span =
+          li.querySelector("[data-filterable-item-text]") ||
+          li.querySelector("span.ActionList-item-label") ||
+          li.querySelector("[data-testid='file-tree-item-text']");
+        const raw = span?.textContent || "";
+        const norm = S.normalizePath(S.stripRenamePath(raw));
+        const hasComponent = S.__striffsPathToComponentId.has("/" + norm);
+        if (hasComponent) {
+          li.classList.remove('striffs-file-disabled');
+          li.removeAttribute('aria-disabled');
+          li.setAttribute('data-striffs-mapped', '1');
+        } else {
+          li.classList.add('striffs-file-disabled');
+          li.setAttribute('aria-disabled', 'true');
+          li.setAttribute('data-striffs-mapped', '0');
+        }
+      });
+    } catch (e) {
+      S.cwarn?.('updateFileTreeAvailability failed', e);
+    }
+  };
+
+  const SHA_PATTERN = /^[a-f0-9]{7,40}$/i;
+  const META_SELECTORS = [
+    'meta[name="octolytics-dimension-head_sha"]',
+    'meta[name="octolytics-dimension-head_commit_sha"]',
+    'meta[name="octolytics-dimension-git_head_sha"]'
+  ];
+  const EMBEDDED_DATA_SELECTOR = 'script[data-target="react-app.embeddedData"]';
+
+  const normalizeCommitSha = (value) => {
+    if (!value) return null;
+    const trimmed = String(value).trim();
+    if (trimmed.length > 40) {
+      const candidate = trimmed.slice(0, 40);
+      return SHA_PATTERN.test(candidate) ? candidate : null;
+    }
+    return SHA_PATTERN.test(trimmed) ? trimmed : null;
+  };
+
+  const getCommitFromMeta = () => {
+    for (const selector of META_SELECTORS) {
+      const node = document?.querySelector(selector);
+      const content = node?.getAttribute?.('content');
+      const normalized = normalizeCommitSha(content);
+      if (normalized) return normalized;
+    }
+    return null;
+  };
+
+  const getCommitFromEmbeddedData = () => {
+    const scripts = document.querySelectorAll(EMBEDDED_DATA_SELECTOR) || [];
+    for (const script of scripts) {
+      const text = script?.textContent || script?.innerText || '';
+      if (!text) continue;
+      try {
+        const payload = JSON.parse(text);
+        const commit = payload?.payload?.pullRequest?.headRefOid
+          || payload?.payload?.pullRequest?.headRef?.oid
+          || payload?.payload?.pullRequest?.headRefOid
+          || payload?.data?.pullRequest?.headRefOid
+          || payload?.pullRequest?.headRefOid;
+        const normalized = normalizeCommitSha(commit);
+        if (normalized) return normalized;
+      } catch (e) {
+        // ignore malformed JSON
+      }
+    }
+    return null;
+  };
+
+  const COMMITS_COUNTER_SELECTOR = '#commits_tab_counter';
+
+  const resolveLatestCommitSha = () => {
+    const copy = document.querySelector("clipboard-copy[value][aria-label*='SHA'], clipboard-copy[value][aria-label*='commit']");
+    const clipboardValue = copy?.getAttribute?.('value');
+    const clipboardSha = normalizeCommitSha(clipboardValue);
+    if (clipboardSha) return clipboardSha;
+
+    const commitLink = document.querySelector("a[data-hovercard-type='commit'], a[href*='/commit/']");
+    const href = commitLink?.getAttribute?.('href') || "";
+    const slug = href.split('/').filter(Boolean).pop() || commitLink?.textContent?.trim() || "";
+    const commitFromLink = normalizeCommitSha(slug);
+    if (commitFromLink) return commitFromLink;
+
+    const metaSha = getCommitFromMeta();
+    if (metaSha) return metaSha;
+
+    return getCommitFromEmbeddedData();
+  };
+
+  const resolveCommitCount = () => {
+    const counter = document.querySelector(COMMITS_COUNTER_SELECTOR);
+    if (!counter) return null;
+    const raw = counter.getAttribute?.('title') || counter.textContent || '';
+    const digits = String(raw).replace(/[^\d]/g, '');
+    const parsed = Number(digits);
+    return Number.isFinite(parsed) ? parsed : null;
+  };
+
   const resolveUpdatedAt = (owner, repo, pull_number) =>
     getUpdatedAtFromMeta() ||
     getUpdatedAtFromEmbeddedData() ||
@@ -1309,7 +2311,12 @@
   S.extractPRMetadata = () => {
     const [, owner, repo, , pull_number] = window.location.pathname.split("/");
     const updated_at = resolveUpdatedAt(owner, repo, pull_number);
-    return { owner, repo, pull_number, updated_at };
+    const commit_sha = resolveLatestCommitSha();
+    const commit_count = resolveCommitCount();
+    const meta = { owner, repo, pull_number, updated_at, commit_sha, commit_count };
+    S.__debugPrMetadata = meta;
+    S.debugDump?.("pr metadata", meta);
+    return meta;
   };
 
   // ---------- File path helpers ----------
@@ -1325,11 +2332,35 @@
   // ---------- Files in PR ----------
     S.getFilesInPR = () => {
         const els = S.$$all(SELECTORS.fileLinks);
-    const titles = els
+    let titles = els
       .map(el => el.getAttribute("title") || el.textContent || "")
       .map(t => S.stripRenamePath(t).trim())
       .filter(Boolean);
-    return titles.map(t => t.toLowerCase());
+    if (titles.length === 0) {
+      const treeEls = S.$$all(SELECTORS.fileTreeItems || []);
+      titles = treeEls
+        .map(el => el.getAttribute("title") || el.textContent || "")
+        .map(t => S.stripRenamePath(t).trim())
+        .filter(Boolean);
+    }
+    if (titles.length === 0) {
+      const dataPathEls = document.querySelectorAll('div.js-file[data-file-type="file"][data-path], div.js-file[data-path], div[data-file-type="file"][data-path]');
+      titles = Array.from(dataPathEls)
+        .map(el => el.getAttribute("data-path") || "")
+        .map(t => S.stripRenamePath(t).trim())
+        .filter(Boolean);
+    }
+    if (titles.length === 0) {
+      const dataPathEls = document.querySelectorAll('[data-path]');
+      titles = Array.from(dataPathEls)
+        .map(el => el.getAttribute("data-path") || "")
+        .map(t => S.stripRenamePath(t).trim())
+        .filter((t) => t && (t.includes('/') || t.includes('.')));
+    }
+    const files = titles.map(t => t.toLowerCase());
+    S.__debugParsedFileExplorerFilenames = files;
+    S.debugDump?.("file explorer filenames", { count: files.length, files });
+    return files;
   };
 
   S.checkIfRelevantFilesExist = (filenames, supportedExts) =>
@@ -1342,15 +2373,73 @@
   // ---------- Mapping ----------
   S.normalizePath = (p) => String(p || "").replace(/\\/g, "/").replace(/^\/+/, "").trim();
   S.cssEscape = (id) => String(id).replace(/(["\\\]])/g, "\\$1");
+  S.normalizeQualifiedName = (name) => {
+    // Qualified names now match SVG data-qualified-name verbatim (including dots).
+    return String(name || "").trim();
+  };
+  S.extractApiComponentRecords = (apiData) => {
+    const rows = [];
+    const items = Array.isArray(apiData?.striffs) ? apiData.striffs : [];
+    for (let i = 0; i < items.length; i += 1) {
+      const item = items[i];
+      let comps = [];
+      try {
+        if (item?.diagramCmpsJSON) comps = JSON.parse(item.diagramCmpsJSON);
+      } catch {}
+      for (const comp of comps || []) {
+        const file = comp?.sourceFile;
+        const rawName = comp?.uniqueName || comp?.qualifiedName || comp?.id || comp?.name;
+        const qn = S.normalizeQualifiedName(rawName);
+        if (!file || !qn) continue;
+        rows.push({
+          striffIndex: i,
+          componentId: qn,
+          filePath: "/" + S.normalizePath(file)
+        });
+      }
+    }
+    return rows;
+  };
+  S.extractApiComponentFilenames = (apiData) => {
+    const records = S.extractApiComponentRecords?.(apiData) || [];
+    return records.map((row) => row.filePath).filter(Boolean);
+  };
+
+  S.updateDebugDatasets = () => {
+    try {
+      const root = document.documentElement;
+      if (!root) return;
+      const pathSize = S.__striffsPathToComponentId?.size || 0;
+      const compSize = S.__striffsComponentIdToFile?.size || 0;
+      let diffSize = 0;
+      if (S.__filePathToDiffId && S.__striffsPathToComponentId) {
+        const diffToComponent = new Map();
+        for (const [path, comp] of S.__striffsPathToComponentId.entries()) {
+          if (!path || !path.startsWith("/")) continue;
+          const diffId = S.__filePathToDiffId.get(path);
+          if (diffId && comp) diffToComponent.set(diffId, comp);
+        }
+        diffSize = diffToComponent.size;
+      }
+      root.dataset.striffsPathToComponentSize = String(pathSize);
+      root.dataset.striffsComponentToFileSize = String(compSize);
+      root.dataset.striffsDiffToComponentSize = String(diffSize);
+    } catch {}
+  };
 
   S.buildPathIdMapping = (apiData) => {
     S.__striffsPathToComponentId.clear();
     S.__striffsComponentIdToFile.clear();
     if (!S.__striffsSvg) return;
 
-    const existsInSvg = (id) =>
-      !!id && (S.__striffsSvg.querySelector(`[id="${S.cssEscape(id)}"]`) ||
-        (typeof S.__striffsSvg.getElementById === "function" && S.__striffsSvg.getElementById(id)));
+    const existsInSvg = (qualifiedName) => {
+      if (!qualifiedName) return false;
+      const esc = S.cssEscape(qualifiedName);
+      return Boolean(
+        S.__striffsSvg.querySelector(`[data-qualified-name="${esc}"]`) ||
+        S.__striffsSvg.querySelector(`text[data-qualified-name="${esc}"]`)
+      );
+    };
 
     const items = Array.isArray(apiData?.striffs) ? apiData.striffs : [];
     const parsedFiles = [];
@@ -1364,44 +2453,134 @@
       } catch (e) { /* ignore */ }
       for (const comp of comps) {
         const file = comp.sourceFile;
-        const id = comp.uniqueName;
-        if (!file || !id) continue;
+        const rawName = comp.uniqueName || comp.qualifiedName || comp.id || comp.name;
+        const qn = S.normalizeQualifiedName(rawName);
+        if (!file || !qn) continue;
         const norm = S.normalizePath(file);
-        componentsDump.push({ id, file: "/" + norm, inSvg: existsInSvg(id) });
+        componentsDump.push({ id: qn, file: "/" + norm, inSvg: existsInSvg(qn) });
         parsedFiles.push(norm);
-        if (existsInSvg(id)) {
-          S.__striffsPathToComponentId.set("/" + norm, id);
-          S.__striffsPathToComponentId.set(norm, id);
-          S.__striffsComponentIdToFile.set(id, "/" + norm);
+        if (existsInSvg(qn)) {
+          const withSlash = "/" + norm;
+          S.__striffsPathToComponentId.set(withSlash, qn);
+          S.__striffsComponentIdToFile.set(qn, withSlash);
         } else {
-          missingInSvg.push({ id, file: norm });
+          missingInSvg.push({ id: qn, file: norm });
         }
       }
     }
 
-    try {
-      const sample = Array.from(S.__striffsPathToComponentId.entries()).slice(0, 10);
+    const debugEnabled = S.isDebug?.();
+    if (debugEnabled) {
+      // Expose a snapshot for debugging in the browser console.
       const uniqueFiles = Array.from(new Set(parsedFiles));
-      S.cinfo('Striffs path/component map', {
-        mappedPaths: S.__striffsPathToComponentId.size,
-        mappedComponents: S.__striffsComponentIdToFile.size,
-        filesFromApi: uniqueFiles.length,
-        sample
-      });
-      if (missingInSvg.length) {
-        S.cwarn('Striffs components missing in SVG (sample)', missingInSvg.slice(0, 10));
+      const allApiComponents = S.extractApiComponentRecords?.(apiData) || [];
+      const pathToDiff = Array.from((S.__filePathToDiffId || new Map()).entries());
+      const diffToPath = pathToDiff.map(([filePath, diffHash]) => [diffHash, filePath]);
+      S.__debugApiComponents = allApiComponents;
+      S.__debugApiFiles = uniqueFiles;
+      S.__debugComponentsDump = componentsDump;
+      S.__debugPathToComponent = Array.from(S.__striffsPathToComponentId.entries());
+      S.__debugComponentToFile = Array.from(S.__striffsComponentIdToFile.entries());
+      S.__debugFilePathToDiffHash = pathToDiff;
+      S.__debugDiffHashToFilePath = diffToPath;
+      S.dumpStriffsMaps = () => {
+        try {
+          console.log("[Striffs][map] api components (component->file)", S.__debugApiComponents);
+          console.log("[Striffs][map] api files", S.__debugApiFiles);
+          console.log("[Striffs][map] componentsDump", S.__debugComponentsDump);
+          console.log("[Striffs][map] path->component", S.__debugPathToComponent);
+          console.log("[Striffs][map] component->file", S.__debugComponentToFile);
+          console.log("[Striffs][map] file->diff", S.__debugFilePathToDiffHash);
+          console.log("[Striffs][map] diff->file", S.__debugDiffHashToFilePath);
+        } catch (e) {
+          S.cwarn?.("dumpStriffsMaps failed", e);
+        }
+      };
+      // Emit the live map for quick inspection in DevTools.
+      try {
+        console.log("[Striffs][map] __striffsComponentIdToFile (Map)", S.__striffsComponentIdToFile);
+      } catch {}
+      S.dumpStriffsMaps(); // log immediately after building the map
+
+      try {
+        const sample = Array.from(S.__striffsPathToComponentId.entries()).slice(0, 10);
+        S.cinfo('Striffs path/component map', {
+          mappedPaths: S.__striffsPathToComponentId.size,
+          mappedComponents: S.__striffsComponentIdToFile.size,
+          apiComponents: allApiComponents.length,
+          filesFromApi: uniqueFiles.length,
+          sample
+        });
+        if (missingInSvg.length) {
+          S.cwarn('Striffs components missing in SVG (sample)', missingInSvg.slice(0, 10));
+        }
+      } catch (e) {
+        S.cwarn?.('Striffs map logging failed', e);
       }
-    } catch (e) {
-      S.cwarn?.('Striffs map logging failed', e);
+    } else {
+      S.dumpStriffsMaps = () => {};
+      S.__debugApiComponents = null;
+      S.__debugApiFiles = null;
+      S.__debugComponentsDump = null;
+      S.__debugPathToComponent = null;
+      S.__debugComponentToFile = null;
+      S.__debugFilePathToDiffHash = null;
+      S.__debugDiffHashToFilePath = null;
     }
+    S.updateDebugDatasets?.();
   };
 
   S.findSvgTextForFile = (fullPath) => {
     if (!S.__striffsSvg) return null;
     const norm = S.normalizePath(fullPath);
-    const mappedId = S.__striffsPathToComponentId.get("/" + norm) || S.__striffsPathToComponentId.get(norm);
+    const mappedId = S.__striffsPathToComponentId.get("/" + norm);
     if (!mappedId) return null;
-    return S.__striffsSvg.querySelector(`text[id="${S.cssEscape(mappedId)}"]`);
+    const esc = S.cssEscape(mappedId);
+    return S.__striffsSvg.querySelector(`[data-qualified-name="${esc}"]`) ||
+           S.__striffsSvg.querySelector(`text[data-qualified-name="${esc}"]`);
+  };
+
+  S.applyPendingFocus = () => {
+    const fullPath = S.__pendingFocusFilePath;
+    if (!fullPath || !S.__striffsSvg) return false;
+    const textEl = S.findSvgTextForFile(fullPath);
+    if (!textEl) return false;
+    const qn = textEl.getAttribute('data-qualified-name') || textEl.getAttribute('id') || '';
+      if (qn) {
+        S.showStriffView();
+        S.saveActiveTab?.('striffs');
+        S.ensureFocusZoom?.(textEl);
+        S.centerElementInStriffs?.(textEl);
+        S.flashFocus(textEl);
+        S.__pendingFocusFilePath = null;
+        return true;
+      }
+    return false;
+  };
+
+  S.focusFileInStriffs = async (fullPath) => {
+    if (!fullPath) return false;
+    if (S.__disabledByRemote) {
+      S.disableStriffsButton();
+      return false;
+    }
+    S.__pendingFocusFilePath = fullPath;
+    if (S.__striffsReady && S.__striffsSvg) {
+      return S.applyPendingFocus();
+    }
+    S.showStriffView();
+    S.saveActiveTab?.('striffs');
+    if (!S.__striffsReady) {
+      S.updateStriffButton?.({
+        loading: true,
+        tooltip: "Generating Striffs…",
+        phase: "Analyzing files..."
+      });
+      const ok = await S.autoFetchStriffs?.();
+      if (!ok) return false;
+      return S.applyPendingFocus();
+    }
+    return false;
   };
 
   const ensureLeadingSlash = (p) => p.startsWith('/') ? p : `/${p}`;
@@ -1413,7 +2592,7 @@
     if (parts.length <= 1) return false; // drop bare filenames/ids
     return true;
   };
-  const isDirectoryNode = (node) => {
+  S.isDirectoryNode = (node) => {
     const li = node?.closest?.('li');
     if (!li) return false;
     const type = li.getAttribute('data-tree-entry-type');
@@ -1429,7 +2608,7 @@
         // File tree entries (modern)
         const treeItems = S.$$all(SELECTORS.fileTreeItems);
     treeItems.forEach(span => {
-      if (isDirectoryNode(span)) return;
+      if (S.isDirectoryNode?.(span)) return;
       const txt = strip(span?.textContent)?.trim();
       if (!txt) return;
       const norm = S.normalizePath(txt);
@@ -1453,24 +2632,40 @@
       }
     }
 
-    return Array.from(paths);
+    const files = Array.from(paths);
+    S.__debugFilterFilesFromNav = files;
+    S.debugDump?.("filter files parsed from file explorer/nav", { count: files.length, files });
+    return files;
   };
 
     S.buildFilePathToDiffIdMapAsync = () => {
         Promise.resolve().then(() => {
             const map = new Map();
-            const items = S.$$all(["[data-testid='file-tree'] li"]);
-      for (const li of items) {
-        const span = li.querySelector("[data-testid='file-tree-item-text']");
-        const a = li.querySelector("a.ActionListContent, a[href^='#diff-'], a[href*='#diff-']");
-        const href = a?.getAttribute("href") || "";
-        const diffId = (href.startsWith("#") ? href.slice(1) : (href.match(/#(.+)$/)?.[1] || null));
-        if (!span || !diffId) continue;
-        const fullPath = "/" + S.normalizePath(S.stripRenamePath(span.textContent.trim()));
-        map.set(fullPath, diffId);
-        map.set(S.normalizePath(S.stripRenamePath(span.textContent.trim())), diffId);
-      }
-      S.__filePathToDiffId = map;
+            const items = S.$$all(["li[id^='file-tree-item-diff-']", "li[data-tree-entry-type='file']"]);
+            for (const li of items) {
+              const span =
+                li.querySelector("[data-filterable-item-text]") ||
+                li.querySelector("span.ActionList-item-label") ||
+                li.querySelector("[data-testid='file-tree-item-text']");
+              const a = li.querySelector("a.ActionListContent, a[href^='#diff-'], a[href*='#diff-']");
+              const href = a?.getAttribute("href") || "";
+              const diffId = (href.startsWith("#") ? href.slice(1) : (href.match(/#(.+)$/)?.[1] || null));
+              if (!span || !diffId) continue;
+              const fullPath = ensureLeadingSlash(S.normalizePath(S.stripRenamePath(span.textContent.trim())));
+              map.set(fullPath, diffId);
+            }
+            S.__filePathToDiffId = map;
+            const pathToDiff = Array.from(map.entries());
+            const diffToPath = pathToDiff.map(([filePath, diffHash]) => [diffHash, filePath]);
+            S.__debugFilePathToDiffHash = pathToDiff;
+            S.__debugDiffHashToFilePath = diffToPath;
+            S.debugDump?.("diff hash mapping", {
+              pathToDiffCount: pathToDiff.length,
+              pathToDiff,
+              diffToPathCount: diffToPath.length,
+              diffToPath
+            });
+            S.updateDebugDatasets?.();
     });
   };
 
@@ -1495,7 +2690,17 @@
     };
 
     const base = parseRef(anchors[0]), head = parseRef(anchors[1]);
-    return { baseOwner: base.owner, baseRepo: base.repo, baseBranch: base.branch, headOwner: head.owner, headRepo: head.repo, headBranch: head.branch };
+    const refs = {
+      baseOwner: base.owner,
+      baseRepo: base.repo,
+      baseBranch: base.branch,
+      headOwner: head.owner,
+      headRepo: head.repo,
+      headBranch: head.branch
+    };
+    S.__debugHeadBaseRefs = refs;
+    S.debugDump?.("head/base refs", refs);
+    return refs;
   };
 })();
 
@@ -1525,18 +2730,18 @@
         if (!S.__striffsSvg || !S.__striffsComponentIdToFile) return;
 
         try {
-            for (const id of S.__striffsComponentIdToFile.keys()) {
+            for (const qn of S.__striffsComponentIdToFile.keys()) {
                 const esc =
                     (window.CSS && typeof CSS.escape === "function")
-                        ? CSS.escape(id)
-                        : S.cssEscape(id);
+                        ? CSS.escape(qn)
+                        : S.cssEscape(qn);
 
-                let textEl =
-                    S.__striffsSvg.querySelector(`text[id="${esc}"]`) ||
-                    S.__striffsSvg.getElementById(id);
-                if (!textEl) continue;
+                const target =
+                    S.__striffsSvg.querySelector(`[data-qualified-name="${esc}"]`) ||
+                    S.__striffsSvg.querySelector(`text[data-qualified-name="${esc}"]`);
+                if (!target) continue;
 
-                const existingStyle = textEl.getAttribute("style") || "";
+                const existingStyle = target.getAttribute("style") || "";
                 const parts = existingStyle
                     .split(";")
                     .map(s => s.trim())
@@ -1548,7 +2753,7 @@
                     "cursor: pointer"
                 );
 
-                textEl.setAttribute("style", parts.join("; "));
+                target.setAttribute("style", parts.join("; "));
             }
         } catch (e) {
             cwarn("applyHoverability failed", e);
@@ -1556,71 +2761,165 @@
     };
 
     // ---------- Cache ----------
-    S.cacheKey = () => {
-        const { owner, repo, pull_number } = S.extractPRMetadata();
-        return `striffs:${owner}/${repo}#${pull_number}`;
-    };
+  S.cacheKey = () => {
+    const { owner, repo, pull_number, commit_count } = S.extractPRMetadata();
+    const countSuffix = typeof commit_count === 'number' ? `@${commit_count}` : '';
+    return `striffs:${owner}/${repo}#${pull_number}${countSuffix}`;
+  };
 
-    S.primeDiagramFromCache = () => {
-        try {
-            S.__lastLoadSource = 'none';
-            const key = S.cacheKey();
-            const raw = localStorage.getItem(key);
-            if (!raw) return;
-            const parsed = JSON.parse(raw);
-            const { updated_at } = S.extractPRMetadata();
-            const freshUpdatedAt = parsed.updated_at === updated_at;
-            const freshTime = (Date.now() - (parsed.savedAt || 0)) < S.CACHE_TTL_MS;
-            if (freshUpdatedAt && freshTime && parsed.result && Array.isArray(parsed.result.striffs)) {
-                const container = S.ensureStriffContainer();
-                if (container) {
-                    const rendered = S.renderStriffsInto(container, parsed.result);
-                    if (rendered) {
-                        S.__lastLoadSource = 'cache';
-                        S.__striffsReady = true;
-                        S.__lastFetchedUpdatedAt = updated_at;
-                        S.updateStriffButton({ success: true, tooltip: "Striffs loaded from cache. Click to view." });
-                    }
-                }
-            }
-        } catch (e) {
-            cwarn('primeDiagramFromCache failed', e);
-        }
-    };
+  S.getCacheClearAt = async () => {
+    try {
+      if (!chrome?.storage?.local) return 0;
+      const res = await new Promise((resolve) =>
+        chrome.storage.local.get(["striffsCacheClearAt"], (items) => resolve(items || {}))
+      );
+      return Number(res?.striffsCacheClearAt || 0);
+    } catch {
+      return 0;
+    }
+  };
 
-    S.storeDiagramInCache = (result) => {
+  S.primeDiagramFromCache = async () => {
+    try {
+      S.__lastLoadSource = 'none';
+      const { updated_at, commit_count } = S.extractPRMetadata();
+      const key = S.cacheKey();
+      let cacheEntryFound = false;
+      const clearAt = await S.getCacheClearAt?.();
+
+      const purgeCacheForKey = () => {
+        try { localStorage.removeItem(key); } catch {}
+        try { localStorage.removeItem(`striffsCacheMeta:${key}`); } catch {}
         try {
-            const key = S.cacheKey();
-            const { updated_at } = S.extractPRMetadata();
-            const payload = { updated_at, savedAt: Date.now(), result };
-            localStorage.setItem(key, JSON.stringify(payload));
-        } catch (e) {
-            cwarn('storeDiagramInCache failed (quota?)', e);
+          const k = S.cacheStorageKey?.();
+          if (k && chrome?.storage?.local) chrome.storage.local.remove(k, () => {});
+        } catch {}
+      };
+
+      const renderCached = (parsed) => {
+        const storedCount = (parsed.commit_count != null ? Number(parsed.commit_count) : null);
+        const currentCount = (commit_count != null ? Number(commit_count) : null);
+        const ageMs = Date.now() - (parsed.savedAt || 0);
+        const freshCount = (currentCount != null && storedCount != null) ? (currentCount === storedCount) : true;
+        const freshTime = ageMs < S.CACHE_TTL_MS;
+        S.cinfo?.('[Striffs] Cache validation', {
+          cacheKey: key,
+          expectedCommitCount: currentCount,
+          storedCommitCount: storedCount,
+          cacheAgeMs: ageMs,
+          ttlMs: S.CACHE_TTL_MS,
+          freshCount,
+          freshTime
+        });
+        if (!freshCount || !freshTime || !parsed.result || !Array.isArray(parsed.result.striffs)) {
+          const reason = !freshCount ? 'commit_count_mismatch' : !freshTime ? 'ttl_expired' : 'invalid_payload';
+          S.cwarn?.('[Striffs] Cache rejected', { cacheKey: key, reason });
+          return false;
         }
-    };
+        S.updateEngagementContextFromResult?.(parsed.result);
+        const container = S.ensureStriffContainer();
+        if (!container) return false;
+        const rendered = S.renderStriffsInto(container, parsed.result);
+        if (!rendered) return false;
+        S.__lastLoadSource = 'cache';
+        S.__striffsReady = true;
+        S.__lastFetchedUpdatedAt = updated_at;
+        S.updateStriffButton({ success: true, tooltip: "Striffs loaded from cache. Click to view." });
+        return true;
+      };
+
+      const markCacheEntry = (parsed) => {
+        if (parsed) cacheEntryFound = true;
+      };
+
+      const tryRender = (parsed) => {
+        if (!parsed) return false;
+        markCacheEntry(parsed);
+        return renderCached(parsed);
+      };
+
+      const raw = localStorage.getItem(key);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (clearAt && parsed?.savedAt && Number(parsed.savedAt) <= clearAt) {
+          purgeCacheForKey();
+        } else if (tryRender(parsed)) {
+          return 'fresh';
+        }
+      }
+      if (typeof S.readCacheFromChromeStorage === 'function') {
+        const parsed = await S.readCacheFromChromeStorage();
+        if (parsed) {
+          if (clearAt && parsed?.savedAt && Number(parsed.savedAt) <= clearAt) {
+            purgeCacheForKey();
+          } else {
+            markCacheEntry(parsed);
+            try { localStorage.setItem(key, JSON.stringify(parsed)); } catch {}
+            if (tryRender(parsed)) return 'fresh';
+          }
+        }
+      }
+      return cacheEntryFound ? 'stale' : 'empty';
+    } catch (e) {
+      cwarn('primeDiagramFromCache failed', e);
+      return 'empty';
+    }
+  };
+
+  S.storeDiagramInCache = (result) => {
+    try {
+      const key = S.cacheKey();
+      const { updated_at, commit_count } = S.extractPRMetadata();
+      const payload = {
+        updated_at,
+        commit_count: commit_count != null ? commit_count : null,
+        savedAt: Date.now(),
+        result
+      };
+      localStorage.setItem(key, JSON.stringify(payload));
+    } catch (e) {
+      cwarn('storeDiagramInCache failed (quota?)', e);
+    }
+  };
 
     // ---------- SVG dimension sanitizer ----------
-    // Only enforce width/height to 100% so the SVG fills the container;
-    // do not touch viewBox or other styling.
+    // Keep SVG intrinsic sizing so it can scroll; only ensure a valid viewBox.
     S.sanitizeSvgDimensions = function sanitizeSvgDimensions(svg) {
         try {
             if (!svg) return;
-
-            svg.setAttribute('width', '100%');
-            svg.setAttribute('height', '100%');
-            svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
 
             const style = svg.getAttribute('style');
             if (style) {
                 const cleaned = style
                     .split(';')
                     .map(s => s.trim())
-                    .filter(s => s && !s.toLowerCase().startsWith('width:') && !s.toLowerCase().startsWith('height:'))
+                    .filter(s => s)
                     .join('; ');
                 if (cleaned) {
                     svg.setAttribute('style', cleaned);
                 } else {
                     svg.removeAttribute('style');
+                }
+            }
+
+            const viewBox = svg.getAttribute('viewBox');
+            let needsViewBox = !viewBox;
+            if (!needsViewBox && viewBox) {
+                const parts = viewBox.trim().split(/\s+/).map(Number);
+                if (parts.length === 4) {
+                    const [, , w, h] = parts;
+                    if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) {
+                        needsViewBox = true;
+                    }
+                }
+            }
+            if (needsViewBox) {
+                let box = null;
+                try { box = svg.getBBox?.(); } catch {}
+                if (box && box.width > 0 && box.height > 0) {
+                    svg.setAttribute('viewBox', `${box.x} ${box.y} ${box.width} ${box.height}`);
+                } else {
+                    svg.setAttribute('viewBox', '0 0 1000 1000');
                 }
             }
         } catch (e) {
@@ -1635,12 +2934,17 @@
         if (!target) return false;
         const State = S.state;
         State?.resetTooLarge?.();
-        target.innerHTML = `<div id="striffs-toast" role="status" aria-live="polite"></div><div id="striffs-status">Rendering diagram…</div>`;
+        S.__striffsSvg = null;
+        const content = target.querySelector("#striffs-content") || target;
+        if (!target.querySelector("#striffs-toast")) {
+          target.insertAdjacentHTML("afterbegin", `<div id="striffs-toast" role="status" aria-live="polite"></div>`);
+        }
+        content.innerHTML = `<div id="striffs-status">Rendering diagram…</div>`;
 
         const items = Array.isArray(data?.striffs) ? data.striffs : [];
 
         if (items.length === 0) {
-            target.innerHTML = `<div id="striffs-toast" role="status" aria-live="polite"></div>`;
+            content.innerHTML = '';
             S.updateStriffButton({ neutral: true, disabled: true, tooltip: "No changes were found" });
             S.toast?.("No changes were found.", "neutral", { timeoutMs: 5000 });
             return true;
@@ -1664,41 +2968,42 @@
                     continue; // no renderable payload in this item
                 }
                 renderableFound = true;
-                target.innerHTML = `<div id="striffs-toast" role="status" aria-live="polite"></div><div id="striffs-status">Rendering diagram…</div>`;
+                content.innerHTML = `<div id="striffs-status">Rendering diagram…</div>`;
                 const wrap = document.createElement("div");
                 wrap.className = "striff-svg-wrap";
                 wrap.innerHTML = svgText;
-                target.appendChild(wrap);
+                content.appendChild(wrap);
 
                 const svg = wrap.querySelector("svg");
+                if (S.isDebug?.() && !svg) {
+                    console.warn("[Striffs][debug] svg not found after render");
+                }
                 if (svg) {
                     S.sanitizeSvgDimensions(svg);
+                    const didFit = S.fitStriffsToView?.(target, svg);
+                    if (!didFit) {
+                      const z = Number(S.__striffsZoom) || 1;
+                      svg.style.transformOrigin = '0 0';
+                      svg.style.transform = `scale(${z})`;
+                    }
+                    try {
+                      if (S.isDebug?.()) {
+                        const serializer = new XMLSerializer();
+                        const svgText = serializer.serializeToString(svg);
+                        S.__debugSvgText = svgText;
+                        console.log("[Striffs][debug] svg", svgText);
+                      }
+                    } catch (e) {
+                      S.cwarn?.("debug svg dump failed", e);
+                    }
                 }
 
-                if (svg && window.panzoom) {
-                    State?.resetPanState?.();
-                    State?.resetInitialFit?.();
-                    // Pan/zoom on the SVG root so fit math matches the viewBox; preserveAspectRatio keeps text from squishing.
-                    const node = svg;
-                    S.__striffsPanzoom = window.panzoom(node, { contain: "inside", maxScale: 3, minScale: 0.5 });
-                    if (typeof S.__striffsPanzoom.on === 'function') {
-                        try {
-                            S.__striffsPanzoom.on('transform', () => S.capturePanState?.());
-                        } catch (e) {
-                            cwarn('panzoom transform listener failed', e);
-                        }
-                    }
+                if (svg) {
                     S.__striffsSvg = svg;
-                    const restored = S.restorePanState?.();
-                    if (!restored) {
-                        S.fitSvgToContainer(svg, S.__striffsPanzoom);
-                        S.capturePanState?.();
-                        State?.markInitialFitDone?.();
-                    } else {
-                        State?.markInitialFitDone?.();
-                    }
                     S.buildPathIdMapping(data);
+                    S.updateFileTreeAvailability?.();
                     S.applyHoverability(); // now colors clickable text
+                    S.applyPendingFocus?.();
                 }
 
                 const s = document.getElementById("striffs-status");
@@ -1711,7 +3016,7 @@
         }
 
         if (!renderableFound && items.length > 0) {
-            target.innerHTML = `<div id="striffs-toast" role="status" aria-live="polite"></div><div style="color:#d1242f;">❗ Diagram too large to render. No SVG was generated.</div>`;
+            content.innerHTML = `<div style="color:#d1242f;">❗ Diagram too large to render. No SVG was generated.</div>`;
             S.__striffsReady = false;
             State?.setTooLarge?.(true);
             S.updateStriffButton?.({ neutral: true, disabled: true, tooltip: "Diagram too large to render" });
@@ -1719,47 +3024,10 @@
             return true; // handled gracefully
         }
 
-        target.innerHTML = `<div id="striffs-toast" role="status" aria-live="polite"></div><div style="color:#d1242f;">❌ Failed to render Striffs diagram.</div>`;
+        content.innerHTML = `<div style="color:#d1242f;">❌ Failed to render Striffs diagram.</div>`;
         return false;
     };
 
-    S.fitSvgToContainer = (svg, pan) => {
-        try {
-            const striffView = document.getElementById("striff-diagram-view") || svg.parentElement;
-            if (typeof S.resizeStriffView === 'function') S.resizeStriffView();
-            const rect = striffView.getBoundingClientRect();
-            const width  = rect.width  || striffView.clientWidth  || window.innerWidth  || 1200;
-            const height = rect.height || striffView.clientHeight || window.innerHeight || 800;
-
-            const root = svg.querySelector("g") || svg;
-            const viewBox = svg.getAttribute('viewBox');
-            let box = null;
-            if (viewBox) {
-                const parts = viewBox.split(/\s+/).map(Number).filter(n => Number.isFinite(n));
-                if (parts.length === 4) {
-                    const [x, y, w, h] = parts;
-                    box = { x, y, width: w, height: h };
-                }
-            }
-            if (!box) {
-                const bbox = root.getBBox();
-                box = { x: bbox.x, y: bbox.y, width: bbox.width, height: bbox.height };
-            }
-
-            const padFactor = 0.9; // balanced fit to avoid over-zooming
-            const scale = Math.min(width / (box.width || 1), height / (box.height || 1)) * padFactor;
-            pan.zoomAbs(0, 0, scale);
-
-            // Anchor the diagram near the top-left with even padding so it stays fully visible.
-            const paddingX = Math.max(0, (width  - (box.width  * scale)) / 2);
-            const paddingY = Math.max(0, (height - (box.height * scale)) / 2);
-            const tx = paddingX - (box.x * scale);
-            const ty = paddingY - (box.y * scale);
-            pan.moveTo(tx, ty);
-        } catch (e) {
-            cwarn('fitSvgToContainer skipped', e);
-        }
-    };
 })();
 
 
@@ -1793,78 +3061,79 @@
         "[data-testid='file-tree'] a[href*='#diff-']"
       );
       if (!link) return;
+      if (S.getCurrentView && S.getCurrentView() !== 'striffs') return;
 
-      const striffView = document.getElementById("striff-diagram-view");
-      const striffsVisible =
-        !!(striffView && window.getComputedStyle(striffView).display !== "none");
-
-      if (!striffsVisible || !S.__striffsSvg || !S.__striffsPanzoom) {
-        return;
-      }
+      const li = link.closest("li[id^='file-tree-item-diff-'], [data-testid='file-tree'] li");
+      if (S.isDirectoryNode?.(li)) return;
+      const hiddenSpan =
+        li?.querySelector("span[data-filterable-item-text], [data-testid='file-tree-item-text']");
+      const fullPath = '/' + (hiddenSpan?.textContent.trim() || '');
+      if (!fullPath || fullPath === '/') return;
+      if (S.__disabledByRemote) return;
+      const normalizedPath = '/' + S.normalizePath(fullPath);
+      const mappedComponentId = S.__striffsPathToComponentId?.get(normalizedPath) || null;
+      S.emitEngagementEvent?.("file_explorer_item_clicked_in_striffs_view", {
+        filePath: normalizedPath,
+        mappedComponentId,
+        hasMappedComponent: Boolean(mappedComponentId)
+      });
 
       e.preventDefault();
       e.stopPropagation();
       if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
 
-      const li = link.closest("li[id^='file-tree-item-diff-'], [data-testid='file-tree'] li");
-      const hiddenSpan =
-        li?.querySelector("span[data-filterable-item-text], [data-testid='file-tree-item-text']");
-      const fullPath = '/' + (hiddenSpan?.textContent.trim() || '');
-      if (S.__striffsSvg && S.__striffsPanzoom) {
-        const textEl = S.findSvgTextForFile(fullPath);
-        const pane = S.ensureStriffContainer();
-        if (pane) pane.scrollIntoView({ block: "center", behavior: "smooth" });
-        if (textEl) {
-          S.centerOnElement(S.__striffsSvg, textEl, S.__striffsPanzoom, 0.85, 0.5);
-          S.flashFocus(textEl);
-        } else {
+      const pane = S.ensureStriffContainer();
+      if (pane) pane.scrollIntoView({ block: "center", behavior: "smooth" });
+      S.focusFileInStriffs?.(fullPath).then((ok) => {
+        if (!ok) {
           S.toast?.("No corresponding component exists in the diagram for this file.", "error", { timeoutMs: 3000 });
         }
-      }
+      });
     };
 
     S.__onDiagramClick = (e) => {
       if (!S.__striffsSvg) return;
-      const target = e.target.closest("text[id]");
+      const target = e.target.closest("g.entity[data-qualified-name]");
       if (!target) return;
+      const debounceMs = S.PAN_CLICK_DEBOUNCE_MS || 250;
+      if (S.__recentPanAt && (Date.now() - S.__recentPanAt) < debounceMs) {
+        S.__recentPanAt = 0;
+        return;
+      }
       const ownerSvg = target.ownerSVGElement || target.closest("svg");
       if (ownerSvg !== S.__striffsSvg) return;
 
-      const id = target.getAttribute("id");
-      const file = S.__striffsComponentIdToFile.get(id);
+      const qn = target.getAttribute("data-qualified-name");
+      const file = S.__striffsComponentIdToFile.get(qn);
+      const diffId = file ? (S.__filePathToDiffId.get(file) || S.__filePathToDiffId.get(S.normalizePath(file))) : null;
+      S.emitEngagementEvent?.("diagram_component_clicked", {
+        componentQualifiedName: qn || null,
+        mappedFile: file || null,
+        hasMappedFile: Boolean(file),
+        diffId: diffId || null,
+        hasDiffTarget: Boolean(diffId)
+      });
       if (file) {
-        S.capturePanState?.();
-        S.showDiffView();
-        S.setActiveButtons("diffs");
-        S.saveActiveTab("diffs");
-
-        const diffId = S.__filePathToDiffId.get(file) || S.__filePathToDiffId.get(S.normalizePath(file));
         if (diffId) {
+          S.showDiffView();
+          S.setActiveButtons("diffs");
+          S.saveActiveTab("diffs");
+
           if (location.hash !== `#${diffId}`) history.replaceState(null, "", `#${diffId}`);
           const diffEl = document.getElementById(diffId);
           if (diffEl) diffEl.scrollIntoView({ block: "start", behavior: "smooth" });
         } else {
-          S.cwarn?.('Striffs component click: file missing in diff map', { id, file });
+          S.cwarn?.('Striffs component click: file missing in diff map', { id: qn, file });
           S.toast?.("No corresponding file exists in this Pull Request’s changeset.", "error", { timeoutMs: 3000 });
         }
       } else {
-        S.cwarn?.('Striffs component click: no file mapped for component', { id });
+        S.cwarn?.('Striffs component click: no file mapped for component', { id: qn });
         S.toast?.("No corresponding file exists in this Pull Request’s changeset.", "error", { timeoutMs: 3000 });
-      }
-    };
-
-    S.__onResize = () => {
-      const view = document.getElementById("striff-diagram-view");
-      const visible = view && window.getComputedStyle ? window.getComputedStyle(view).display !== 'none' : false;
-      if (!visible) return;
-      if (S.__striffsSvg && S.__striffsPanzoom) {
-        S.restorePanState?.();
       }
     };
 
     document.addEventListener("click", S.__onFileTreeClick);
     document.addEventListener("click", S.__onDiagramClick);
-    window.addEventListener("resize", S.__onResize);
 
     S.__domListenersRegistered = true;
   }
@@ -1881,31 +3150,112 @@
   };
 
   // ---------- Auto fetch (background-powered) ----------
-  function readCachedDiagram(updatedAt) {
-    const key = S.cacheKey();
-    if (!key) return null;
-    const cached = localStorage.getItem(key);
-    if (!cached) return null;
+  const cacheStorageKey = () => {
     try {
-      const parsed = JSON.parse(cached);
-      if (parsed.updated_at !== updatedAt) return null;
-      if ((Date.now() - parsed.savedAt) > (S.CACHE_TTL_MS || 0)) return null;
-      return parsed.result || null;
-    } catch (e) {
-      S.cwarn?.("Cache parse failed", e);
+      const key = S.cacheKey?.();
+      return key ? `striffsCache:${key}` : null;
+    } catch {
       return null;
     }
+  };
+
+  S.cacheStorageKey = cacheStorageKey;
+
+  function writeCacheToChromeStorage(payload) {
+    try {
+      const k = cacheStorageKey();
+      if (!k || !chrome?.storage?.local) return;
+      chrome.storage.local.set({ [k]: payload }, () => {});
+    } catch {}
   }
 
-  function writeCachedDiagram(result, updatedAt) {
+  function readCacheFromChromeStorage() {
+    return new Promise((resolve) => {
+      try {
+        const k = cacheStorageKey();
+        if (!k || !chrome?.storage?.local) return resolve(null);
+        chrome.storage.local.get([k], (res) => resolve(res?.[k] || null));
+      } catch {
+        resolve(null);
+      }
+    });
+  }
+
+  S.writeCacheToChromeStorage = writeCacheToChromeStorage;
+  S.readCacheFromChromeStorage = readCacheFromChromeStorage;
+
+  async function readCachedDiagram(meta) {
+    const key = S.cacheKey();
+    if (!key) return null;
+    const clearAt = await S.getCacheClearAt?.();
+    let parsed = null;
+    try {
+      const cached = localStorage.getItem(key);
+      if (cached) parsed = JSON.parse(cached);
+    } catch (e) {
+      S.cwarn?.("Cache parse failed", e);
+    }
+    if (!parsed) {
+      parsed = await readCacheFromChromeStorage();
+      if (parsed) {
+        try { localStorage.setItem(key, JSON.stringify(parsed)); } catch {}
+      }
+    }
+    if (!parsed) return null;
+    if (clearAt && parsed?.savedAt && Number(parsed.savedAt) <= clearAt) {
+      try { localStorage.removeItem(key); } catch {}
+      try { localStorage.removeItem(`striffsCacheMeta:${key}`); } catch {}
+      try {
+        const k = S.cacheStorageKey?.();
+        if (k && chrome?.storage?.local) chrome.storage.local.remove(k, () => {});
+      } catch {}
+      return null;
+    }
+    const commitCount = meta?.commit_count;
+    if (commitCount != null && parsed.commit_count != null && Number(parsed.commit_count) !== Number(commitCount)) return null;
+    if ((Date.now() - parsed.savedAt) > (S.CACHE_TTL_MS || 0)) return null;
+    return parsed.result || null;
+  }
+
+  function writeCachedDiagram(result, meta) {
+    const updatedAt = meta?.updated_at; // retained for logging; not used for cache validity
+    const commitCount = meta?.commit_count;
     try {
       const key = S.cacheKey();
       if (!key) return;
-      localStorage.setItem(key, JSON.stringify({
+      const payload = {
         result,
         updated_at: updatedAt,
+        commit_count: commitCount != null ? commitCount : null,
         savedAt: Date.now(),
-      }));
+      };
+      const setCacheDataset = (savedAtValue) => {
+        try {
+          const d = document.documentElement?.dataset;
+          if (!d) return;
+          d.striffsCacheSavedAt = String(savedAtValue || '');
+          d.striffsCacheKey = key;
+        } catch {}
+      };
+      try { window.__striffsCacheMeta = payload.savedAt; window.__striffsCacheKey = key; } catch {}
+      setCacheDataset(payload.savedAt);
+      try {
+        const approx = JSON.stringify(payload).length;
+        if (approx > 4_000_000) {
+          try { window.__striffsCacheTooLarge = true; } catch {}
+          try { document.documentElement.dataset.striffsCacheTooLarge = "1"; } catch {}
+          return;
+        }
+      } catch {}
+      try {
+        localStorage.setItem(key, JSON.stringify(payload));
+      } catch (e) {
+        try { localStorage.setItem(`striffsCacheMeta:${key}`, String(payload.savedAt)); } catch {}
+        writeCacheToChromeStorage(payload);
+        return;
+      }
+      try { localStorage.setItem(`striffsCacheMeta:${key}`, String(payload.savedAt)); } catch {}
+      writeCacheToChromeStorage(payload);
     } catch (e) {
       S.cwarn?.("Cache write failed", e);
     }
@@ -1914,6 +3264,8 @@
   async function requestWithToken(token, meta) {
     const { owner, repo, pull_number, updated_at } = meta;
     const reqStart = Date.now();
+    S.__lastRequestType = 'token';
+    try { document.documentElement.dataset.striffsLastRequestType = 'token'; } catch {}
     S.updateStriffButton({ loading: true, phase: " Fetching source...", tooltip: "Generating Striffs…" });
     S.cinfo?.("Striffs request (token)", { owner, repo, pull_number, updated_at });
     const resp = await S.bgRequest({
@@ -1926,12 +3278,24 @@
     }, timeoutFor("bgToken", timeoutFor("message", 7000)));
     const durationMs = Date.now() - reqStart;
     S.cinfo?.("Striffs timings", resp?.timings || { type: "token", durationMs, note: "no timings payload from background" });
+    S.__debugLastApiResponse = resp?.json || null;
+    const componentRecords = S.extractApiComponentRecords?.(resp?.json) || [];
+    const componentFilenames = S.extractApiComponentFilenames?.(resp?.json) || [];
+    S.debugDump?.("api response (token request)", {
+      striffsCount: Array.isArray(resp?.json?.striffs) ? resp.json.striffs.length : 0,
+      componentCount: componentRecords.length,
+      componentFilenames,
+      componentUniqueFilenames: Array.from(new Set(componentFilenames)),
+      components: componentRecords
+    });
     return resp.json;
   }
 
   async function requestWithZips(meta) {
     const { updated_at } = meta;
     const reqStart = Date.now();
+    S.__lastRequestType = 'zips';
+    try { document.documentElement.dataset.striffsLastRequestType = 'zips'; } catch {}
     S.updateStriffButton({ loading: true, phase: "Generating diagram...", tooltip: "Generating Striffs…" });
     const filterFiles = S.getFilterFilesFromNav();
     const { baseOwner, baseRepo, baseBranch, headOwner, headRepo, headBranch } = S.extractHeadBaseRefs();
@@ -1949,14 +3313,33 @@
     }, timeoutFor("bgGenerate", timeoutFor("message", 7000)));
     const durationMs = Date.now() - reqStart;
     S.cinfo?.("Striffs timings", resp?.timings || { type: "generate", durationMs, note: "no timings payload from background" });
+    S.__debugLastApiResponse = resp?.json || null;
+    const componentRecords = S.extractApiComponentRecords?.(resp?.json) || [];
+    const componentFilenames = S.extractApiComponentFilenames?.(resp?.json) || [];
+    S.debugDump?.("api response (zip request)", {
+      striffsCount: Array.isArray(resp?.json?.striffs) ? resp.json.striffs.length : 0,
+      componentCount: componentRecords.length,
+      componentFilenames,
+      componentUniqueFilenames: Array.from(new Set(componentFilenames)),
+      components: componentRecords
+    });
     return resp.json;
   }
 
-  function renderStriffsResult(result, updated_at, { fromCache = false } = {}) {
+  function renderStriffsResult(result, meta, { fromCache = false } = {}) {
+    const updated_at = meta?.updated_at;
     const striffContainer = S.ensureStriffContainer();
     if (!S.isValidStriffsResult(result)) {
       throw new Error(result?.error || result?.message || "Invalid response.");
     }
+    S.updateEngagementContextFromResult?.(result);
+    S.debugDump?.("render result payload summary", {
+      componentFilenames: S.extractApiComponentFilenames?.(result) || [],
+      fromCache,
+      striffsCount: Array.isArray(result?.striffs) ? result.striffs.length : 0,
+      componentCount: (S.extractApiComponentRecords?.(result) || []).length,
+      components: S.extractApiComponentRecords?.(result) || []
+    });
 
     if (Array.isArray(result.striffs) && result.striffs.length === 0) {
       if (striffContainer) {
@@ -1982,7 +3365,7 @@
         throw new Error("Failed to render diagram.");
       }
       if (!fromCache) {
-        writeCachedDiagram(result, updated_at);
+        writeCachedDiagram(result, meta);
         S.__lastLoadSource = "fresh";
       } else {
         S.__lastLoadSource = "cache";
@@ -1995,36 +3378,57 @@
   }
 
   S.autoFetchStriffs = async () => {
-    if (S.__disabledByRemote) {
-      S.disableStriffsButton();
-      return false;
-    }
-    const token = await S.getStoredToken();
-    const meta = S.extractPRMetadata();
-    const { updated_at } = meta;
+    if (S.__autoFetchPromise) return S.__autoFetchPromise;
+    S.__autoFetchPromise = (async () => {
+      if (S.__disabledByRemote) {
+        S.disableStriffsButton();
+        return false;
+      }
+      const token = await S.getStoredToken();
+      const meta = S.extractPRMetadata();
+      const { updated_at } = meta;
 
-    S.buildFilePathToDiffIdMapAsync?.(); // parallel, but safe
-
-    try {
-      let result = readCachedDiagram(updated_at);
-      const fromCache = !!result;
-
-      if (!result) {
-        result = token ? await requestWithToken(token, meta) : await requestWithZips(meta);
-        writeCachedDiagram(result, updated_at);
+      if (!token && S.isPrivateRepo?.()) {
+        S.updateStriffButton({ neutral: true, disabled: true, tooltip: "Private repo requires a token" });
+        S.toast?.("<strong>Private repo detected.</strong> Please add a GitHub token: click the Striffs extension icon, choose “Set Token”, and paste a PAT with repo read access.", "error", { timeoutMs: 9000 });
+        return false;
       }
 
-      renderStriffsResult(result, updated_at, { fromCache });
-      return true;
-    } catch (err) {
-      const message = err?.message || String(err);
-      cerr("autoFetchStriffs error:", message, err);
+      S.buildFilePathToDiffIdMapAsync?.(); // parallel, but safe
 
-      S.updateStriffButton({ failure: true, tooltip: message });
-      S.__striffsReady = false;
+      try {
+        let result = await readCachedDiagram(meta);
+        let fromCache = !!result;
+        if (result && !S.isValidStriffsResult(result)) {
+          try { localStorage.removeItem(S.cacheKey()); } catch {}
+          try {
+            const k = S.cacheStorageKey?.();
+            if (k && chrome?.storage?.local) chrome.storage.local.remove(k, () => {});
+          } catch {}
+          result = null;
+          fromCache = false;
+        }
 
-      S.toast?.(message, "error", { timeoutMs: 5000 });
-      return false;
+        if (!result) {
+          result = token ? await requestWithToken(token, meta) : await requestWithZips(meta);
+        }
+
+        renderStriffsResult(result, meta, { fromCache });
+        return true;
+      } catch (err) {
+        const message = err?.message || String(err);
+        cerr("autoFetchStriffs error:", message, err);
+        S.updateStriffButton({ failure: true, tooltip: message });
+        S.__striffsReady = false;
+
+        S.toast?.(message, "error", { timeoutMs: 5000 });
+        return false;
+      }
+    })();
+    try {
+      return await S.__autoFetchPromise;
+    } finally {
+      S.__autoFetchPromise = null;
     }
   };
 
@@ -2032,32 +3436,122 @@
 
   // Shared helpers used by initial boot + navigation boot
   S.waitForToolbar = S.waitForToolbar || async function waitForToolbar(maxMs = timeoutFor("waitForToolbar", 8000)) {
-    const sleep = S.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
-    const start = Date.now();
     let toolbar = typeof S.getMainToolbar === 'function' ? S.getMainToolbar() : null;
-    while (!toolbar && Date.now() - start < maxMs) {
-      await sleep(120);
-      toolbar = typeof S.getMainToolbar === 'function' ? S.getMainToolbar() : null;
+    if (toolbar) return toolbar;
+    if (typeof MutationObserver !== 'function') {
+      const sleep = S.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
+      const start = Date.now();
+      while (!toolbar && Date.now() - start < maxMs) {
+        await sleep(120);
+        toolbar = typeof S.getMainToolbar === 'function' ? S.getMainToolbar() : null;
+      }
+      return toolbar;
     }
-    return toolbar;
+    return new Promise((resolve) => {
+      const root = document.documentElement || document.body;
+      if (!root) return resolve(null);
+      const obs = new MutationObserver(() => {
+        const el = typeof S.getMainToolbar === 'function' ? S.getMainToolbar() : null;
+        if (el) {
+          obs.disconnect();
+          resolve(el);
+        }
+      });
+      obs.observe(root, { childList: true, subtree: true });
+      setTimeout(() => {
+        obs.disconnect();
+        resolve(typeof S.getMainToolbar === 'function' ? S.getMainToolbar() : null);
+      }, maxMs);
+    });
   };
 
   S.ensureSupportedExtensionsReady = S.ensureSupportedExtensionsReady || async function ensureSupportedExtensionsReady() {
     if (S.__disabledByRemote) return;
-    if (Array.isArray(S.__supportedExtensionsForUi) && S.__supportedExtensionsForUi.length > 0) return;
-    if (typeof S.fetchSupportedExtensions !== 'function' || typeof S.registerSupportedExtensions !== 'function') return;
+    if (S.__supportedExtensionsPromise) return S.__supportedExtensionsPromise;
+    const ttlMs = S.SUPPORTED_LANGS_TTL_MS || (24 * 60 * 60 * 1000);
+    if (
+      Array.isArray(S.__supportedExtensionsForUi) &&
+      S.__supportedExtensionsForUi.length > 0 &&
+      S.__supportedExtensionsFetchedAt &&
+      (Date.now() - S.__supportedExtensionsFetchedAt) < ttlMs
+    ) return;
+    S.__supportedExtensionsPromise = (async () => {
+      try {
+        const apiText = await S.fetchSupportedLanguagesFromApi?.();
+        const apiExts = apiText ? S.parseLangsToExts(apiText) : [];
+        if (apiExts.length) {
+          S.registerSupportedExtensions?.(apiExts);
+          S.__supportedExtensionsFetchedAt = Date.now();
+          return;
+        }
+        if (S.isDebug?.()) {
+          S.cwarn?.('No supported languages from API or cache; skipping supported extensions.');
+        }
+      } catch {}
+    })();
     try {
-      const exts = await S.fetchSupportedExtensions();
-      if (Array.isArray(exts)) {
-        S.registerSupportedExtensions(exts);
-      }
-    } catch (err) {
-      S.cwarn?.('languages check error', err);
+      return await S.__supportedExtensionsPromise;
+    } finally {
+      S.__supportedExtensionsPromise = null;
     }
   };
 
   // File tree -> center the corresponding node in the diagram when Striffs view is visible
   registerDomListeners();
+
+  // Test message hook (opt-in via localStorage striffsTest=1)
+  window.addEventListener('message', (e) => {
+    try {
+      if (!S.isTest?.()) return;
+      if (e.source !== window) return;
+      const data = e?.data || {};
+      if (data.type !== 'STRIFFS_TEST') return;
+      if (data.fn === 'extractSupportedExtensionsFromConfig') {
+        const result = S.extractSupportedExtensionsFromConfig?.(data.cfg) || [];
+        window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result }, '*');
+        return;
+      }
+      if (data.fn === 'ensureSupportedExtensionsReady') {
+        if (data.force) {
+          S.__supportedExtensionsForUi = [];
+          S.__supportedExtensionsFetchedAt = 0;
+          S.__supportedExtensionsPromise = null;
+        }
+        Promise.resolve(S.ensureSupportedExtensionsReady?.())
+          .then(() => {
+            const exts = Array.isArray(S.__supportedExtensionsForUi) ? S.__supportedExtensionsForUi : [];
+            window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: exts }, '*');
+          })
+          .catch(() => {
+            window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: [] }, '*');
+          });
+        return;
+      }
+      if (data.fn === 'getSupportedLanguagesText') {
+        Promise.resolve(S.fetchSupportedLanguagesFromApi?.({ force: false }))
+          .then((text) => {
+            window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: String(text || '') }, '*');
+          })
+          .catch(() => {
+            window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: '' }, '*');
+          });
+        return;
+      }
+      if (data.fn === 'debugSupportedLanguagesCache') {
+        if (!S.bgRequest) {
+          window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: { error: 'no bgRequest' } }, '*');
+          return;
+        }
+        Promise.resolve(S.bgRequest?.({ type: 'getSupportedLanguagesCache' }, 5000))
+          .then((resp) => {
+            window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: resp || null }, '*');
+          })
+          .catch((e) => {
+            window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: { error: String(e?.message || e) } }, '*');
+          });
+      }
+    } catch {}
+  });
 
   // Focus flash (temporarily disabled: no visual highlight styling)
   S.flashFocus = (elem) => {
@@ -2067,20 +3561,26 @@
     } catch {}
   };
 
-  S.centerOnElement = (svg, elem, pan, paddingFactor = 0.8, scaleAdjust = 1.0) => {
+  S.centerElementInStriffs = (elem) => {
     try {
-      const striffView = document.getElementById("striff-diagram-view") || svg.parentElement;
-      const container = striffView.getBoundingClientRect();
+      if (!elem || typeof elem.getBBox !== 'function') return false;
+      const view = S.getStriffScrollEl();
+      if (!view) return false;
       const bbox = elem.getBBox();
-      let scale = Math.min(container.width / (bbox.width || 1), container.height / (bbox.height || 1)) * paddingFactor;
-      scale = Math.max(scale * scaleAdjust, 0.1);
-      pan.zoomAbs(0, 0, scale);
-      const cx = bbox.x + bbox.width / 2;
-      const cy = bbox.y + bbox.height / 2;
-      const tx = container.width / 2 - cx * scale;
-      const ty = container.height / 2 - cy * scale;
-      pan.moveTo(tx, ty);
-    } catch (e) { cwarn('centerOnElement skipped', e); }
+      const scale = Number(S.__striffsZoom) || 1;
+      const targetX = (bbox.x + bbox.width / 2) * scale;
+      const targetY = (bbox.y + bbox.height / 2) * scale;
+      const viewportW = view.clientWidth || 0;
+      const viewportH = view.clientHeight || 0;
+      if (viewportW < 2 || viewportH < 2) return false;
+      const left = Math.max(0, targetX - viewportW / 2);
+      const top = Math.max(0, targetY - viewportH / 2);
+      view.scrollTo({ left, top, behavior: 'smooth' });
+      return true;
+    } catch (e) {
+      S.cwarn?.('centerElementInStriffs failed', e);
+      return false;
+    }
   };
 
   window.addEventListener("pagehide", () => {
@@ -2095,7 +3595,6 @@
     S.__striffsReady = false;
     S.__lastFetchedUpdatedAt = null;
     S.__striffsSvg = null;
-    S.__striffsPanzoom = null;
     S.__striffsPathToComponentId.clear();
     S.__striffsComponentIdToFile.clear();
     S.__lastPanState = null;
@@ -2103,7 +3602,14 @@
     try { localStorage.removeItem(S.cacheKey()); } catch {}
 
     const view = document.getElementById("striff-diagram-view");
-    if (view) view.innerHTML = `<div id="striffs-toast" role="status" aria-live="polite"></div><p>Reloading…</p>`;
+    if (view) {
+      const scroll = view.querySelector("#striffs-scroll");
+      if (scroll) {
+        scroll.innerHTML = `<div id="striffs-toast" role="status" aria-live="polite"></div><div id="striffs-content"><p>Reloading…</p></div>`;
+      } else {
+        view.innerHTML = `<div id="striffs-toast" role="status" aria-live="polite"></div><p>Reloading…</p>`;
+      }
+    }
 
     S.updateStriffButton({ loading: true, tooltip: "Force reloading…", phase: "Bypassing cache..." });
     const ok = await S.autoFetchStriffs();
@@ -2125,7 +3631,12 @@
   S.setDefaultButtonIfIdle = () => {
     S.revealToolbarButtons?.();
     const last = S.__lastStriffsButtonState || {};
-    if (last.loading || last.success || last.failure) return;
+    if (last.loading || last.success || last.failure || last.disabled || last.neutral) {
+      if ((last.disabled || last.neutral) && S.isDebug?.()) {
+        S.cinfo?.('setDefaultButtonIfIdle skipped; button already disabled/neutral');
+      }
+      return;
+    }
     S.updateStriffButton({ tooltip: "Click to generate Striffs" });
   };
 
@@ -2133,10 +3644,10 @@
   const onFilesPage = isPRFiles(location.pathname);
   if (!relevantPage) return;
 
-  console.log('[Striffs] content script boot', location.href);
+  S.clog?.('content script boot', location.href);
 
-  const remoteCfg = await S.fetchRemoteConfig?.();
-  const remoteDisabled = S.applyRemoteDisableIfNeeded?.(remoteCfg);
+  S.__remoteConfigPostMountApplied = false;
+  const remoteCfgPromise = S.fetchRemoteConfig?.();
 
   try {
     S.addSpinAnimation?.();
@@ -2150,22 +3661,48 @@
     return;
   }
 
-  const toolbar = await S.waitForToolbar?.();
+  await S.checkGlobalCacheClearFlag?.();
+  const toolbarPromise = S.waitForToolbar?.();
+  const extsPromise = S.ensureSupportedExtensionsReady?.();
+  const filesRootPromise = S.waitForFilesRoot?.();
+
+  let remoteCfg = await remoteCfgPromise;
+  let remoteDisabled = S.applyRemoteDisableIfNeeded?.(remoteCfg);
+
+  const toolbar = await toolbarPromise;
   if (toolbar) S.mountMainBarButtons?.();
-  if (remoteDisabled) {
-    S.disableStriffsButton();
-    return;
+  // Re-apply after mount to ensure the button reflects the remote state.
+  if (!remoteCfg) {
+    remoteCfg = await S.fetchRemoteConfig?.();
+    remoteDisabled = S.applyRemoteDisableIfNeeded?.(remoteCfg);
+  } else {
+    S.applyRemoteDisableIfNeeded?.(remoteCfg);
   }
+  // If storage caught up with a different config URL, re-fetch and re-apply.
+  try {
+    const latestUrl = await S.getRemoteConfigUrl?.();
+    if (latestUrl && latestUrl !== S.__remoteConfigUrl) {
+      remoteCfg = await S.fetchRemoteConfig?.({ force: true });
+      remoteDisabled = S.applyRemoteDisableIfNeeded?.(remoteCfg);
+    }
+  } catch {}
+  if (remoteDisabled) return;
 
-  await S.ensureSupportedExtensionsReady?.();
+  await extsPromise;
 
-  const filesRoot = await S.waitForFilesRoot();
+  const filesRoot = await filesRootPromise;
   if (!filesRoot) {
     S.cwarn?.('Files root not found; skipping initial boot');
     return;
   }
+  S.ensureFilesObserver?.(filesRoot);
   S.buildFilePathToDiffIdMapAsync?.();
-  S.primeDiagramFromCache();
+  S.refreshSupportedFilesState?.();
+  const cacheStatus = await S.primeDiagramFromCache();
+    if (cacheStatus === 'stale') {
+      S.updateStriffButton({ loading: true, tooltip: "Refreshing Striffs…", phase: "Refreshing…" });
+    await S.autoFetchStriffs?.();
+  }
 
   S.setDefaultButtonIfIdle();
   S.setActiveButtons("diffs");
@@ -2190,25 +3727,50 @@
     try {
       if (!isPRFiles(location.pathname)) return;
 
-      const cfg = await S.fetchRemoteConfig?.();
-      const disabled = S.applyRemoteDisableIfNeeded?.(cfg);
-
+      S.__remoteConfigPostMountApplied = false;
+      const cfgPromise = S.fetchRemoteConfig?.();
       S.addSpinAnimation?.();
-      await S.waitForToolbar?.();
+      await S.checkGlobalCacheClearFlag?.();
+      const toolbarPromise = S.waitForToolbar?.();
+      const extsPromise = S.ensureSupportedExtensionsReady?.();
+      const filesRootPromise = S.waitForFilesRoot?.();
+
+      let cfg = await cfgPromise;
+      let disabled = S.applyRemoteDisableIfNeeded?.(cfg);
+
+      await toolbarPromise;
       S.mountMainBarButtons?.();
-      if (disabled) {
-        S.disableStriffsButton();
-        return;
+      // Re-apply after mount to ensure the button reflects the remote state.
+      if (!cfg) {
+        cfg = await S.fetchRemoteConfig?.();
+        disabled = S.applyRemoteDisableIfNeeded?.(cfg);
+      } else {
+        S.applyRemoteDisableIfNeeded?.(cfg);
       }
+      // If storage caught up with a different config URL, re-fetch and re-apply.
+      try {
+        const latestUrl = await S.getRemoteConfigUrl?.();
+        if (latestUrl && latestUrl !== S.__remoteConfigUrl) {
+          cfg = await S.fetchRemoteConfig?.({ force: true });
+          disabled = S.applyRemoteDisableIfNeeded?.(cfg);
+        }
+      } catch {}
+      if (disabled) return;
 
-      await S.ensureSupportedExtensionsReady?.();
+      await extsPromise;
 
-      const filesRoot = await S.waitForFilesRoot?.();
+      const filesRoot = await filesRootPromise;
       if (!filesRoot) return;
 
+      S.ensureFilesObserver?.(filesRoot);
       S.buildFilePathToDiffIdMapAsync?.();
+      S.refreshSupportedFilesState?.();
 
-      S.primeDiagramFromCache?.();
+      const cacheStatus = await S.primeDiagramFromCache?.();
+      if (cacheStatus === 'stale') {
+        S.updateStriffButton?.({ loading: true, tooltip: "Refreshing Striffs…", phase: "Refreshing…" });
+        await S.autoFetchStriffs?.();
+      }
       S.setDefaultButtonIfIdle?.();
       S.setActiveButtons?.("diffs");
       S.showDiffView?.();

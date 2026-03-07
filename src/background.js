@@ -16,6 +16,23 @@ chrome.runtime.onInstalled.addListener(() => {
 const log  = (...a) => { try { console.log('[bg-striffs]', ...a); } catch {} };
 const warn = (...a) => { try { console.warn('[bg-striffs]', ...a); } catch {} };
 const err  = (...a) => { try { console.error('[bg-striffs]', ...a); } catch {} };
+let debugEnabled = false;
+
+async function loadDebugFlag() {
+  try {
+    const stored = await chrome.storage.local.get(['striffsDebug']);
+    debugEnabled = stored?.striffsDebug === true;
+  } catch {
+    debugEnabled = false;
+  }
+}
+
+const debugLog = (...a) => {
+  if (!debugEnabled) return;
+  log(...a);
+};
+
+loadDebugFlag();
 
 function abortableTimeout(ms) {
   const ctrl = new AbortController();
@@ -35,33 +52,6 @@ async function getApiBase(defaultBase = 'http://localhost:8080') {
     warn('getApiBase failed', e);
   }
   return defaultBase;
-}
-
-async function fetchText(url, { timeoutMs = 15000, init = {} } = {}) {
-  const t = abortableTimeout(timeoutMs);
-  try {
-    const res = await fetch(url, { ...init, signal: t.signal, cache: 'no-cache' });
-    const text = await res.text();
-    return { ok: res.ok, status: res.status, text };
-  } catch (e) {
-    return { ok: false, error: String(e?.message || e) };
-  } finally {
-    t.cancel();
-  }
-}
-
-async function fetchJson(url, { timeoutMs = 20000, init = {} } = {}) {
-  const t = abortableTimeout(timeoutMs);
-  try {
-    const res = await fetch(url, { ...init, signal: t.signal, cache: 'no-cache' });
-    if (!res.ok) return { ok: false, status: res.status, error: `HTTP ${res.status}` };
-    const json = await res.json();
-    return { ok: true, status: res.status, json };
-  } catch (e) {
-    return { ok: false, error: String(e?.message || e) };
-  } finally {
-    t.cancel();
-  }
 }
 
 async function fetchArrayBuffer(url, { timeoutMs = 45000, init = {} } = {}) {
@@ -107,6 +97,109 @@ async function postZipsToLocal(apiUrl, beforeAB, afterAB, filterFiles = [], { ti
   }
 }
 
+const CACHE_PREFIXES = ["striffs:", "striffscache:", "striffscachemeta:", "striffscachemeta:"];
+const CLEAR_FLAG_KEY = "striffsCacheClearAt";
+const DEBUG_FLAG_KEY = "striffsDebug";
+const CACHE_KEYS = [
+  "striffsActiveTab",
+  "striffsRemoteConfig",
+  "striffsRemoteConfigFetchedAt",
+  "striffsRemoteConfigUrl",
+  "striffsSupportedLangs",
+  "striffsSupportedLangsFetchedAt",
+  "striffsSupportedLangsBase",
+  "striffsConfigUrl",
+  "striffsApiBase"
+];
+
+async function clearChromeStorageCaches() {
+  try {
+    const items = await chrome.storage.local.get(null);
+    const keys = Object.keys(items || {}).filter((k) => {
+      if (!k) return false;
+      if (k === "ghToken") return false;
+      if (k === CLEAR_FLAG_KEY) return false;
+      if (k === DEBUG_FLAG_KEY) return false;
+      const lower = k.toLowerCase();
+      return CACHE_KEYS.includes(k) || CACHE_PREFIXES.some((p) => lower.startsWith(p)) || lower.startsWith("striffs");
+    });
+    if (keys.length) {
+      await chrome.storage.local.remove(keys);
+    }
+  } catch (e) {
+    warn('clearChromeStorageCaches failed', e);
+  }
+}
+
+async function clearGithubLocalStorages() {
+  if (!chrome.scripting?.executeScript) return;
+  try {
+    const tabs = await chrome.tabs.query({ url: ["*://github.com/*/pull/*", "*://*.github.com/*/pull/*"] });
+    if (!tabs || !tabs.length) return;
+    const promises = tabs.map(async (tab) => {
+      const tryMessage = async () => {
+        try {
+          const resp = await chrome.tabs.sendMessage(tab.id, { type: "clearStriffsCaches" });
+          return !!resp?.ok;
+        } catch (_) {
+          return false;
+        }
+      };
+
+      const tryScript = async () => {
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            world: "MAIN",
+            func: () => {
+              const prefixes = ["striffs:", "striffscache:", "striffscachemeta:"];
+              const removeKeys = (store) => {
+                if (!store) return;
+                const toRemove = [];
+                for (let i = 0; i < store.length; i += 1) {
+                  const key = store.key(i);
+                  if (!key) continue;
+                  const lower = key.toLowerCase();
+                  if (lower === "striffsdebug") continue;
+                  if (prefixes.some((p) => lower.startsWith(p)) || lower.startsWith("striffs")) {
+                    toRemove.push(key);
+                  }
+                }
+                toRemove.forEach((k) => store.removeItem(k));
+              };
+              try {
+                removeKeys(window.localStorage);
+              } catch (e) {
+                console.error('clearGithubLocalStorages localStorage failed', e);
+              }
+              try {
+                removeKeys(window.sessionStorage);
+              } catch (e) {
+                console.error('clearGithubLocalStorages sessionStorage failed', e);
+              }
+              try {
+                window.Striffs?.clearLocalDiagramCaches?.();
+              } catch (e) {
+                console.error('clearGithubLocalStorages Striffs clear failed', e);
+              }
+              return true;
+            },
+          });
+          return true;
+        } catch (_) {
+          return false;
+        }
+      };
+
+      const ok = (await tryMessage()) || (await tryScript());
+      return ok;
+    });
+    await Promise.allSettled(promises);
+  } catch (e) {
+    warn('clearGithubLocalStorages failed', e);
+  }
+}
+
 // ------------------------------------------------------------
 // Token cache + helpers (ADDED)
 // ------------------------------------------------------------
@@ -132,9 +225,12 @@ async function clearTokenFromStorage() {
 }
 
 chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && Object.prototype.hasOwnProperty.call(changes, 'striffsDebug')) {
+    debugEnabled = changes?.striffsDebug?.newValue === true;
+  }
   if ((area === 'local' || area === 'sync') && changes.ghToken) {
     tokenCache = null; // invalidate cache on any change to ghToken
-    log('Token cache invalidated due to storage change.');
+    debugLog('Token cache invalidated due to storage change.');
   }
 });
 
@@ -142,32 +238,25 @@ chrome.storage.onChanged.addListener((changes, area) => {
 // Message Router (always safeReply + return true for async)
 // ------------------------------------------------------------
 const handlers = {
+  clearStriffsCaches: async (msg, { safeReply }) => {
+    try {
+      const clearAt = Date.now();
+      try { await chrome.storage.local.set({ [CLEAR_FLAG_KEY]: clearAt }); } catch {}
+      await clearChromeStorageCaches();
+      await clearGithubLocalStorages();
+      // Run a second pass to remove any keys re-written by active tabs during clear.
+      await clearChromeStorageCaches();
+      try { await chrome.storage.local.set({ [CLEAR_FLAG_KEY]: clearAt }); } catch {}
+      safeReply({ ok: true });
+    } catch (e) {
+      safeReply({ ok: false, error: String(e?.message || e) });
+    }
+  },
   ping: (msg, { safeReply }) => {
     safeReply({ ok: true, pong: true, ts: Date.now() });
   },
   keepAlive: (msg, { safeReply }) => {
     setTimeout(() => safeReply({ ok: true, msg: 'kept alive' }), 2500);
-  },
-  getLanguages: async (msg, { safeReply }) => {
-    const candidates = [
-      'http://localhost:8080/api/v1/languages',
-    ];
-
-    for (const u of candidates) {
-      const r = await fetchText(u, { timeoutMs: 8000 });
-      if (r.ok) {
-        log('getLanguages OK from', u);
-        safeReply({ ok: true, body: r.text });
-        return;
-      }
-      warn('getLanguages failed', u, r.error || r.status);
-    }
-
-    // Fallback quick answer to verify message path even if API is down
-    safeReply({
-      ok: true,
-      body: 'java, go, javascript, typescript, python, csharp, cpp, ruby, rust, php, kotlin'
-    });
   },
   getToken: async (msg, { safeReply }) => {
     try {
@@ -198,7 +287,7 @@ const handlers = {
       return;
     }
     const apiBase = await getApiBase();
-    log('fetchStriffsWithToken using base', apiBase);
+    debugLog('fetchStriffsWithToken using base', apiBase);
     const url = `${apiBase}/api/v1/github/striffs/owners/${owner}/repos/${repo}/pulls/${pull_number}?updated_at=${encodeURIComponent(updated_at || '')}`;
 
     const t = abortableTimeout(180000);
@@ -209,7 +298,7 @@ const handlers = {
       lastStatus = res.status;
       if (!res.ok) {
         const text = await res.text().catch(() => '');
-        log('fetchStriffsWithToken timings', {
+        debugLog('fetchStriffsWithToken timings', {
           owner, repo, pull_number,
           durationMs: Date.now() - started,
           status: res.status,
@@ -219,7 +308,7 @@ const handlers = {
         return;
       }
       const json = await res.json();
-      log('fetchStriffsWithToken timings', {
+      debugLog('fetchStriffsWithToken timings', {
         owner, repo, pull_number,
         durationMs: Date.now() - started,
         status: res.status,
@@ -227,10 +316,38 @@ const handlers = {
       });
       safeReply({ ok: true, json, timings: { type: 'token', durationMs: Date.now() - started, status: res.status } });
     } catch (e) {
-      log('fetchStriffsWithToken error', { durationMs: Date.now() - started, status: lastStatus, error: String(e?.message || e) });
+      debugLog('fetchStriffsWithToken error', { durationMs: Date.now() - started, status: lastStatus, error: String(e?.message || e) });
       safeReply({ ok: false, error: String(e?.message || e) });
     } finally {
       t.cancel();
+    }
+  },
+  fetchSupportedLanguages: async (msg, { safeReply }) => {
+    try {
+      const base = await getApiBase();
+      const url = `${base.replace(/\/+$/, '')}/api/v1/languages`;
+      const t = abortableTimeout(10000);
+      try {
+        const res = await fetch(url, { signal: t.signal, cache: 'no-cache' });
+        if (!res.ok) {
+          safeReply({ ok: false, error: `HTTP ${res.status}` });
+          return;
+        }
+        const text = await res.text();
+        safeReply({ ok: true, text });
+      } finally {
+        t.cancel();
+      }
+    } catch (e) {
+      safeReply({ ok: false, error: String(e?.message || e) });
+    }
+  },
+  getSupportedLanguagesCache: async (msg, { safeReply }) => {
+    try {
+      const cached = await chrome.storage.local.get(['striffsSupportedLangs', 'striffsSupportedLangsFetchedAt']);
+      safeReply({ ok: true, cached });
+    } catch (e) {
+      safeReply({ ok: false, error: String(e?.message || e) });
     }
   },
   generateStriffs: async (msg, { safeReply }) => {
@@ -245,7 +362,7 @@ const handlers = {
       return;
     }
 
-    log('generateStriffs start', {
+    debugLog('generateStriffs start', {
       baseOwner, baseRepo, baseBranch, headOwner, headRepo, headBranch,
       filterFilesCount: filterFiles.length,
       filterFilesPreview: Array.isArray(filterFiles) ? filterFiles.slice(0, 30) : []
@@ -268,7 +385,7 @@ const handlers = {
     const downloadDurationMs = Date.now() - downloadStart;
 
     if (!before.ok || !after.ok) {
-      log('generateStriffs download error', {
+      debugLog('generateStriffs download error', {
         baseOk: before.ok, headOk: after.ok,
         baseDurationMs: before.durationMs, headDurationMs: after.durationMs,
         totalDownloadMs: downloadDurationMs,
@@ -278,7 +395,7 @@ const handlers = {
       if (!after.ok)  { safeReply({ ok: false, error: `Failed downloading head zip: ${after.error}` }); return; }
     }
 
-    log('generateStriffs download timings', {
+    debugLog('generateStriffs download timings', {
       baseDownloadMs: before.durationMs,
       headDownloadMs: after.durationMs,
       totalDownloadMs: downloadDurationMs,
@@ -287,7 +404,7 @@ const handlers = {
 
     const postStart = Date.now();
     const apiBase = await getApiBase();
-    log('generateStriffs using base', apiBase);
+    debugLog('generateStriffs using base', apiBase);
     const posted = await postZipsToLocal(
       `${apiBase}/api/v1/github/striffs`,
       before.arrayBuffer,
@@ -298,7 +415,7 @@ const handlers = {
     const postDurationMs = Date.now() - postStart;
     const totalDurationMs = Date.now() - overallStart;
 
-    log('generateStriffs timings', {
+    debugLog('generateStriffs timings', {
       baseDownloadMs: before.durationMs,
       headDownloadMs: after.durationMs,
       totalDownloadMs: downloadDurationMs,
@@ -363,6 +480,54 @@ const handlers = {
         const text = await res.text().catch(() => '');
         safeReply({ ok: res.ok, status, text, headers: hdrs });
       }
+    } catch (e) {
+      safeReply({ ok: false, error: String(e?.message || e) });
+    } finally {
+      t.cancel();
+    }
+  },
+  recordEngagementEvent: async (msg, { safeReply }) => {
+    const {
+      operationId,
+      engagementToken,
+      payload,
+      timeoutMs = 12000
+    } = msg || {};
+    const op = String(operationId || "").trim();
+    const token = String(engagementToken || "").trim();
+    if (!op) { safeReply({ ok: false, error: "missing operationId" }); return; }
+    if (!token) { safeReply({ ok: false, error: "missing engagementToken" }); return; }
+    if (!payload || typeof payload !== "object") {
+      safeReply({ ok: false, error: "missing payload" });
+      return;
+    }
+    const apiBase = await getApiBase();
+    const url = `${apiBase}/api/v1/striffs/${encodeURIComponent(op)}/engagement`;
+    const t = abortableTimeout(timeoutMs);
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Striff-Engagement-Token": token
+        },
+        body: JSON.stringify(payload),
+        signal: t.signal,
+        cache: "no-cache"
+      });
+      const status = res.status;
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        debugLog("recordEngagementEvent failed", {
+          operationId: op,
+          status,
+          eventType: payload?.eventType || payload?.event?.type || null
+        });
+        safeReply({ ok: false, status, error: `HTTP ${status}`, body: text });
+        return;
+      }
+      const json = await res.json().catch(() => null);
+      safeReply({ ok: true, status, json });
     } catch (e) {
       safeReply({ ok: false, error: String(e?.message || e) });
     } finally {
