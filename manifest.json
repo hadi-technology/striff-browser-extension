@@ -2,9 +2,10 @@
   "manifest_version": 3,
   "name": "Striffs for GitHub",
   "description": "Adds an architectural diff tab to GitHub pull requests.",
-  "version": "1.0",
-  "permissions": ["storage"],
+  "version": "1.0.2",
+  "permissions": ["storage", "tabs", "scripting"],
   "host_permissions": [
+    "*://github.com/*",
     "*://*.github.com/*",
     "https://codeload.github.com/*",
     "https://striffs-config.tor1.cdn.digitaloceanspaces.com/*",
@@ -23,6 +24,7 @@
       "js": [
         "lib/fflate.min.js",
         "src/webext-shim.js",
+        "src/pr-metadata-utils.js",
         "src/striffs.js"
       ],
       "run_at": "document_idle"

@@ -543,60 +543,52 @@
       wrap.appendChild(layer);
     }
     layer.innerHTML = "";
-    const zoom = Number(S.__striffsZoom) || 1;
+    const wrapRect = wrap.getBoundingClientRect?.();
+    if (!wrapRect) return false;
     const notes = S.getReviewNoteEntities?.(svg) || [];
     for (const note of notes) {
       const qn = String(note.getAttribute?.("data-qualified-name") || "").trim();
       const noteId = S.extractReviewNoteId?.(qn);
       if (!noteId) continue;
-      try {
-        const bbox = note.getBBox?.();
-        if (!bbox) continue;
-        const shell = document.createElement("div");
-        shell.className = "striffs-note-feedback";
-        shell.setAttribute("data-note-id", noteId);
-        shell.setAttribute("data-note-qualified-name", qn);
-        // Position at top-right corner of the note, accounting for button size
-        const buttonWidth = 24;
-        const buttonGap = 4;
-        const totalWidth = (buttonWidth * 2) + buttonGap;
-        shell.style.left = `${(bbox.x + bbox.width) * zoom - totalWidth - 4}px`;
-        shell.style.top = `${bbox.y * zoom + 4}px`;
+      const rect = note.getBoundingClientRect?.();
+      if (!rect || rect.width <= 0 || rect.height <= 0) continue;
+      const shell = document.createElement("div");
+      shell.className = "striffs-note-feedback";
+      shell.setAttribute("data-note-id", noteId);
+      shell.setAttribute("data-note-qualified-name", qn);
+      shell.style.left = `${Math.max(6, rect.right - wrapRect.left - 54)}px`;
+      shell.style.top = `${Math.max(6, rect.bottom - wrapRect.top - 26)}px`;
 
-        const currentVote = S.__reviewNoteVotes?.get?.(noteId) || null;
-        const noteText = S.extractReviewNoteText?.(note) || "";
-        const createVoteButton = (vote, icon, label) => {
-          const btn = document.createElement("button");
-          btn.type = "button";
-          btn.className = `striffs-note-feedback-btn${currentVote === vote ? " is-selected" : ""}`;
-          btn.setAttribute("data-vote", vote);
-          btn.setAttribute("aria-label", label);
-          btn.title = label;
-          btn.innerHTML = S.octicon(icon);
-          btn.addEventListener("click", (event) => {
-            event.preventDefault();
-            event.stopPropagation();
-            S.__reviewNoteVotes?.set?.(noteId, vote);
-            S.emitEngagementEvent?.("ai_note_feedback", {
-              noteId,
-              vote,
-              noteQualifiedName: qn
-            }, {
-              noteText,
-              noteQualifiedName: qn
-            });
-            S.queueReviewNoteFeedbackLayout?.();
+      const currentVote = S.__reviewNoteVotes?.get?.(noteId) || null;
+      const noteText = S.extractReviewNoteText?.(note) || "";
+      const createVoteButton = (vote, icon, label) => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = `striffs-note-feedback-btn${currentVote === vote ? " is-selected" : ""}`;
+        btn.setAttribute("data-vote", vote);
+        btn.setAttribute("aria-label", label);
+        btn.title = label;
+        btn.innerHTML = S.octicon(icon);
+        btn.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          S.__reviewNoteVotes?.set?.(noteId, vote);
+          S.emitEngagementEvent?.("ai_note_feedback", {
+            noteId,
+            vote,
+            noteQualifiedName: qn
+          }, {
+            noteText,
+            noteQualifiedName: qn
           });
-          return btn;
-        };
+          S.queueReviewNoteFeedbackLayout?.();
+        });
+        return btn;
+      };
 
-        shell.appendChild(createVoteButton("up", "thumbsup", "Helpful AI note"));
-        shell.appendChild(createVoteButton("down", "thumbsdown", "Unhelpful AI note"));
-        layer.appendChild(shell);
-      } catch (e) {
-        // Skip notes that can't be positioned
-        continue;
-      }
+      shell.appendChild(createVoteButton("up", "thumbsup", "Helpful AI note"));
+      shell.appendChild(createVoteButton("down", "thumbsdown", "Unhelpful AI note"));
+      layer.appendChild(shell);
     }
     return true;
   };
@@ -1652,8 +1644,7 @@
     S.octicon = function octicon(name) {
         const pathMap = {
             file: 'M3 2.75A.75.75 0 0 1 3.75 2h5.5a.75.75 0 0 1 .53.22l3 3a.75.75 0 0 1 .22.53v7.5A1.75 1.75 0 0 1 11.25 15H4.75A1.75 1.75 0 0 1 3 13.25Zm1 .75v9.75c0 .138.112.25.25.25h6.5c.138 0 .25-.112.25-.25V6.5H9.5a1 1 0 0 1-1-1V3.5H4.25a.25.25 0 0 0-.25.25Zm6 .25V5.5h1.5Z',
-            // Using 'project' icon - better represents architecture/structure diagrams
-            graph: 'M1.75 1h12.5c.966 0 1.75.784 1.75 1.75v10.5A1.75 1.75 0 0 1 14.25 15H1.75A1.75 1.75 0 0 1 0 13.25V2.75C0 1.784.784 1 1.75 1ZM1.5 2.75v10.5c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25V2.75a.25.25 0 0 0-.25-.25H1.75a.25.25 0 0 0-.25.25Zm7.5 3.75a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Zm-5 0a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Zm10 0a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Zm-10 5a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Zm5 0a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Zm5 0a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Z',
+            graph: 'M1.75 2.5a.75.75 0 0 0 0 1.5h.443l2.168 5.42a.75.75 0 0 0 1.388 0l1.07-2.675 1.094 3.283a.75.75 0 0 0 1.4.12L12.1 5h2.15a.75.75 0 0 0 0-1.5h-2.6a.75.75 0 0 0-.659.393L9.5 7.4 8.37 4.06a.75.75 0 0 0-1.4-.06L5.7 6.953 3.93 2.9A.75.75 0 0 0 3.2 2.5Z',
 
             // status icons
             'check-circle': 'M8 15A7 7 0 1 0 8 1a7 7 0 0 0 0 14Zm3.78-8.72a.75.75 0 0 1 0 1.06l-4 4a.75.75 0 0 1-1.06 0l-2-2a.75.75 0 1 1 1.06-1.06L7 9.94l3.22-3.22a.75.75 0 0 1 1.06 0Z',
@@ -1789,7 +1780,7 @@
         S.ensureBtn(
             slot,
             'striffs-btn',
-            `${S.octicon('workflow')}<span class="striffs-local-btn-label"> Striffs</span>`,
+            `${S.octicon('graph')}<span class="striffs-local-btn-label"> Striffs</span>`,
             onStriffClick
         );
 
@@ -1877,7 +1868,7 @@
             return;
         }
 
-        btn.innerHTML = `${S.octicon('workflow')}<span class="striffs-local-btn-label"> Striffs</span>`;
+        btn.innerHTML = `${S.octicon('graph')}<span class="striffs-local-btn-label"> Striffs</span>`;
     };
 
     // --- Global toast helpers (theme-aware) ---
@@ -2116,13 +2107,18 @@
     display: inline-flex;
     align-items: center;
     gap: 4px;
+    padding: 3px;
+    border-radius: 999px;
+    background: rgba(255,255,255,0.78);
+    backdrop-filter: blur(4px);
+    box-shadow: 0 6px 18px rgba(17, 24, 39, 0.14);
     pointer-events: auto;
   }
   #striff-diagram-view .striffs-note-feedback-btn{
     appearance: none;
-    border: none;
-    background: rgba(255, 245, 157, 0.98);
-    color: #000000;
+    border: 1px solid rgba(225, 168, 191, 0.65);
+    background: rgba(255,255,255,0.92);
+    color: #c25d8a;
     width: 24px;
     height: 24px;
     border-radius: 999px;
@@ -2131,15 +2127,17 @@
     justify-content: center;
     cursor: pointer;
     padding: 0;
-    transition: transform .12s ease, background-color .12s ease;
+    transition: transform .12s ease, box-shadow .12s ease, background-color .12s ease, color .12s ease;
   }
   #striff-diagram-view .striffs-note-feedback-btn:hover{
     transform: translateY(-1px);
-    background: rgba(255, 245, 157, 1);
+    box-shadow: 0 4px 12px rgba(194, 93, 138, 0.22);
+    background: rgba(255, 244, 249, 0.96);
   }
   #striff-diagram-view .striffs-note-feedback-btn.is-selected{
-    background: rgba(255, 245, 157, 1);
-    color: #000000;
+    background: rgba(248, 207, 224, 0.98);
+    color: #a63d6c;
+    border-color: rgba(166, 61, 108, 0.38);
   }
   #striff-diagram-view .striffs-note-feedback-btn svg{
     width: 14px;
@@ -2598,8 +2596,6 @@
       if (S.__striffsSvg) {
           S.__striffsSvg.style.pointerEvents = 'auto';
       }
-      // Center the striff view in the viewport
-      striffView.scrollIntoView({ block: 'center', behavior: 'smooth' });
         }
         S.setCurrentView('striffs');
     };
@@ -2892,7 +2888,7 @@
       const filePath = `/${S.normalizePath(rawPath)}`;
       const componentId = S.__striffsPathToComponentId?.get(filePath) || null;
       const enabled = Boolean(S.__striffsReady && componentId);
-      // Convert hyphenated back to dotted for display/telemetry (idempotent for already-dotted names)
+      // Convert hyphenated back to dotted for display/telemetry (more readable)
       const dottedComponentId = componentId ? componentId.replace(/-/g, '.') : null;
 
       btn.dataset.striffsFilePath = filePath;
@@ -3155,7 +3151,7 @@
         if (!file || !qn) continue;
         const norm = S.normalizePath(file);
 
-        // Try hyphenated format first (for old SVGs), fall back to dotted format (newer SVGs)
+        // Try hyphenated format first (PlantUML convention), fall back to dotted format
         const hyphenatedName = toHyphenatedName(qn);
         const svgElement = svgEntityMap.get(hyphenatedName) || svgEntityMap.get(qn);
 
@@ -3169,9 +3165,8 @@
 
         if (svgElement) {
           const withSlash = "/" + norm;
-          // Store the actual name found in SVG (could be hyphenated or dotted)
-          const actualSvgName = svgEntityMap.has(hyphenatedName) ? hyphenatedName : qn;
-          S.__striffsPathToComponentId.set(withSlash, actualSvgName);
+          // Store hyphenated name for SVG query (SVG uses hyphens, not dots)
+          S.__striffsPathToComponentId.set(withSlash, hyphenatedName);
           // Store both dotted and hyphenated versions for click handler compatibility
           S.__striffsComponentIdToFile.set(qn, withSlash);
           S.__striffsComponentIdToFile.set(hyphenatedName, withSlash);
@@ -3195,13 +3190,6 @@
       S.__debugComponentToFile = Array.from(S.__striffsComponentIdToFile.entries());
       S.__debugFilePathToDiffHash = pathToDiff;
       S.__debugDiffHashToFilePath = diffToPath;
-    }
-
-    // Always log the path->component mapping for debugging file tree clicks
-    console.log("[Striffs][buildPathIdMapping] Path to component map:", Array.from(S.__striffsPathToComponentId.entries()));
-    console.log("[Striffs][buildPathIdMapping] Components missing from SVG:", missingInSvg);
-
-    if (debugEnabled) {
       S.dumpStriffsMaps = () => {
         try {
           console.log("[Striffs][map] api components (component->file)", S.__debugApiComponents);
@@ -3253,19 +3241,8 @@
   S.findSvgTextForFile = (fullPath) => {
     if (!S.__striffsSvg) return null;
     const norm = S.normalizePath(fullPath);
-    const lookupKey = "/" + norm;
-    const mappedId = S.__striffsPathToComponentId.get(lookupKey);
-    if (!mappedId) {
-      // Debug: log why the lookup failed
-      console.warn('[Striffs][findSvgTextForFile] Not found in path->component map', {
-        fullPath,
-        norm,
-        lookupKey,
-        mapKeys: Array.from(S.__striffsPathToComponentId.keys()).slice(0, 10),
-        mapSize: S.__striffsPathToComponentId.size
-      });
-      return null;
-    }
+    const mappedId = S.__striffsPathToComponentId.get("/" + norm);
+    if (!mappedId) return null;
     const esc = S.cssEscape(mappedId);
     return S.__striffsSvg.querySelector(`[data-qualified-name="${esc}"]`) ||
            S.__striffsSvg.querySelector(`text[data-qualified-name="${esc}"]`);
@@ -3874,17 +3851,6 @@
       if (S.__disabledByRemote) return;
       const normalizedPath = '/' + S.normalizePath(fullPath);
       const mappedComponentId = S.__striffsPathToComponentId?.get(normalizedPath) || null;
-
-      // Debug: log the click details
-      console.log('[Striffs][FileTreeClick]', {
-        textContent: hiddenSpan?.textContent?.trim(),
-        fullPath,
-        normalizedPath,
-        mappedComponentId,
-        mapSize: S.__striffsPathToComponentId?.size || 0,
-        sampleKeys: Array.from(S.__striffsPathToComponentId?.keys() || []).slice(0, 5)
-      });
-
       // Convert hyphenated back to dotted for telemetry (more readable/standard)
       const dottedComponentId = mappedComponentId ? mappedComponentId.replace(/-/g, '.') : null;
       S.emitEngagementEvent?.("file_explorer_item_clicked_in_striffs_view", {
@@ -3913,24 +3879,22 @@
 	        targetNode.closest?.("g.entity[data-qualified-name]");
 	      if (!target) return false;
 	      const qn = target.getAttribute("data-qualified-name");
-	      // Convert hyphenated to dotted for engagement telemetry and debug state
-	      const dottedQn = qn ? qn.replace(/-/g, '.') : null;
 	      if (S.isReviewNoteQualifiedName?.(qn)) {
 	        S.syncDiagramClickDebugState?.("ignored-note", {
-	          componentQualifiedName: dottedQn || null,
+	          componentQualifiedName: qn || null,
 	          reason: "review note nodes are not navigable",
 	          targetFound: true
 	        });
 	        return false;
 	      }
 	      S.syncDiagramClickDebugState?.("received", {
-	        componentQualifiedName: dottedQn || null,
+	        componentQualifiedName: qn || null,
 	        targetFound: true
 	      });
 	      const ownerSvg = target.ownerSVGElement || target.closest("svg");
 	      if (ownerSvg !== S.__striffsSvg) {
 	        S.syncDiagramClickDebugState?.("ignored-foreign-svg", {
-	          componentQualifiedName: dottedQn || null,
+	          componentQualifiedName: qn || null,
 	          reason: "target belongs to a different svg",
 	          targetFound: true
 	        });
@@ -3939,9 +3903,8 @@
 
 	      const file = S.__striffsComponentIdToFile.get(qn);
 	      const diffId = file ? (S.__filePathToDiffId.get(file) || S.__filePathToDiffId.get(S.normalizePath(file))) : null;
-
 	      S.emitEngagementEvent?.("diagram_component_clicked", {
-	        componentQualifiedName: dottedQn || null,
+	        componentQualifiedName: qn || null,
 	        mappedFile: file || null,
 	        hasMappedFile: Boolean(file),
 	        diffId: diffId || null,
@@ -3957,7 +3920,7 @@
 	          const diffEl = document.getElementById(diffId);
 	          if (diffEl) diffEl.scrollIntoView({ block: "start", behavior: "smooth" });
 	          S.syncDiagramClickDebugState?.("navigated", {
-	            componentQualifiedName: dottedQn || null,
+	            componentQualifiedName: qn || null,
 	            file,
 	            diffId,
 	            targetFound: true,
@@ -3968,7 +3931,7 @@
 
 	        S.cwarn?.('Striffs component click: file missing in diff map', { id: qn, file });
 	        S.syncDiagramClickDebugState?.("missing-diff", {
-	          componentQualifiedName: dottedQn || null,
+	          componentQualifiedName: qn || null,
 	          file,
 	          reason: "file missing in diff map",
 	          targetFound: true
@@ -3979,7 +3942,7 @@
 
 	      S.cwarn?.('Striffs component click: no file mapped for component', { id: qn });
 	      S.syncDiagramClickDebugState?.("missing-file", {
-	        componentQualifiedName: dottedQn || null,
+	        componentQualifiedName: qn || null,
 	        reason: "component missing file mapping",
 	        targetFound: true
 	      });
@@ -4332,7 +4295,7 @@
     S.__lastRequestType = 'token';
     try { document.documentElement.dataset.striffsLastRequestType = 'token'; } catch {}
     if (!quiet) {
-      S.updateStriffButton({ loading: true, phase: " Loading diagram...", tooltip: "Generating Striffs…" });
+      S.updateStriffButton({ loading: true, phase: " Fetching source...", tooltip: "Generating Striffs…" });
     }
     S.cinfo?.("Striffs request (token)", { owner, repo, pull_number, updated_at });
     const resp = await S.bgRequest({
@@ -4356,8 +4319,7 @@
       componentCount: componentRecords.length,
       componentFilenames,
       componentUniqueFilenames: Array.from(new Set(componentFilenames)),
-      components: componentRecords,
-      fullApiResponse: resp?.json  // Add full API response in debug mode
+      components: componentRecords
     });
     return resp.json;
   }
@@ -4397,8 +4359,7 @@
       componentCount: componentRecords.length,
       componentFilenames,
       componentUniqueFilenames: Array.from(new Set(componentFilenames)),
-      components: componentRecords,
-      fullApiResponse: resp?.json  // Add full API response in debug mode
+      components: componentRecords
     });
     return resp.json;
   }
@@ -4516,7 +4477,6 @@
     if (S.__autoFetchPromise) return S.__autoFetchPromise;
     S.__autoFetchPromise = (async () => {
       let terminalErrorMessage = "";
-      let skipReconcile = false; // Flag to skip reconcile in finally block
       if (S.__disabledByRemote) {
         S.disableStriffsButton();
         return false;
@@ -4527,7 +4487,7 @@
 
       if (!token && S.isPrivateRepo?.()) {
         S.updateStriffButton({ neutral: true, disabled: true, tooltip: "Private repo requires a token" });
-        S.toast?.("<strong>Private repo detected.</strong> Please add a GitHub token: click the Striffs extension icon, choose \"Set Token\", and paste a PAT with repo read access.", "error", { timeoutMs: 9000 });
+        S.toast?.("<strong>Private repo detected.</strong> Please add a GitHub token: click the Striffs extension icon, choose “Set Token”, and paste a PAT with repo read access.", "error", { timeoutMs: 9000 });
         return false;
       }
 
@@ -4556,23 +4516,18 @@
         S.__striffsReady = false;
 
         // Check for HTTP 413 (Payload Too Large) error
-        if (message.includes('413') || message.includes('Too many changes') || message.includes('Unable to generate AI review: request too large')) {
-          message = "Unable to generate AI review: this PR has too many changes.";
+        if (message.includes('413') || message.includes('Too many changes')) {
+          message = "Too many changes for AI review. Please view smaller diffs or contact support to increase limits.";
           S.updateStriffButton({ neutral: true, disabled: true, tooltip: message });
-          S.toast?.(message, "neutral", { timeoutMs: 8000 });
-          // Skip reconcile since we've already set the desired button state
-          skipReconcile = true;
-          return false;
+        } else {
+          terminalErrorMessage = message;
+          S.updateStriffButton({ failure: true, tooltip: message });
         }
 
-        terminalErrorMessage = message;
-        S.updateStriffButton({ failure: true, tooltip: message });
         S.toast?.(message, "neutral", { timeoutMs: 8000 });
         return false;
       } finally {
-        if (!skipReconcile) {
-          S.reconcileStriffButtonState?.({ errorMessage: terminalErrorMessage });
-        }
+        S.reconcileStriffButtonState?.({ errorMessage: terminalErrorMessage });
       }
     })();
     try {

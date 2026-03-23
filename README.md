@@ -55,6 +55,15 @@ StriffsExtension/
 
 ---
 
+## ✅ Test Commands
+
+- `npm test`
+  - Runs the stable local suite: unit tests, background telemetry tests, result-contract tests, and a deterministic Playwright UI harness against a local PR fixture.
+- `npm run test:live`
+  - Runs the live GitHub smoke (`test/manual-smoke-live.js`). This is intentionally separate because it depends on GitHub UI, remote config, and a running backend.
+
+---
+
 ## ✅ Manual Smoke Test Coverage
 
 The manual Playwright smoke test (`test/manual-smoke-live.js`) validates observable behavior only:

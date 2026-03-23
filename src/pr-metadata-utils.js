@@ -47,7 +47,45 @@ const getCommitFromEmbeddedData = (document) => {
   return null;
 };
 
-const COMMITS_COUNTER_SELECTOR = '#commits_tab_counter';
+const COMMIT_COUNT_COUNTER_SELECTORS = [
+  '#commits_tab_counter',
+  'a#commits_tab .Counter',
+  '#commits_tab .Counter',
+  '[data-tab-item="commits-tab"] .Counter',
+  'a[href$="/commits"] .Counter'
+];
+
+const COMMIT_COUNT_TAB_SELECTORS = [
+  'a#commits_tab',
+  '#commits_tab',
+  '[data-tab-item="commits-tab"]',
+  'a[href$="/commits"]'
+];
+
+const parseCommitCountFromText = (value) => {
+  if (value == null) return null;
+  const raw = String(value).trim();
+  if (!raw) return null;
+  const compact = raw.replace(/,/g, '');
+  const match = compact.match(/\d+/);
+  if (!match) return null;
+  const parsed = Number(match[0]);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const parseCommitCountFromNode = (node) => {
+  if (!node) return null;
+  const candidates = [
+    node?.getAttribute?.('title'),
+    node?.getAttribute?.('aria-label'),
+    node?.textContent
+  ];
+  for (const candidate of candidates) {
+    const parsed = parseCommitCountFromText(candidate);
+    if (parsed != null) return parsed;
+  }
+  return null;
+};
 
 const resolveLatestCommitShaFromDocument = (document) => {
   if (!document) return null;
@@ -70,18 +108,33 @@ const resolveLatestCommitShaFromDocument = (document) => {
 
 const resolveCommitCountFromDocument = (document) => {
   if (!document) return null;
-  const counter = document.querySelector(COMMITS_COUNTER_SELECTOR);
-  if (!counter) return null;
-  const raw = counter.getAttribute?.('title') || counter.textContent || '';
-  const digits = String(raw).replace(/[^\d]/g, '');
-  const parsed = Number(digits);
-  return Number.isFinite(parsed) ? parsed : null;
+  for (const selector of COMMIT_COUNT_COUNTER_SELECTORS) {
+    const node = document.querySelector(selector);
+    const parsed = parseCommitCountFromNode(node);
+    if (parsed != null) return parsed;
+  }
+
+  for (const selector of COMMIT_COUNT_TAB_SELECTORS) {
+    const node = document.querySelector(selector);
+    const parsed = parseCommitCountFromNode(node);
+    if (parsed != null) return parsed;
+  }
+
+  return null;
 };
 
-module.exports = {
+const api = {
   resolveLatestCommitShaFromDocument,
   normalizeCommit,
   getCommitFromMeta,
   getCommitFromEmbeddedData,
   resolveCommitCountFromDocument,
 };
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = api;
+}
+
+if (typeof globalThis !== 'undefined') {
+  globalThis.StriffsPrMetadataUtils = api;
+}

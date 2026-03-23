@@ -97,7 +97,7 @@ async function postZipsToLocal(apiUrl, beforeAB, afterAB, filterFiles = [], { ti
   }
 }
 
-const CACHE_PREFIXES = ["striffs:", "striffscache:", "striffscachemeta:", "striffscachemeta:"];
+const CACHE_PREFIXES = ["striffs:", "striffscache:", "striffscachemeta:"];
 const CLEAR_FLAG_KEY = "striffsCacheClearAt";
 const DEBUG_FLAG_KEY = "striffsDebug";
 const CACHE_KEYS = [
@@ -131,15 +131,28 @@ async function clearChromeStorageCaches() {
   }
 }
 
-async function clearGithubLocalStorages() {
-  if (!chrome.scripting?.executeScript) return;
+function isGithubPullRequestUrl(url) {
+  return /^https?:\/\/(?:[^/]+\.)?github\.com\/[^/]+\/[^/]+\/pull\/\d+(?:\/.*)?$/i.test(String(url || ""));
+}
+
+async function clearGithubLocalStorages({ senderTabId = null, senderUrl = "" } = {}) {
   try {
-    const tabs = await chrome.tabs.query({ url: ["*://github.com/*/pull/*", "*://*.github.com/*/pull/*"] });
-    if (!tabs || !tabs.length) return;
-    const promises = tabs.map(async (tab) => {
+    const tabIds = new Set();
+    if (Number.isInteger(senderTabId) && senderTabId >= 0 && isGithubPullRequestUrl(senderUrl)) {
+      tabIds.add(senderTabId);
+    }
+    if (chrome.tabs?.query) {
+      const tabs = await chrome.tabs.query({ url: ["*://github.com/*/pull/*", "*://*.github.com/*/pull/*"] });
+      for (const tab of (tabs || [])) {
+        if (Number.isInteger(tab?.id)) tabIds.add(tab.id);
+      }
+    }
+    if (!tabIds.size) return;
+    const promises = Array.from(tabIds).map(async (tabId) => {
       const tryMessage = async () => {
+        if (!chrome.tabs?.sendMessage) return false;
         try {
-          const resp = await chrome.tabs.sendMessage(tab.id, { type: "clearStriffsCaches" });
+          const resp = await chrome.tabs.sendMessage(tabId, { type: "clearStriffsCaches" });
           return !!resp?.ok;
         } catch (_) {
           return false;
@@ -147,9 +160,10 @@ async function clearGithubLocalStorages() {
       };
 
       const tryScript = async () => {
+        if (!chrome.scripting?.executeScript) return false;
         try {
           await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
+            target: { tabId },
             world: "MAIN",
             func: () => {
               const prefixes = ["striffs:", "striffscache:", "striffscachemeta:"];
@@ -191,8 +205,9 @@ async function clearGithubLocalStorages() {
         }
       };
 
-      const ok = (await tryMessage()) || (await tryScript());
-      return ok;
+      const messageOk = await tryMessage();
+      const scriptOk = await tryScript();
+      return messageOk || scriptOk;
     });
     await Promise.allSettled(promises);
   } catch (e) {
@@ -243,7 +258,10 @@ const handlers = {
       const clearAt = Date.now();
       try { await chrome.storage.local.set({ [CLEAR_FLAG_KEY]: clearAt }); } catch {}
       await clearChromeStorageCaches();
-      await clearGithubLocalStorages();
+      await clearGithubLocalStorages({
+        senderTabId: Number.isInteger(msg?.senderTabId) ? msg.senderTabId : null,
+        senderUrl: msg?.senderUrl || ""
+      });
       // Run a second pass to remove any keys re-written by active tabs during clear.
       await clearChromeStorageCaches();
       try { await chrome.storage.local.set({ [CLEAR_FLAG_KEY]: clearAt }); } catch {}
@@ -569,7 +587,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
     }
     const handler = handlers[type];
-    Promise.resolve(handler(msg, { sender, safeReply })).catch(e => safeReply({ ok: false, error: String(e?.message || e) }));
+    const msgWithSender = {
+      ...(msg || {}),
+      senderTabId: Number.isInteger(sender?.tab?.id) ? sender.tab.id : undefined,
+      senderUrl: sender?.tab?.url || sender?.url || undefined
+    };
+    Promise.resolve(handler(msgWithSender, { sender, safeReply })).catch(e => safeReply({ ok: false, error: String(e?.message || e) }));
     return true;
   } catch (e) {
     safeReply({ ok: false, error: String(e?.message || e) });
