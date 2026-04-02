@@ -20,11 +20,17 @@
   S.__striffsSvg = null;
   S.__striffsPathToComponentId = new Map();
   S.__striffsComponentIdToFile = new Map();
+  S.__striffsComponentIdToDiffId = new Map();
   S.__filePathToDiffId = new Map(); // "/path" -> diffId (no '#')
+  S.__stablePathToComponentId = new Map();
+  S.__stableComponentIdToFile = new Map();
+  S.__stableComponentIdToDiffId = new Map();
+  S.__stableFilePathToDiffId = new Map();
   S.__striffsReady = false;
   S.__striffsNoChanges = false;
   S.__lastFetchedUpdatedAt = null;
-  S.__styleInjected = false; 
+  S.__styleInjected = false;
+  S.__waitingForToken = false;
   S.__striffsZoom = 1;
   S.__recentPanAt = 0;
   S.__supportedExtensionsForUi = S.__supportedExtensionsForUi ||
@@ -131,7 +137,10 @@
       'div[data-testid="files-changed"]',
       'div[data-target="diff-layout.sidebarContainer"]',
       'div.diff-sidebar[data-view-component="true"]',
-      'file-tree'
+      'file-tree',
+      'div[data-testid="progressive-diffs-list"]',
+      'ul[role="tree"][aria-label*="File Tree"]',
+      'div[aria-label="File Tree"]'
     ],
     diffContainers: [
       '[data-testid="file-diff-split"]',
@@ -145,7 +154,9 @@
       ".file-info a.Link--primary",
       '[data-testid="file-header"] a.Link--primary',
       'a[data-testid="file-name"], a[data-hovercard-type="file"]',
-      "a.ActionList-content[href^='#diff-']"
+      "a.ActionList-content[href^='#diff-']",
+      "a[href*='#diff-'][title]",
+      "a[href*='#diff-'][aria-label]"
     ],
     fileTreeItems: [
       // New GitHub ActionList tree (2025)
@@ -155,7 +166,8 @@
       "li[id^='file-tree-item-diff-'] span.ActionList-item-label",
       // Older tree (fallbacks)
       "[data-testid='file-tree'] li [data-testid='file-tree-item-text']",
-      "[data-testid='file-tree'] li a.ActionListContent"
+      "[data-testid='file-tree'] li a.ActionListContent",
+      "li[role='treeitem'] span.PRIVATE_TreeView-item-content-text"
     ]
   });
 
@@ -469,9 +481,7 @@
       const root = document.documentElement;
       if (!root) return;
       // Convert hyphenated component names to dotted for display/debugging (more readable)
-      const dottedComponentName = extra.componentQualifiedName
-        ? String(extra.componentQualifiedName).replace(/-/g, '.')
-        : "";
+      const dottedComponentName = S.toDottedName(extra.componentQualifiedName) || "";
       root.dataset.striffsLastDiagramClickStatus = String(status || "");
       root.dataset.striffsLastDiagramClickComponent = dottedComponentName;
       root.dataset.striffsLastDiagramClickFile = String(extra.file || "");
@@ -520,6 +530,20 @@
     return texts.join(" ").replace(/\s+/g, " ").trim();
   };
 
+  S.reviewNoteFeedbackIcon = (vote) => {
+    const iconName = vote === "down" ? "thumbsdown" : "thumbsup";
+    const pathMap = {
+      thumbsup: 'M8.347 1.631A1.75 1.75 0 0 1 10 3.375V6h2.68a1.82 1.82 0 0 1 1.79 2.146l-.765 4.593A2.75 2.75 0 0 1 11 15H5.72a2.75 2.75 0 0 1-1.887-.75l-.59-.554A1.75 1.75 0 0 1 2.7 12.42V7.75C2.7 6.784 3.484 6 4.45 6H6.5V3.92c0-.354.107-.7.307-.992ZM4.45 7.5a.25.25 0 0 0-.25.25v4.67c0 .07.03.136.08.184l.591.554c.237.222.549.342.872.342H11c.61 0 1.13-.439 1.23-1.04l.766-4.593a.32.32 0 0 0-.316-.377H9.25A.75.75 0 0 1 8.5 6.75V3.375a.25.25 0 0 0-.472-.121l-1.22 2.135a.75.75 0 0 1-.652.381Z',
+      thumbsdown: 'M7.653 14.369A1.75 1.75 0 0 1 6 12.625V10H3.32A1.82 1.82 0 0 1 1.53 7.854l.765-4.593A2.75 2.75 0 0 1 5 1h5.28c.695 0 1.364.266 1.887.75l.59.554c.356.333.558.799.558 1.276v4.67c0 .966-.784 1.75-1.75 1.75H9.5v2.08c0 .354-.107.7-.307.992ZM5 2.5c-.61 0-1.13.439-1.23 1.04l-.766 4.593a.32.32 0 0 0 .316.377H6.75A.75.75 0 0 1 7.5 9.25v3.375a.25.25 0 0 0 .472.121l1.22-2.135a.75.75 0 0 1 .652-.381h1.706a.25.25 0 0 0 .25-.25V3.58a.252.252 0 0 0-.08-.185l-.591-.554a1.25 1.25 0 0 0-.872-.341Z'
+    };
+    const d = pathMap[iconName] || pathMap.thumbsup;
+    return [
+      '<svg class="striffs-note-feedback-icon" aria-hidden="true" viewBox="0 0 16 16" width="16" height="16">',
+      `<path class="striffs-note-feedback-icon-glyph" d="${d}" />`,
+      '</svg>'
+    ].join('');
+  };
+
   S.clearReviewNoteFeedback = () => {
     try {
       if (Number(S.__reviewNoteFeedbackFrame || 0) > 0) {
@@ -556,12 +580,13 @@
         shell.className = "striffs-note-feedback";
         shell.setAttribute("data-note-id", noteId);
         shell.setAttribute("data-note-qualified-name", qn);
-        // Position at top-right corner of the note, accounting for button size
-        const buttonWidth = 24;
+        // Position at the bottom-right corner of the note, accounting for button size
+        const buttonWidth = 26;
+        const buttonHeight = 26;
         const buttonGap = 4;
         const totalWidth = (buttonWidth * 2) + buttonGap;
-        shell.style.left = `${(bbox.x + bbox.width) * zoom - totalWidth - 4}px`;
-        shell.style.top = `${bbox.y * zoom + 4}px`;
+        shell.style.left = `${(bbox.x + bbox.width) * zoom - totalWidth - 6}px`;
+        shell.style.top = `${(bbox.y + bbox.height) * zoom - buttonHeight - 6}px`;
 
         const currentVote = S.__reviewNoteVotes?.get?.(noteId) || null;
         const noteText = S.extractReviewNoteText?.(note) || "";
@@ -572,7 +597,7 @@
           btn.setAttribute("data-vote", vote);
           btn.setAttribute("aria-label", label);
           btn.title = label;
-          btn.innerHTML = S.octicon(icon);
+          btn.innerHTML = S.reviewNoteFeedbackIcon(vote);
           btn.addEventListener("click", (event) => {
             event.preventDefault();
             event.stopPropagation();
@@ -727,6 +752,57 @@
       if (!S.isDebug?.()) return;
       console.log(`[Striffs][debug] ${label}`, payload);
     } catch {}
+  };
+
+  // Convert hyphenated names to dotted format (e.g., "my-component" -> "my.component")
+  // Used for component qualified names in telemetry and display
+  S.toDottedName = (name) => {
+    if (!name) return null;
+    return String(name).replace(/-/g, '.');
+  };
+
+  // Sanitize SVG content before DOM injection to prevent XSS
+  // Uses DOMParser to parse SVG, then removes potentially dangerous elements
+  S.sanitizeSvg = (svgString) => {
+    if (!svgString || typeof svgString !== 'string') return '';
+    try {
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(svgString, 'image/svg+xml');
+      const svg = doc.documentElement;
+
+      // Remove script elements and their content
+      const scripts = svg.querySelectorAll('script');
+      for (const script of scripts) {
+        script.remove();
+      }
+
+      // Remove event handler attributes (onclick, onerror, etc.)
+      const allElements = svg.querySelectorAll('*');
+      for (const el of allElements) {
+        const attrs = el.attributes;
+        for (let i = attrs.length - 1; i >= 0; i--) {
+          const attr = attrs[i];
+          if (attr.name.startsWith('on')) {
+            el.removeAttribute(attr.name);
+          }
+          // Remove javascript: URLs
+          if (attr.value && attr.value.trim().toLowerCase().startsWith('javascript:')) {
+            el.removeAttribute(attr.name);
+          }
+        }
+      }
+
+      // Remove foreignObject elements (can contain arbitrary HTML)
+      const foreignObjects = svg.querySelectorAll('foreignObject');
+      for (const fo of foreignObjects) {
+        fo.remove();
+      }
+
+      return svg.outerHTML;
+    } catch (e) {
+      S.cwarn?.('SVG sanitization failed, using original', e);
+      return svgString; // Fail safely by returning original
+    }
   };
 
   try {
@@ -1059,6 +1135,7 @@
   // ---------- Cache clearing (per-page) ----------
   S.clearLocalDiagramCaches = async (opts = {}) => {
     const preserveClearFlag = !!opts.preserveClearFlag;
+    const resetLiveDiagram = !!opts.resetLiveDiagram;
     const DEBUG_KEY_LOWER = "striffsdebug";
     const prefixes = ["striffs:", "striffscache:", "striffscachemeta:"];
     const chromeCacheKeys = [
@@ -1128,16 +1205,24 @@
     S.__suppressViewPersist = true;
     try { setTimeout(() => { S.__suppressViewPersist = false; }, 2000); } catch {}
 
-	    S.__striffsReady = false;
-	    S.__striffsNoChanges = false;
-	    S.__striffsSvg = null;
-    S.clearReviewNoteFeedback?.();
-    S.__striffsPathToComponentId?.clear?.();
-    S.__striffsComponentIdToFile?.clear?.();
-    S.__filePathToDiffId?.clear?.();
-    S.state?.resetPanState?.();
-    S.state?.resetInitialFit?.();
-    S.state?.resetTooLarge?.();
+    if (resetLiveDiagram) {
+        S.__striffsReady = false;
+        S.__striffsNoChanges = false;
+        S.__striffsSvg = null;
+      S.clearReviewNoteFeedback?.();
+      S.__striffsPathToComponentId?.clear?.();
+      S.__striffsComponentIdToFile?.clear?.();
+      S.__striffsComponentIdToDiffId?.clear?.();
+      S.__striffsComponentIdToSvgElement?.clear?.();
+      S.__filePathToDiffId?.clear?.();
+      S.__stablePathToComponentId?.clear?.();
+      S.__stableComponentIdToFile?.clear?.();
+      S.__stableComponentIdToDiffId?.clear?.();
+      S.__stableFilePathToDiffId?.clear?.();
+      S.state?.resetPanState?.();
+      S.state?.resetInitialFit?.();
+      S.state?.resetTooLarge?.();
+    }
     S.__remoteConfig = null;
     S.__remoteConfigFetchedAt = 0;
     S.__remoteConfigUrl = null;
@@ -1201,6 +1286,29 @@
   }
 
   // ---------- Messaging (MV3-hardened) ----------
+  S.isExtensionContextInvalidatedError = (message) =>
+    /extension context invalidated/i.test(String(message || ''));
+
+  S.promptRefreshAfterExtensionInvalidation = () => {
+    if (S.__didPromptExtensionRefresh) return;
+    S.__didPromptExtensionRefresh = true;
+    const promptText = "Striffs was reloaded or updated. Refresh this page to reconnect the extension.";
+    try {
+      S.toast?.(promptText, "error", { timeoutMs: 12000 });
+    } catch {}
+    setTimeout(() => {
+      try {
+        const shouldReload =
+          typeof window.confirm === "function"
+            ? window.confirm("Striffs was reloaded or updated. Refresh this page now?")
+            : false;
+        if (shouldReload) {
+          window.location.reload();
+        }
+      } catch {}
+    }, 0);
+  };
+
   S.sendMessageWithTimeout = function sendMessageWithTimeout(msg, timeoutMs = 7000) {
     return new Promise((resolve, reject) => {
       let settled = false;
@@ -1217,7 +1325,11 @@
           settled = true;
           clearTimeout(t);
           if (chrome.runtime.lastError) {
-            reject(new Error(chrome.runtime.lastError.message));
+            const message = chrome.runtime.lastError.message;
+            if (S.isExtensionContextInvalidatedError?.(message)) {
+              S.promptRefreshAfterExtensionInvalidation?.();
+            }
+            reject(new Error(message));
           } else if (resp == null || (typeof resp !== 'object' && typeof resp !== 'boolean')) {
             reject(new Error('empty/invalid response from background'));
           } else {
@@ -1228,7 +1340,11 @@
         if (settled) return;
         settled = true;
         clearTimeout(t);
-        reject(new Error(String(e?.message || e)));
+        const message = String(e?.message || e);
+        if (S.isExtensionContextInvalidatedError?.(message)) {
+          S.promptRefreshAfterExtensionInvalidation?.();
+        }
+        reject(new Error(message));
       }
     });
   };
@@ -1413,6 +1529,7 @@
         filesCheckScheduled = true;
         requestAnimationFrame(() => {
             filesCheckScheduled = false;
+            S.buildFilePathToDiffIdMapAsync?.();
             S.refreshSupportedFilesState?.();
         });
     };
@@ -1474,6 +1591,16 @@
                     if (isFilesNode(node)) {
                         scheduleFilesCheck();
                         return;
+                    }
+                    // Also watch for file tree items being added (for /changes UI)
+                    if (node instanceof Element) {
+                        const hasFileTreeItem = node.matches?.('[data-tree-entry-type="file"]') ||
+                            node.matches?.('[id^="file-tree-item-"]') ||
+                            !!node.querySelector?.('[data-tree-entry-type="file"], [id^="file-tree-item-"]');
+                        if (hasFileTreeItem) {
+                            scheduleFilesCheck();
+                            return;
+                        }
                     }
                 }
             }
@@ -1561,7 +1688,7 @@
         return out;
     };
 
-    S.waitForFilesRoot = async (maxMs = 15000) => {
+    S.waitForFilesRoot = async (maxMs = 120000) => {
         const found = S.$$first(SELECTORS.filesRoot);
         if (found) return found;
         if (typeof MutationObserver !== 'function') {
@@ -1654,6 +1781,7 @@
             file: 'M3 2.75A.75.75 0 0 1 3.75 2h5.5a.75.75 0 0 1 .53.22l3 3a.75.75 0 0 1 .22.53v7.5A1.75 1.75 0 0 1 11.25 15H4.75A1.75 1.75 0 0 1 3 13.25Zm1 .75v9.75c0 .138.112.25.25.25h6.5c.138 0 .25-.112.25-.25V6.5H9.5a1 1 0 0 1-1-1V3.5H4.25a.25.25 0 0 0-.25.25Zm6 .25V5.5h1.5Z',
             // Using 'project' icon - better represents architecture/structure diagrams
             graph: 'M1.75 1h12.5c.966 0 1.75.784 1.75 1.75v10.5A1.75 1.75 0 0 1 14.25 15H1.75A1.75 1.75 0 0 1 0 13.25V2.75C0 1.784.784 1 1.75 1ZM1.5 2.75v10.5c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25V2.75a.25.25 0 0 0-.25-.25H1.75a.25.25 0 0 0-.25.25Zm7.5 3.75a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Zm-5 0a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Zm10 0a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Zm-10 5a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Zm5 0a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Zm5 0a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Z',
+            workflow: 'M1.75 1h12.5c.966 0 1.75.784 1.75 1.75v10.5A1.75 1.75 0 0 1 14.25 15H1.75A1.75 1.75 0 0 1 0 13.25V2.75C0 1.784.784 1 1.75 1ZM1.5 2.75v10.5c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25V2.75a.25.25 0 0 0-.25-.25H1.75a.25.25 0 0 0-.25.25Zm7.5 3.75a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Zm-5 0a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Zm10 0a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Zm-10 5a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Zm5 0a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Zm5 0a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Z',
 
             // status icons
             'check-circle': 'M8 15A7 7 0 1 0 8 1a7 7 0 0 0 0 14Zm3.78-8.72a.75.75 0 0 1 0 1.06l-4 4a.75.75 0 0 1-1.06 0l-2-2a.75.75 0 1 1 1.06-1.06L7 9.94l3.22-3.22a.75.75 0 0 1 1.06 0Z',
@@ -1696,9 +1824,27 @@
         if (!toolbar) return;
 
         const row = S.getToolbarControlsRow(toolbar) || toolbar;
+        const toolbarSection = toolbar?.matches?.('section')
+            ? toolbar
+            : toolbar?.closest?.('section');
+        const rightCluster = row?.closest?.(':scope > .prc-Stack-Stack-UQ9k6, :scope > div.prc-Stack-Stack-UQ9k6') || row?.parentElement || null;
+        const leftCluster = toolbarSection
+            ? Array.from(toolbarSection.children || []).find((child) =>
+                child !== rightCluster &&
+                child.tagName !== 'H2' &&
+                !/\bsr-only\b/.test(String(child.className || ''))
+            )
+            : null;
+        const isNewToolbarLayout = Boolean(
+            toolbarSection &&
+            leftCluster &&
+            rightCluster &&
+            leftCluster !== rightCluster
+        );
+        const preferredParent = isNewToolbarLayout ? leftCluster : row;
 
         let slot = document.getElementById('striffs-toolbar-slot');
-        if (slot && slot.parentElement !== row) {
+        if (slot && slot.parentElement !== preferredParent) {
             slot.parentElement.removeChild(slot);
             slot = null;
         }
@@ -1709,21 +1855,32 @@
             slot.style.display = 'inline-flex';
             slot.style.gap = '6px';
             slot.style.alignItems = 'center';
-            slot.style.marginLeft = '8px';
+            slot.style.marginLeft = '12px';
+            slot.style.marginRight = '0';
+            slot.style.flex = '0 0 auto';
+            slot.style.alignSelf = 'center';
             slot.style.visibility = 'visible';
 
-            const viewedCount = row.querySelector(
-                'span[class*="ViewedFileProgress-module__FilesCountText"]'
-            );
-            if (viewedCount) {
-                const viewedContainer = viewedCount.closest('div') || viewedCount;
-                if (viewedContainer && viewedContainer.parentElement) {
-                    viewedContainer.parentElement.insertBefore(slot, viewedContainer);
+            // In the new GitHub UI the visible right rail contains viewed/review controls.
+            // Mount inside the left stack instead so the buttons stay on the inner-left side.
+            if (isNewToolbarLayout && preferredParent === leftCluster) {
+                leftCluster.appendChild(slot);
+            } else {
+                const viewedContainer =
+                    row.querySelector('span[class*="ViewedFileProgress-module__FilesCountText"]')?.closest('div');
+                const viewedAnchor = viewedContainer?.parentElement || viewedContainer || null;
+                const rightActionAnchor =
+                    row.querySelector('button[data-testid="review-changes-button"]') ||
+                    row.querySelector('button[data-testid="merge-button"]') ||
+                    row.querySelector('.BtnGroup:has(button[data-testid])');
+
+                if (viewedAnchor?.parentElement === row) {
+                    viewedAnchor.insertAdjacentElement('afterend', slot);
+                } else if (rightActionAnchor?.parentElement) {
+                    rightActionAnchor.parentElement.insertBefore(slot, rightActionAnchor);
                 } else {
                     row.appendChild(slot);
                 }
-            } else {
-                row.appendChild(slot);
             }
         }
 
@@ -1741,18 +1898,18 @@
                 ready: Boolean(S.__striffsReady && S.__striffsSvg),
                 disabledByRemote: Boolean(S.__disabledByRemote)
             });
-	            if (S.__disabledByRemote) {
-	                S.disableStriffsButton();
-	                return;
-	            }
-	            if (S.__striffsNoChanges) {
-	                S.applyNoChangesUiState?.("No changes were found");
-	                return;
-	            }
-	            // If diagram is ready, do not refetch; just show Striffs.
-	            if (S.__striffsReady && S.__striffsSvg) {
-	                S.showStriffView();
-	                S.saveActiveTab('striffs');
+              if (S.__disabledByRemote) {
+                  S.disableStriffsButton();
+                  return;
+              }
+              if (S.__striffsNoChanges) {
+                  S.applyNoChangesUiState?.("No changes were found");
+                  return;
+              }
+              // If diagram is ready, do not refetch; just show Striffs.
+              if (S.__striffsReady && S.__striffsSvg) {
+                  S.showStriffView();
+                  S.saveActiveTab('striffs');
                 return;
             }
 
@@ -1761,16 +1918,16 @@
                 S.updateStriffButton({
                     loading: true,
                     tooltip: "Generating Striffs…",
-                    phase: "Analyzing files..."
+                    phase: "Analyzing"
                 });
 
-	                const ok = await S.autoFetchStriffs();
-	                // autoFetchStriffs sets button to success/neutral/error and
-	                // updates __striffsReady / __striffsSvg.
-	                if (!ok || S.__striffsNoChanges || !S.__striffsReady || !S.__striffsSvg) return;
+                  const ok = await S.autoFetchStriffs();
+                  // autoFetchStriffs sets button to success/neutral/error and
+                  // updates __striffsReady / __striffsSvg.
+                  if (!ok || S.__striffsNoChanges || !S.__striffsReady || !S.__striffsSvg) return;
 
-	                // Show Striffs immediately after a successful generation.
-	                S.showStriffView();
+                  // Show Striffs immediately after a successful generation.
+                  S.showStriffView();
                 S.saveActiveTab('striffs');
                 return;
             }
@@ -1783,13 +1940,13 @@
         S.ensureBtn(
             slot,
             'diffs-btn',
-            `${S.octicon('file')}<span class="striffs-local-btn-label"> Diffs</span>`,
+            `<span class="striffs-local-btn-label">Diffs</span>`,
             onDiffClick
         );
         S.ensureBtn(
             slot,
             'striffs-btn',
-            `${S.octicon('workflow')}<span class="striffs-local-btn-label"> Striffs</span>`,
+            `<span class="striffs-local-btn-label">Striffs</span>`,
             onStriffClick
         );
 
@@ -1877,7 +2034,7 @@
             return;
         }
 
-        btn.innerHTML = `${S.octicon('workflow')}<span class="striffs-local-btn-label"> Striffs</span>`;
+        btn.innerHTML = `<span class="striffs-local-btn-label">Striffs</span>`;
     };
 
     // --- Global toast helpers (theme-aware) ---
@@ -1937,11 +2094,15 @@
     line-height: 20px;
     display: inline-flex;
     align-items: center;
+    justify-content: center;
     gap: 3px;
-    padding: 2px 12px;
+    padding: 3px 12px;
     border-radius: 6px;
+    min-width: 75px;
     transition: background-color .12s ease, border-color .12s ease, color .12s ease, box-shadow .12s ease;
     box-shadow: 0 0 0 0 transparent;
+    font-weight: 600;
+    letter-spacing: 0.5px;
   }
   .striffs-local-btn:hover {
     background: var(--button-default-bgColor-hover, var(--color-btn-hover-bg, #eef1f4));
@@ -2120,30 +2281,40 @@
   }
   #striff-diagram-view .striffs-note-feedback-btn{
     appearance: none;
-    border: none;
-    background: rgba(255, 245, 157, 0.98);
-    color: #000000;
-    width: 24px;
-    height: 24px;
+    border: 1px solid rgba(120, 53, 15, 0.28);
+    background: rgba(255, 251, 235, 0.96);
+    color: #f4b400;
+    width: 26px;
+    height: 26px;
     border-radius: 999px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
     cursor: pointer;
     padding: 0;
-    transition: transform .12s ease, background-color .12s ease;
+    box-shadow: 0 2px 8px rgba(120, 53, 15, 0.18);
+    transition: transform .12s ease, background-color .12s ease, color .12s ease, box-shadow .12s ease;
   }
   #striff-diagram-view .striffs-note-feedback-btn:hover{
     transform: translateY(-1px);
-    background: rgba(255, 245, 157, 1);
+    background: rgba(255, 247, 214, 1);
+    color: #f6bf26;
+    box-shadow: 0 4px 10px rgba(120, 53, 15, 0.22);
   }
   #striff-diagram-view .striffs-note-feedback-btn.is-selected{
-    background: rgba(255, 245, 157, 1);
-    color: #000000;
+    background: rgba(255, 239, 184, 1);
+    color: #f2a900;
+    border-color: rgba(180, 83, 9, 0.4);
   }
   #striff-diagram-view .striffs-note-feedback-btn svg{
-    width: 14px;
-    height: 14px;
+    width: 15px;
+    height: 15px;
+  }
+  #striff-diagram-view .striffs-note-feedback-icon{
+    display: block;
+  }
+  #striff-diagram-view .striffs-note-feedback-icon-glyph{
+    fill: currentColor;
   }
   #striff-diagram-view svg{
     width: auto;
@@ -2203,11 +2374,51 @@
   .striffs-view-striff-option{
     width: 100%;
     text-align: left;
-    display: block;
+    display: flex;
+    align-items: center;
+    gap: 0;
+    min-height: 32px;
+    padding: 6px 8px 6px 12px;
+    box-sizing: border-box;
   }
   .striffs-view-striff-option.is-disabled{
     opacity: 0.5;
     cursor: not-allowed;
+  }
+  .striffs-view-striff-option-spacer{
+    display: inline-flex;
+    flex: 0 0 4px;
+    width: 4px;
+    height: 1px;
+  }
+  .striffs-view-striff-option-visual{
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 16px;
+    width: 16px;
+    margin-right: 8px;
+  }
+  .striffs-view-striff-option-icon{
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 16px;
+    width: 16px;
+    height: 16px;
+    color: var(--fgColor-muted, #57606a);
+  }
+  .striffs-view-striff-option-icon svg{
+    width: 16px;
+    height: 16px;
+    display: block;
+  }
+  .striffs-view-striff-option-label{
+    display: inline-flex;
+    align-items: center;
+    min-width: 0;
+    flex: 1 1 auto;
+    line-height: 20px;
   }
   #striffs-toast{position:absolute;top:6px;left:8px;background:var(--bgColor-default, #fff);border:1px solid #f0a3a3;color:#b00020;padding:6px 10px;border-radius:6px;font-size:12px;box-shadow:0 1px 4px rgba(0,0,0,.08);opacity:0;transition:opacity .2s}
   #striffs-toast.show{opacity:1}
@@ -2571,6 +2782,10 @@
     S.setAutoGenerateIntent?.(false);
     S.__striffsPathToComponentId?.clear?.();
     S.__striffsComponentIdToFile?.clear?.();
+    S.__stablePathToComponentId?.clear?.();
+    S.__stableComponentIdToFile?.clear?.();
+    S.__stableComponentIdToDiffId?.clear?.();
+    S.__stableFilePathToDiffId?.clear?.();
     const striffView = document.getElementById("striff-diagram-view");
     if (striffView) {
       striffView.remove();
@@ -2586,7 +2801,7 @@
       return S.applyNoChangesUiState?.("No changes were found");
     }
     S.hideAllDiffs();
-    S.updateFileTreeAvailability?.();
+    S.scheduleFileTreeAvailabilityRefresh?.();
     const striffView = S.ensureStriffContainer();
     if (striffView) {
       striffView.style.display = "block";
@@ -2598,8 +2813,11 @@
       if (S.__striffsSvg) {
           S.__striffsSvg.style.pointerEvents = 'auto';
       }
-      // Center the striff view in the viewport
-      striffView.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      // Center the striff view in the viewport (only on first show)
+      if (!S.__striffViewScrolled) {
+        striffView.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        S.__striffViewScrolled = true;
+      }
         }
         S.setCurrentView('striffs');
     };
@@ -2699,27 +2917,90 @@
     });
   };
 
+  S.scheduleFileTreeAvailabilityRefresh = () => {
+    const delays = [0, 50, 200, 500, 1000];
+    delays.forEach((delay) => {
+      setTimeout(() => {
+        try {
+          S.updateFileTreeAvailability?.();
+        } catch {}
+      }, delay);
+    });
+  };
+
   S.updateFileTreeAvailability = () => {
     try {
       if (!S.__striffsPathToComponentId || !S.__striffsPathToComponentId.size) return;
-      const items = S.$$all?.(["li[id^='file-tree-item-diff-']", "li[data-tree-entry-type='file']"]) || [];
+      // Include new UI selectors
+      const items = S.$$all?.([
+        "li[id^='file-tree-item-diff-']",
+        "li[data-tree-entry-type='file']",
+        "[data-testid='file-tree'] li",
+        "[role='treeitem']"
+      ]) || [];
       items.forEach(li => {
+        // Skip folders (items that contain other tree items)
+        if (li.querySelector('ul, ol, [role="group"], [role="tree"]')) return;
+
         const span =
           li.querySelector("[data-filterable-item-text]") ||
           li.querySelector("span.ActionList-item-label") ||
-          li.querySelector("[data-testid='file-tree-item-text']");
-        const raw = span?.textContent || "";
+          li.querySelector("[data-testid='file-tree-item-text']") ||
+          li.querySelector("span.PRIVATE_TreeView-item-content-text") ||
+          li.querySelector("span[data-component='text']");
+        const raw = S.getFilePathFromTreeItem?.(li) || span?.textContent || "";
+        if (!raw.trim()) return;
+
         const norm = S.normalizePath(S.stripRenamePath(raw));
-        const hasComponent = S.__striffsPathToComponentId.has("/" + norm);
+        const filePath = ensureLeadingSlash(norm);
+        const componentId = S.findMappedComponentIdForPath?.(norm) || '';
+        const hasComponent = Boolean(componentId);
+        const actionTargets = [
+          li,
+          li.querySelector?.("a.ActionList-content, a.ActionListContent, a[href^='#diff-'], a[href*='#diff-']"),
+          li.querySelector?.('button'),
+          li.querySelector?.('[role="button"]')
+        ].filter(Boolean);
         if (hasComponent) {
           li.classList.remove('striffs-file-disabled');
           li.removeAttribute('aria-disabled');
           li.setAttribute('data-striffs-mapped', '1');
+          li.setAttribute('data-striffs-file-path', filePath);
+          li.setAttribute('data-striffs-component-id', String(componentId));
+          actionTargets.forEach((el) => {
+            try {
+              el.setAttribute('data-striffs-mapped', '1');
+              el.setAttribute('data-striffs-file-path', filePath);
+              el.setAttribute('data-striffs-component-id', String(componentId));
+            } catch {}
+          });
         } else {
           li.classList.add('striffs-file-disabled');
           li.setAttribute('aria-disabled', 'true');
           li.setAttribute('data-striffs-mapped', '0');
+          li.removeAttribute('data-striffs-file-path');
+          li.removeAttribute('data-striffs-component-id');
+          actionTargets.forEach((el) => {
+            try {
+              el.setAttribute('data-striffs-mapped', '0');
+              el.removeAttribute('data-striffs-file-path');
+              el.removeAttribute('data-striffs-component-id');
+            } catch {}
+          });
         }
+      });
+      document.querySelectorAll("a[href^='#diff-'], a[href*='#diff-']").forEach((link) => {
+        try {
+          const href = String(link.getAttribute('href') || '');
+          const mappedPath = S.findFilePathByDiffId?.(href);
+          const normalizedPath = mappedPath ? `/${S.normalizePath(mappedPath)}` : '';
+          const componentId = normalizedPath ? (S.findMappedComponentIdForPath?.(normalizedPath) || '') : '';
+          if (normalizedPath && componentId) {
+            link.setAttribute('data-striffs-mapped', '1');
+            link.setAttribute('data-striffs-file-path', normalizedPath);
+            link.setAttribute('data-striffs-component-id', String(componentId));
+          }
+        } catch {}
       });
     } catch (e) {
       S.cwarn?.('updateFileTreeAvailability failed', e);
@@ -2745,9 +3026,16 @@
     '.js-file[data-path]',
     '[data-testid="file-diff-unified"][data-path]',
     '[data-testid="file-diff-split"][data-path]',
+    '.js-file',
+    '[data-testid="file-diff-unified"]',
+    '[data-testid="file-diff-split"]',
     '.file-header[data-path]',
     '.js-file-header[data-path]',
-    '.file-header--expandable[data-path]'
+    '.file-header--expandable[data-path]',
+    '.file-header',
+    '.js-file-header',
+    '.file-header--expandable',
+    '[id^="diff-"]'
   ].join(', ');
 
   S.syncFileMenuDebugState = (status, extra = {}) => {
@@ -2785,18 +3073,62 @@
     }
   };
 
+  const isVisibleMenuHost = (node) => {
+    try {
+      if (!(node instanceof Element)) return false;
+      const style = window.getComputedStyle(node);
+      if (!style || style.display === 'none' || style.visibility === 'hidden') return false;
+      const rect = node.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    } catch {
+      return false;
+    }
+  };
+
+  const findGlobalOpenFileMenuHost = (fileNode) => {
+    const candidates = Array.from(document.querySelectorAll(
+      'details-menu[role="menu"], details-menu, [role="menu"], [data-testid*="menu"]'
+    )).filter((host) => {
+      if (!isVisibleMenuHost(host)) return false;
+      if (host.querySelector?.(FILE_MENU_OPTION_SELECTOR)) return true;
+      const text = String(host.textContent || '').toLowerCase();
+      return /view file|copy path|open file|view blame|raw|download/i.test(text);
+    });
+    if (!candidates.length) return null;
+    if (candidates.length === 1) return candidates[0];
+    const anchor = fileNode?.getBoundingClientRect?.();
+    if (!anchor) return candidates[0];
+    let best = candidates[0];
+    let bestDistance = Infinity;
+    for (const candidate of candidates) {
+      const rect = candidate.getBoundingClientRect();
+      const dx = rect.left - anchor.left;
+      const dy = rect.top - anchor.top;
+      const distance = Math.abs(dx) + Math.abs(dy);
+      if (distance < bestDistance) {
+        best = candidate;
+        bestDistance = distance;
+      }
+    }
+    return best;
+  };
+
   const findOpenFileMenuHost = (fileNode) => {
     if (!fileNode) return null;
     const details = fileNode.querySelector(
       'details.js-file-header-dropdown[open], details[open].js-file-header-dropdown, details[open]'
     );
     if (!details) {
+      const globalHost = findGlobalOpenFileMenuHost(fileNode);
       S.debugFileMenu?.('findOpenFileMenuHost:no-open-details', {
         path: String(fileNode.getAttribute?.('data-path') || ''),
         openDetailsCount: Number(fileNode.querySelectorAll?.('details[open]').length || 0),
-        detailsCount: Number(fileNode.querySelectorAll?.('details').length || 0)
+        detailsCount: Number(fileNode.querySelectorAll?.('details').length || 0),
+        globalHostFound: Boolean(globalHost),
+        globalHostTag: String(globalHost?.tagName || ''),
+        globalHostClass: String(globalHost?.className || '')
       });
-      return null;
+      return globalHost || null;
     }
     const detailsMenu =
       details.querySelector('details-menu.dropdown-menu[role="menu"]') ||
@@ -2815,13 +3147,14 @@
       details.querySelector('[role="menu"]') ||
       details.querySelector('ul, ol, div')
     );
-    S.debugFileMenu?.(fallbackHost ? 'findOpenFileMenuHost:fallback-host' : 'findOpenFileMenuHost:no-host', {
+    const globalHost = fallbackHost ? null : findGlobalOpenFileMenuHost(fileNode);
+    S.debugFileMenu?.((fallbackHost || globalHost) ? 'findOpenFileMenuHost:fallback-host' : 'findOpenFileMenuHost:no-host', {
       path: String(fileNode.getAttribute?.('data-path') || ''),
-      hostTag: String(fallbackHost?.tagName || ''),
-      hostClass: String(fallbackHost?.className || ''),
+      hostTag: String((fallbackHost || globalHost)?.tagName || ''),
+      hostClass: String((fallbackHost || globalHost)?.className || ''),
       detailsClass: String(details.className || '')
     });
-    return fallbackHost;
+    return fallbackHost || globalHost;
   };
 
   const ensureFileMenuOptionButton = (menuHost) => {
@@ -2842,10 +3175,16 @@
     const hostTag = String(menuHost.tagName || '').toUpperCase();
     if (hostTag === 'DETAILS-MENU') {
       btn.className = 'tmp-pl-5 dropdown-item btn-link striffs-view-striff-option';
+    } else if (menuHost.getAttribute?.('role') === 'menu') {
+      btn.className = 'ActionListContent ActionListItem striffs-view-striff-option';
     } else {
       btn.className = 'ActionListContent striffs-view-striff-option';
     }
-    btn.textContent = 'View Striff';
+    btn.innerHTML = [
+      `<span class="striffs-view-striff-option-spacer" aria-hidden="true"></span>`,
+      `<span class="striffs-view-striff-option-visual" aria-hidden="true"><span class="striffs-view-striff-option-icon">${S.octicon('graph')}</span></span>`,
+      `<span class="striffs-view-striff-option-label">View Striff</span>`
+    ].join('');
 
     if (hostTag === 'UL' || hostTag === 'OL') {
       const li = document.createElement('li');
@@ -2884,16 +3223,22 @@
         return;
       }
 
-      const rawPath = String(fileNode.getAttribute('data-path') || '').trim();
+      const rawPath = String(
+        fileNode.getAttribute('data-path') ||
+        fileNode.getAttribute('data-file-path') ||
+        S.findFilePathByDiffId?.(fileNode.id || '') ||
+        S.getFilePathFromDiffContainer?.(fileNode) ||
+        ''
+      ).trim();
       if (!rawPath) {
         S.debugFileMenu?.('update:missing-path');
         return;
       }
       const filePath = `/${S.normalizePath(rawPath)}`;
-      const componentId = S.__striffsPathToComponentId?.get(filePath) || null;
+      const componentId = S.findMappedComponentIdForPath?.(filePath) || null;
       const enabled = Boolean(S.__striffsReady && componentId);
       // Convert hyphenated back to dotted for display/telemetry (idempotent for already-dotted names)
-      const dottedComponentId = componentId ? componentId.replace(/-/g, '.') : null;
+      const dottedComponentId = S.toDottedName(componentId);
 
       btn.dataset.striffsFilePath = filePath;
       btn.dataset.striffsComponentId = dottedComponentId || '';
@@ -2976,6 +3321,92 @@
     return txt;
   };
 
+  const getNormalizedFilePathCandidate = (value) => {
+    const stripped = S.stripRenamePath(String(value || '').trim());
+    if (!stripped) return '';
+    const normalized = S.normalizePath(stripped);
+    if (!normalized) return '';
+    if (normalized.includes('/') || normalized.includes('.')) return normalized;
+    return '';
+  };
+
+  S.getFilePathFromTreeItem = (node) => {
+    try {
+      const li = node?.closest?.("li[data-tree-entry-type='file'], li[id^='file-tree-item-diff-'], li[role='treeitem']") || node?.closest?.('li') || node || null;
+      if (!li) return '';
+      const link = li.querySelector?.("a[href^='#diff-'], a[href*='#diff-'], a.ActionList-content, a.ActionListContent");
+      const label =
+        li.querySelector?.("[data-filterable-item-text]") ||
+        li.querySelector?.("[data-testid='file-tree-item-text']") ||
+        li.querySelector?.("span.ActionList-item-label") ||
+        li.querySelector?.("span.PRIVATE_TreeView-item-content-text") ||
+        li.querySelector?.("span[data-component='text']") ||
+        null;
+      const candidates = [
+        li.getAttribute?.('data-path'),
+        li.getAttribute?.('data-file-path'),
+        li.id,
+        li.getAttribute?.('title'),
+        li.getAttribute?.('aria-label'),
+        link?.getAttribute?.('data-path'),
+        link?.getAttribute?.('data-file-path'),
+        link?.id,
+        link?.getAttribute?.('title'),
+        link?.getAttribute?.('aria-label'),
+        label?.getAttribute?.('data-path'),
+        label?.getAttribute?.('data-file-path'),
+        label?.id,
+        label?.getAttribute?.('title'),
+        label?.getAttribute?.('aria-label'),
+        link?.textContent,
+        label?.textContent,
+        li.textContent
+      ];
+      for (const candidate of candidates) {
+        const normalized = getNormalizedFilePathCandidate(candidate);
+        if (normalized) return normalized;
+      }
+      const href = String(link?.getAttribute?.('href') || '');
+      const diffId = href.startsWith('#') ? href.slice(1) : (href.match(/#(.+)$/)?.[1] || '');
+      if (diffId && S.__filePathToDiffId?.entries) {
+        for (const [filePath, mappedDiffId] of S.__filePathToDiffId.entries()) {
+          if (String(mappedDiffId || '') === diffId) {
+            return S.normalizePath(filePath);
+          }
+        }
+      }
+    } catch {}
+    return '';
+  };
+
+  S.getFilePathFromDiffContainer = (node) => {
+    try {
+      const root =
+        node?.closest?.("[id^='diff-'], .js-file, [data-testid='file-diff-unified'], [data-testid='file-diff-split'], .file-header, .js-file-header, .file-header--expandable") ||
+        node ||
+        null;
+      if (!root) return '';
+      const candidates = [
+        root.getAttribute?.('data-path'),
+        root.getAttribute?.('data-file-path'),
+        root.id,
+        root.querySelector?.("a[data-testid='file-name']")?.getAttribute?.('title'),
+        root.querySelector?.("a[data-hovercard-type='file']")?.getAttribute?.('title'),
+        root.querySelector?.("a[href*='#diff-'][title]")?.getAttribute?.('title'),
+        root.querySelector?.("a[href*='#diff-'][aria-label]")?.getAttribute?.('aria-label'),
+        root.querySelector?.("[data-testid='file-header'] a")?.getAttribute?.('title'),
+        root.querySelector?.(".file-info a.Link--primary")?.getAttribute?.('title'),
+        root.querySelector?.("[data-testid='file-header'] a")?.textContent,
+        root.querySelector?.(".file-info a.Link--primary")?.textContent
+      ];
+      for (const candidate of candidates) {
+        const normalized = getNormalizedFilePathCandidate(candidate);
+        if (normalized) return normalized;
+      }
+    } catch {}
+    return '';
+  };
+
   // ---------- Files in PR ----------
     S.getFilesInPR = () => {
         const els = S.$$all(SELECTORS.fileLinks);
@@ -2984,10 +3415,9 @@
       .map(t => S.stripRenamePath(t).trim())
       .filter(Boolean);
     if (titles.length === 0) {
-      const treeEls = S.$$all(SELECTORS.fileTreeItems || []);
+      const treeEls = S.$$all(["li[data-tree-entry-type='file']", "li[id^='file-tree-item-diff-']", "li[role='treeitem']"]);
       titles = treeEls
-        .map(el => el.getAttribute("title") || el.textContent || "")
-        .map(t => S.stripRenamePath(t).trim())
+        .map(el => S.getFilePathFromTreeItem?.(el) || "")
         .filter(Boolean);
     }
     if (titles.length === 0) {
@@ -3060,6 +3490,7 @@
       if (!root) return;
       const pathSize = S.__striffsPathToComponentId?.size || 0;
       const compSize = S.__striffsComponentIdToFile?.size || 0;
+      const diffSizeRaw = S.__filePathToDiffId?.size || 0;
       let diffSize = 0;
       let exampleComponent = "";
       let exampleDiffHash = "";
@@ -3086,16 +3517,93 @@
       root.dataset.striffsExampleMappedComponent = exampleComponent;
       root.dataset.striffsExampleMappedDiffHash = exampleDiffHash;
       root.dataset.striffsExampleMappedFile = exampleFile;
+      S.debugDump?.("updateDebugDatasets", {
+        pathSize,
+        compSize,
+        diffSizeRaw,
+        diffSize,
+        exampleComponent,
+        exampleDiffHash,
+        exampleFile,
+        pathToComponentKeys: Array.from(S.__striffsPathToComponentId?.keys() || []),
+        filePathToDiffIdKeys: Array.from(S.__filePathToDiffId?.keys() || []),
+        existingDataset: {
+          component: root.dataset.striffsExampleMappedComponent,
+          hash: root.dataset.striffsExampleMappedDiffHash,
+          file: root.dataset.striffsExampleMappedFile
+        }
+      });
+    } catch (e) {
+      S.cerr?.("updateDebugDatasets error", e);
+    }
+  };
+
+  S.restoreStableMappings = () => {
+    try {
+      const restoreMap = (target, snapshot) => {
+        if (!target?.size && snapshot?.size) {
+          for (const [key, value] of snapshot.entries()) {
+            target.set(key, value);
+          }
+        }
+      };
+      restoreMap(S.__striffsPathToComponentId, S.__stablePathToComponentId);
+      restoreMap(S.__striffsComponentIdToFile, S.__stableComponentIdToFile);
+      restoreMap(S.__striffsComponentIdToDiffId, S.__stableComponentIdToDiffId);
+      restoreMap(S.__filePathToDiffId, S.__stableFilePathToDiffId);
     } catch {}
+  };
+
+  S.getCanonicalMappedRoute = () => {
+    try {
+      S.restoreStableMappings?.();
+      const pathToComponent = S.__striffsPathToComponentId;
+      const filePathToDiff = S.__filePathToDiffId;
+      for (const [filePath, componentId] of pathToComponent?.entries?.() || []) {
+        const diffId =
+          filePathToDiff?.get?.(filePath) ||
+          filePathToDiff?.get?.(String(filePath || '').replace(/^\/+/, '')) ||
+          '';
+        if (filePath && componentId && diffId) {
+          return {
+            filePath: String(filePath),
+            componentId: String(componentId),
+            diffId: String(diffId)
+          };
+        }
+      }
+    } catch {}
+    return null;
+  };
+
+  S.findMappedComponentIdForPath = (rawPath) => {
+    try {
+      S.restoreStableMappings?.();
+      const normalized = "/" + S.normalizePath(S.stripRenamePath(String(rawPath || '')));
+      if (!normalized || normalized === "/") return null;
+      const direct = S.__striffsPathToComponentId?.get?.(normalized);
+      if (direct) return direct;
+      const lower = normalized.toLowerCase();
+      for (const [key, value] of S.__striffsPathToComponentId?.entries?.() || []) {
+        if (String(key || '').toLowerCase() === lower) return value;
+      }
+    } catch {}
+    return null;
   };
 
   S.buildPathIdMapping = (apiData) => {
     S.__striffsPathToComponentId.clear();
     S.__striffsComponentIdToFile.clear();
+    S.__striffsComponentIdToDiffId = S.__striffsComponentIdToDiffId || new Map();
+    S.__striffsComponentIdToDiffId.clear();
+    S.__striffsComponentIdToSvgElement = S.__striffsComponentIdToSvgElement || new Map();
+    S.__striffsComponentIdToSvgElement.clear();
     if (!S.__striffsSvg) return;
 
     // Debug: Check what's actually in the SVG
-    console.log("[Striffs][debug] buildPathIdMapping: SVG has", S.__striffsSvg.querySelectorAll('[data-qualified-name]').length, "elements with data-qualified-name");
+    if (S.isDebug?.()) {
+      console.log("[Striffs][debug] buildPathIdMapping: SVG has", S.__striffsSvg.querySelectorAll('[data-qualified-name]').length, "elements with data-qualified-name");
+    }
 
     // The SVG should already have data-qualified-name attributes on entity elements
     // Build a map of qualified names to SVG elements
@@ -3171,10 +3679,22 @@
           const withSlash = "/" + norm;
           // Store the actual name found in SVG (could be hyphenated or dotted)
           const actualSvgName = svgEntityMap.has(hyphenatedName) ? hyphenatedName : qn;
+          const diffId =
+            S.__filePathToDiffId.get(withSlash) ||
+            S.__filePathToDiffId.get(norm) ||
+            null;
           S.__striffsPathToComponentId.set(withSlash, actualSvgName);
           // Store both dotted and hyphenated versions for click handler compatibility
           S.__striffsComponentIdToFile.set(qn, withSlash);
           S.__striffsComponentIdToFile.set(hyphenatedName, withSlash);
+          if (diffId) {
+            S.__striffsComponentIdToDiffId.set(qn, diffId);
+            S.__striffsComponentIdToDiffId.set(hyphenatedName, diffId);
+            S.__striffsComponentIdToDiffId.set(actualSvgName, diffId);
+          }
+          S.__striffsComponentIdToSvgElement.set(qn, svgElement);
+          S.__striffsComponentIdToSvgElement.set(hyphenatedName, svgElement);
+          S.__striffsComponentIdToSvgElement.set(actualSvgName, svgElement);
         } else {
           missingInSvg.push({ id: qn, hyphenatedId: hyphenatedName, file: norm });
         }
@@ -3197,9 +3717,11 @@
       S.__debugDiffHashToFilePath = diffToPath;
     }
 
-    // Always log the path->component mapping for debugging file tree clicks
-    console.log("[Striffs][buildPathIdMapping] Path to component map:", Array.from(S.__striffsPathToComponentId.entries()));
-    console.log("[Striffs][buildPathIdMapping] Components missing from SVG:", missingInSvg);
+    // Always log the path->component mapping for debugging file tree clicks (only in debug mode)
+    if (S.isDebug?.()) {
+      console.log("[Striffs][buildPathIdMapping] Path to component map:", Array.from(S.__striffsPathToComponentId.entries()));
+      console.log("[Striffs][buildPathIdMapping] Components missing from SVG:", missingInSvg);
+    }
 
     if (debugEnabled) {
       S.dumpStriffsMaps = () => {
@@ -3223,6 +3745,8 @@
 
       try {
         const sample = Array.from(S.__striffsPathToComponentId.entries()).slice(0, 10);
+        const allApiComponents = S.extractApiComponentRecords?.(apiData) || [];
+        const uniqueFiles = Array.from(new Set(parsedFiles));
         S.cinfo('Striffs path/component map', {
           mappedPaths: S.__striffsPathToComponentId.size,
           mappedComponents: S.__striffsComponentIdToFile.size,
@@ -3246,48 +3770,162 @@
       S.__debugFilePathToDiffHash = null;
       S.__debugDiffHashToFilePath = null;
     }
+    S.__stablePathToComponentId = new Map(S.__striffsPathToComponentId);
+    S.__stableComponentIdToFile = new Map(S.__striffsComponentIdToFile);
+    S.__stableComponentIdToDiffId = new Map(S.__striffsComponentIdToDiffId);
     S.updateAllFileMenuOptions?.();
     S.updateDebugDatasets?.();
   };
 
   S.findSvgTextForFile = (fullPath) => {
     if (!S.__striffsSvg) return null;
-    const norm = S.normalizePath(fullPath);
+    const stripped = S.stripRenamePath(fullPath);
+    const norm = S.normalizePath(stripped);
     const lookupKey = "/" + norm;
-    const mappedId = S.__striffsPathToComponentId.get(lookupKey);
+    const mappedId = S.findMappedComponentIdForPath?.(lookupKey);
     if (!mappedId) {
-      // Debug: log why the lookup failed
-      console.warn('[Striffs][findSvgTextForFile] Not found in path->component map', {
-        fullPath,
-        norm,
-        lookupKey,
-        mapKeys: Array.from(S.__striffsPathToComponentId.keys()).slice(0, 10),
-        mapSize: S.__striffsPathToComponentId.size
-      });
+      // Debug: log why the lookup failed (only in debug mode)
+      if (S.isDebug?.()) {
+        console.warn('[Striffs][findSvgTextForFile] Not found in path->component map', {
+          fullPath,
+          norm,
+          lookupKey,
+          mapKeys: Array.from(S.__striffsPathToComponentId.keys()).slice(0, 10),
+          mapSize: S.__striffsPathToComponentId.size
+        });
+      }
       return null;
     }
+    const mappedNode = S.__striffsComponentIdToSvgElement?.get?.(mappedId);
+    if (mappedNode) return mappedNode;
     const esc = S.cssEscape(mappedId);
     return S.__striffsSvg.querySelector(`[data-qualified-name="${esc}"]`) ||
            S.__striffsSvg.querySelector(`text[data-qualified-name="${esc}"]`);
   };
 
+  S.resolveDiagramNodeForComponentId = (componentId) => {
+    S.restoreStableMappings?.();
+    if (!componentId) return null;
+    const direct = S.__striffsComponentIdToSvgElement?.get?.(componentId);
+    if (direct) return direct;
+    if (!S.__striffsSvg) return null;
+    const esc = S.cssEscape(componentId);
+    return S.__striffsSvg.querySelector(`[data-qualified-name="${esc}"]`) ||
+           S.__striffsSvg.querySelector(`g.entity[data-qualified-name="${esc}"]`) ||
+           S.__striffsSvg.querySelector(`text[data-qualified-name="${esc}"]`);
+  };
+
+  S.resolveDiffIdForComponentId = (componentId) => {
+    S.restoreStableMappings?.();
+    if (!componentId) return null;
+    const direct = S.__striffsComponentIdToDiffId?.get?.(componentId);
+    if (direct) return direct;
+    const file =
+      S.__striffsComponentIdToFile?.get?.(componentId) ||
+      S.__stableComponentIdToFile?.get?.(componentId);
+    if (!file) return null;
+    return S.__filePathToDiffId?.get?.(file) ||
+           S.__stableFilePathToDiffId?.get?.(file) ||
+           S.__filePathToDiffId?.get?.(S.normalizePath(file)) ||
+           null;
+  };
+
+  S.routeDiagramComponentId = (componentId) => {
+    S.restoreStableMappings?.();
+    const qn = String(componentId || '').trim();
+    if (!qn) return false;
+    const dottedQn = S.toDottedName(qn);
+    const file =
+      S.__striffsComponentIdToFile?.get?.(qn) ||
+      S.__stableComponentIdToFile?.get?.(qn) ||
+      null;
+    let diffId = S.resolveDiffIdForComponentId?.(qn) || null;
+    if (!diffId && file) {
+      try {
+        S.buildFilePathToDiffIdMapAsync?.();
+        diffId = S.resolveDiffIdForComponentId?.(qn) || null;
+      } catch {}
+    }
+
+    S.emitEngagementEvent?.("diagram_component_clicked", {
+      componentQualifiedName: dottedQn || null,
+      mappedFile: file || null,
+      hasMappedFile: Boolean(file),
+      diffId: diffId || null,
+      hasDiffTarget: Boolean(diffId)
+    });
+    if (!file) {
+      S.cwarn?.('Striffs component click: no file mapped for component', { id: qn });
+      S.syncDiagramClickDebugState?.("missing-file", {
+        componentQualifiedName: dottedQn || null,
+        reason: "component missing file mapping",
+        targetFound: true
+      });
+      S.toast?.("No corresponding file exists in this Pull Request’s changeset.", "error", { timeoutMs: 3000 });
+      return false;
+    }
+    if (!diffId) {
+      S.cwarn?.('Striffs component click: file missing in diff map', { id: qn, file });
+      S.syncDiagramClickDebugState?.("missing-diff", {
+        componentQualifiedName: dottedQn || null,
+        file,
+        reason: "file missing in diff map",
+        targetFound: true
+      });
+      S.toast?.("No corresponding file exists in this Pull Request’s changeset.", "error", { timeoutMs: 3000 });
+      return false;
+    }
+
+    S.showDiffView();
+    S.setActiveButtons("diffs");
+    S.saveActiveTab("diffs");
+    if (location.hash !== `#${diffId}`) history.replaceState(null, "", `#${diffId}`);
+    const diffEl = document.getElementById(diffId);
+    if (diffEl) diffEl.scrollIntoView({ block: "start", behavior: "smooth" });
+    S.syncDiagramClickDebugState?.("navigated", {
+      componentQualifiedName: dottedQn || null,
+      file,
+      diffId,
+      targetFound: true,
+      diffElementFound: Boolean(diffEl)
+    });
+    return true;
+  };
+
+  S.focusMappedComponentForFile = (fullPath, mappedComponentId) => {
+    S.restoreStableMappings?.();
+    const normalizedFullPath = String(fullPath || '').trim();
+    const componentId = String(mappedComponentId || '').trim();
+    if (!normalizedFullPath || !componentId || !S.__striffsSvg) return false;
+    const textEl = S.resolveDiagramNodeForComponentId?.(componentId) || S.findSvgTextForFile(normalizedFullPath);
+    try {
+      const root = document.documentElement;
+      if (root?.dataset) {
+        root.dataset.striffsLastFocusedFile = normalizedFullPath;
+        root.dataset.striffsLastFocusedComponent = componentId;
+        root.dataset.striffsLastFocusedAt = String(Date.now());
+        root.dataset.striffsLastFocusResolvedNode = textEl ? "1" : "0";
+      }
+    } catch {}
+    S.showStriffView();
+    S.saveActiveTab?.('striffs');
+    if (!textEl) return true;
+    document.getElementById('striff-diagram-view')?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    S.ensureFocusZoom?.(textEl);
+    S.centerElementInStriffs?.(textEl);
+    S.flashFocus(textEl);
+    return true;
+  };
+
   S.applyPendingFocus = () => {
+    S.restoreStableMappings?.();
     const fullPath = S.__pendingFocusFilePath;
     if (!fullPath || !S.__striffsSvg) return false;
-    const textEl = S.findSvgTextForFile(fullPath);
-    if (!textEl) return false;
-    const qn = textEl.getAttribute('data-qualified-name') || textEl.getAttribute('id') || '';
-      if (qn) {
-        S.showStriffView();
-        S.saveActiveTab?.('striffs');
-        document.getElementById('striff-diagram-view')?.scrollIntoView({ block: 'center', behavior: 'smooth' });
-        S.ensureFocusZoom?.(textEl);
-        S.centerElementInStriffs?.(textEl);
-        S.flashFocus(textEl);
-        S.__pendingFocusFilePath = null;
-        return true;
-      }
-    return false;
+    const mappedComponentId = S.findMappedComponentIdForPath?.(fullPath) || null;
+    if (!mappedComponentId) return false;
+    const ok = S.focusMappedComponentForFile?.(fullPath, mappedComponentId);
+    S.__pendingFocusFilePath = null;
+    return Boolean(ok);
   };
 
   S.focusFileInStriffs = async (fullPath) => {
@@ -3306,7 +3944,7 @@
       S.updateStriffButton?.({
         loading: true,
         tooltip: "Generating Striffs…",
-        phase: "Analyzing files..."
+        phase: "Analyzing"
       });
       const ok = await S.autoFetchStriffs?.();
       if (!ok) return false;
@@ -3316,6 +3954,20 @@
   };
 
   const ensureLeadingSlash = (p) => p.startsWith('/') ? p : `/${p}`;
+  S.findFilePathByDiffId = (rawDiffId) => {
+    const diffId = String(rawDiffId || '').replace(/^#/, '').trim();
+    if (!diffId) return '';
+    try {
+      S.restoreStableMappings?.();
+      const maps = [S.__filePathToDiffId, S.__stableFilePathToDiffId];
+      for (const map of maps) {
+        for (const [filePath, mappedDiffId] of map?.entries?.() || []) {
+          if (String(mappedDiffId || '') === diffId) return String(filePath || '');
+        }
+      }
+    } catch {}
+    return '';
+  };
   const isPathLike = (p) => {
     if (!p) return false;
     if (/^file-tree-item-diff-/i.test(p)) return false;
@@ -3341,9 +3993,7 @@
         const treeItems = S.$$all(SELECTORS.fileTreeItems);
     treeItems.forEach(span => {
       if (S.isDirectoryNode?.(span)) return;
-      const txt = strip(span?.textContent)?.trim();
-      if (!txt) return;
-      const norm = S.normalizePath(txt);
+      const norm = S.getFilePathFromTreeItem?.(span) || S.normalizePath(strip(span?.textContent)?.trim());
       if (isPathLike(norm)) paths.add(ensureLeadingSlash(norm));
     });
 
@@ -3371,26 +4021,52 @@
   };
 
     S.buildFilePathToDiffIdMapAsync = () => {
-        Promise.resolve().then(() => {
+        return Promise.resolve().then(() => {
             const map = new Map();
-            const items = S.$$all(["li[id^='file-tree-item-diff-']", "li[data-tree-entry-type='file']"]);
+            const setMap = (rawPath, rawDiffId) => {
+              const fullPath = ensureLeadingSlash(S.normalizePath(S.stripRenamePath(rawPath || '')));
+              const diffId = String(rawDiffId || '').replace(/^#/, '').trim();
+              if (!fullPath || !diffId) return;
+              map.set(fullPath, diffId);
+            };
+            const items = S.$$all(["li[id^='file-tree-item-diff-']", "li[data-tree-entry-type='file']", "li[role='treeitem']"]);
             for (const li of items) {
-              const span =
-                li.querySelector("[data-filterable-item-text]") ||
-                li.querySelector("span.ActionList-item-label") ||
-                li.querySelector("[data-testid='file-tree-item-text']");
-              const a = li.querySelector("a.ActionListContent, a[href^='#diff-'], a[href*='#diff-']");
+              const fullPath = S.getFilePathFromTreeItem?.(li) || '';
+              const a = li.querySelector("a.ActionList-content, a.ActionListContent, a[href^='#diff-'], a[href*='#diff-']");
               const href = a?.getAttribute("href") || "";
               const diffId = (href.startsWith("#") ? href.slice(1) : (href.match(/#(.+)$/)?.[1] || null));
-              if (!span || !diffId) continue;
-              const fullPath = ensureLeadingSlash(S.normalizePath(S.stripRenamePath(span.textContent.trim())));
-              map.set(fullPath, diffId);
+              setMap(fullPath, diffId);
+            }
+            const headerLinks = S.$$all(SELECTORS.fileLinks || []);
+            for (const link of headerLinks) {
+              const href = link?.getAttribute?.('href') || '';
+              const diffId = href.startsWith('#') ? href.slice(1) : (href.match(/#(.+)$/)?.[1] || null);
+              const rawPath = link?.getAttribute?.('title') || link?.textContent || '';
+              setMap(rawPath, diffId);
+            }
+            const fileNodes = S.$$all([
+              '.js-file[data-path]',
+              '[data-testid="file-diff-unified"][data-path]',
+              '[data-testid="file-diff-split"][data-path]',
+              '.file-header[data-path]',
+              '.js-file-header[data-path]',
+              '.file-header--expandable[data-path]',
+              "[id^='diff-']"
+            ]);
+            for (const fileNode of fileNodes) {
+              const rawPath = S.getFilePathFromDiffContainer?.(fileNode) || fileNode?.getAttribute?.('data-path') || '';
+              const link = fileNode.querySelector?.('a[href^="#diff-"], a[href*="#diff-"]');
+              const href = link?.getAttribute?.('href') || '';
+              const diffId = href.startsWith('#') ? href.slice(1) : (href.match(/#(.+)$/)?.[1] || null);
+              const fallbackId = fileNode?.id && /^diff-/i.test(fileNode.id) ? fileNode.id : null;
+              setMap(rawPath, diffId || fallbackId);
             }
             S.__filePathToDiffId = map;
             const pathToDiff = Array.from(map.entries());
             const diffToPath = pathToDiff.map(([filePath, diffHash]) => [diffHash, filePath]);
             S.__debugFilePathToDiffHash = pathToDiff;
             S.__debugDiffHashToFilePath = diffToPath;
+            S.__stableFilePathToDiffId = new Map(map);
             S.debugDump?.("diff hash mapping", {
               pathToDiffCount: pathToDiff.length,
               pathToDiff,
@@ -3398,6 +4074,7 @@
               diffToPath
             });
             S.updateDebugDatasets?.();
+            return map; // Return the map for chaining
     });
   };
 
@@ -3562,7 +4239,7 @@
       const { updated_at, commit_count } = meta;
       const key = S.cacheKey();
       const clearAt = await S.getCacheClearAt?.();
-      const parsed = await S.readCacheFromChromeStorage?.();
+      const parsed = await S.readCacheFromChromeStorage?.() || S.readCacheFromLocalStorage?.();
       if (!parsed) return 'empty';
 
       const renderCached = async (parsed) => {
@@ -3605,7 +4282,7 @@
 
       if (clearAt && parsed?.savedAt && Number(parsed.savedAt) <= clearAt) {
         await S.removeCacheFromChromeStorage?.();
-        try { localStorage.removeItem(key); } catch {}
+        S.removeCacheFromLocalStorage?.();
         return 'stale';
       }
       if (await renderCached(parsed)) return 'fresh';
@@ -3710,11 +4387,6 @@
                     svgText = item.svgCode;
                 } else if (item.base64encodedSVGCode) {
                     svgText = atob(item.base64encodedSVGCode);
-                } else if (item.gzippedBase64Svg) {
-                    const raw = b64ToBytes(item.gzippedBase64Svg);
-                    if (!window.fflate) throw new Error("fflate not loaded");
-                    const u8 = window.fflate.gunzipSync(raw);
-                    svgText = new TextDecoder("utf-8").decode(u8);
                 } else {
                     continue; // no renderable payload in this item
                 }
@@ -3722,7 +4394,8 @@
                 content.innerHTML = `<div id="striffs-status">Rendering diagram…</div>`;
                 const wrap = document.createElement("div");
                 wrap.className = "striff-svg-wrap";
-                wrap.innerHTML = svgText;
+                // Sanitize SVG before DOM injection to prevent XSS
+                wrap.innerHTML = S.sanitizeSvg(svgText);
                 content.appendChild(wrap);
 
                 const svg = wrap.querySelector("svg");
@@ -3751,7 +4424,7 @@
                 if (svg) {
                     S.__striffsSvg = svg;
                     S.buildPathIdMapping(data);
-                    S.updateFileTreeAvailability?.();
+                    S.scheduleFileTreeAvailabilityRefresh?.();
                     S.applyHoverability(); // now colors clickable text
                     S.applyPendingFocus?.();
                     S.queueReviewNoteFeedbackLayout?.();
@@ -3767,11 +4440,12 @@
         }
 
         if (!renderableFound && items.length > 0) {
-            content.innerHTML = `<div style="color:#d1242f;">❗ Diagram too large to render. No SVG was generated.</div>`;
+            const errorMsg = "No SVG was generated.";
+            content.innerHTML = `<div style="color:#d1242f;">❗ ${errorMsg}</div>`;
             S.__striffsReady = false;
             State?.setTooLarge?.(true);
-            S.updateStriffButton?.({ neutral: true, disabled: true, tooltip: "Diagram too large to render" });
-            S.toast?.("Diagram too large to render. No SVG was generated.", "neutral", { timeoutMs: 5000 });
+            S.updateStriffButton?.({ neutral: true, disabled: true, tooltip: "Diagram generation failed" });
+            S.toast?.(errorMsg, "neutral", { timeoutMs: 5000 });
             return true; // handled gracefully
         }
 
@@ -3832,66 +4506,116 @@
     typeof TIMEOUTS[key] === "number" ? TIMEOUTS[key] : fallback;
 
   // ---------- Listener lifecycle helpers ----------
-		  S.teardownDomListeners = function teardownDomListeners() {
-		    if (S.__onFileTreeClick) document.removeEventListener("click", S.__onFileTreeClick);
-		    if (S.__onDiagramClick) document.removeEventListener("click", S.__onDiagramClick);
+      S.teardownDomListeners = function teardownDomListeners() {
+        if (S.__onFileTreeClick) document.removeEventListener("click", S.__onFileTreeClick, true);
+        if (S.__onDiagramClick) document.removeEventListener("click", S.__onDiagramClick);
         if (S.__onFileMenuClick) document.removeEventListener("click", S.__onFileMenuClick);
-		    if (S.__onFileMenuToggle) document.removeEventListener("toggle", S.__onFileMenuToggle, true);
-		    if (S.__onStriffsTestRouteEvent) document.removeEventListener("striffs:routeDiagramComponent", S.__onStriffsTestRouteEvent);
-		    if (S.__onStriffsTestMessage) window.removeEventListener("message", S.__onStriffsTestMessage);
-		    if (S.__striffsTestRouteObserver) S.__striffsTestRouteObserver.disconnect();
-		    if (S.__onResize) window.removeEventListener("resize", S.__onResize);
-		    S.__onFileTreeClick = null;
-		    S.__onDiagramClick = null;
+        if (S.__onFileMenuToggle) document.removeEventListener("toggle", S.__onFileMenuToggle, true);
+        if (S.__onHashChange) window.removeEventListener("hashchange", S.__onHashChange);
+        if (S.__onStriffsTestRouteEvent) document.removeEventListener("striffs:routeDiagramComponent", S.__onStriffsTestRouteEvent);
+        if (S.__onStriffsTestMessage) window.removeEventListener("message", S.__onStriffsTestMessage);
+        if (S.__striffsTestRouteObserver) S.__striffsTestRouteObserver.disconnect();
+        if (S.__onResize) window.removeEventListener("resize", S.__onResize);
+        S.__onFileTreeClick = null;
+        S.__onDiagramClick = null;
         S.__onFileMenuClick = null;
-		    S.__onFileMenuToggle = null;
-		    S.__onStriffsTestRouteEvent = null;
-		    S.__onStriffsTestMessage = null;
-		    S.__striffsTestRouteObserver = null;
-		    S.__lastHandledStriffsTestRouteRequestId = null;
-		    S.__onResize = null;
-		    S.__domListenersRegistered = false;
-		  };
+        S.__onFileMenuToggle = null;
+        S.__onHashChange = null;
+        S.__onStriffsTestRouteEvent = null;
+        S.__onStriffsTestMessage = null;
+        S.__striffsTestRouteObserver = null;
+        S.__lastHandledStriffsTestRouteRequestId = null;
+        S.__onResize = null;
+        S.__domListenersRegistered = false;
+      };
 
   function registerDomListeners() {
     if (S.__domListenersRegistered) return;
 
-	    S.__onFileTreeClick = (e) => {
+      S.__onFileTreeClick = (e) => {
       const link = e.target.closest(
+        "a[href^='#diff-'], a[href*='#diff-'], " +
         "a.ActionList-content, a.ActionListContent, " +
         "[data-testid='file-tree'] a[href^='#diff-'], " +
-        "[data-testid='file-tree'] a[href*='#diff-']"
+        "[data-testid='file-tree'] a[href*='#diff-'], " +
+        "li a[href^='#diff-'], li a[href*='#diff-'], " +
+        "li[role='treeitem'] a, li[role='treeitem'] button, li[role='treeitem'] [role='button']"
       );
       if (!link) return;
       if (S.getCurrentView && S.getCurrentView() !== 'striffs') return;
 
-      const li = link.closest("li[id^='file-tree-item-diff-'], [data-testid='file-tree'] li");
-      if (S.isDirectoryNode?.(li)) return;
-      const hiddenSpan =
-        li?.querySelector("span[data-filterable-item-text], [data-testid='file-tree-item-text']");
-      const fullPath = '/' + (hiddenSpan?.textContent.trim() || '');
-      if (!fullPath || fullPath === '/') return;
-      if (S.__disabledByRemote) return;
-      const normalizedPath = '/' + S.normalizePath(fullPath);
-      const mappedComponentId = S.__striffsPathToComponentId?.get(normalizedPath) || null;
+	      const li = link.closest("li[id^='file-tree-item-diff-'], [data-testid='file-tree'] li, li[data-tree-entry-type='file'], li[role='treeitem'], li");
+	      if (S.isDirectoryNode?.(li)) return;
+	      const annotatedFilePath = String(
+          link?.getAttribute?.('data-striffs-file-path') ||
+          li?.getAttribute?.('data-striffs-file-path') ||
+          ''
+        ).trim();
+	      const annotatedComponentId = String(
+          link?.getAttribute?.('data-striffs-component-id') ||
+          li?.getAttribute?.('data-striffs-component-id') ||
+          ''
+        ).trim();
+	      const parsedPath =
+          annotatedFilePath ||
+          S.getFilePathFromTreeItem?.(li) ||
+          S.getFilePathFromTreeItem?.(link) ||
+          String(link?.getAttribute?.('title') || link?.textContent || '').trim() ||
+          '';
+	      const linkHref = String(link?.getAttribute?.('href') || '');
+	      const fallbackPath = S.findFilePathByDiffId?.(linkHref);
+        const parsedNormalizedPath = S.normalizePath(parsedPath || '');
+        const parsedFullPath = parsedNormalizedPath ? `/${parsedNormalizedPath}` : '';
+        const fallbackFullPath = fallbackPath ? `/${S.normalizePath(fallbackPath)}` : '';
+        const parsedLooksMapped = Boolean(
+          parsedFullPath &&
+          parsedFullPath !== '/' &&
+          (
+            parsedNormalizedPath.includes('/') ||
+            S.findMappedComponentIdForPath?.(parsedFullPath)
+          )
+        );
+	      const fullPath = parsedLooksMapped
+          ? parsedFullPath
+          : (fallbackFullPath || parsedFullPath);
+	      if (!fullPath || fullPath === '/') return;
+	      if (S.__disabledByRemote) return;
+	      const normalizedPath = fullPath;
 
-      // Debug: log the click details
-      console.log('[Striffs][FileTreeClick]', {
-        textContent: hiddenSpan?.textContent?.trim(),
-        fullPath,
-        normalizedPath,
-        mappedComponentId,
-        mapSize: S.__striffsPathToComponentId?.size || 0,
-        sampleKeys: Array.from(S.__striffsPathToComponentId?.keys() || []).slice(0, 5)
-      });
+      const mappedComponentId = annotatedComponentId || S.findMappedComponentIdForPath?.(normalizedPath) || null;
+
+      // Debug: log the click details (only in debug mode)
+      if (S.isDebug?.()) {
+        console.log('[Striffs][FileTreeClick]', {
+          parsedPath,
+          fullPath,
+          normalizedPath,
+          mappedComponentId,
+          mapSize: S.__striffsPathToComponentId?.size || 0,
+          sampleKeys: Array.from(S.__striffsPathToComponentId?.keys() || []).slice(0, 5),
+          hasComponent: Boolean(S.findMappedComponentIdForPath?.(normalizedPath)),
+          svgReady: !!S.__striffsSvg,
+          currentView: S.getCurrentView?.()
+        });
+      }
 
       // Convert hyphenated back to dotted for telemetry (more readable/standard)
-      const dottedComponentId = mappedComponentId ? mappedComponentId.replace(/-/g, '.') : null;
+      const dottedComponentId = S.toDottedName(mappedComponentId);
       S.emitEngagementEvent?.("file_explorer_item_clicked_in_striffs_view", {
         filePath: normalizedPath,
         mappedComponentId: dottedComponentId,
         hasMappedComponent: Boolean(mappedComponentId)
       });
+      if (mappedComponentId) {
+        try {
+          const root = document.documentElement;
+          if (root?.dataset) {
+            root.dataset.striffsLastFocusedFile = String(normalizedPath);
+            root.dataset.striffsLastFocusedComponent = String(mappedComponentId);
+            root.dataset.striffsLastFocusedAt = String(Date.now());
+          }
+        } catch {}
+      }
 
       e.preventDefault();
       e.stopPropagation();
@@ -3899,118 +4623,88 @@
 
       const pane = S.ensureStriffContainer();
       if (pane) pane.scrollIntoView({ block: "center", behavior: "smooth" });
-      S.focusFileInStriffs?.(fullPath).then((ok) => {
+      const directFocused = mappedComponentId
+        ? S.focusMappedComponentForFile?.(fullPath, mappedComponentId)
+        : false;
+      Promise.resolve(directFocused || S.focusFileInStriffs?.(fullPath)).then((ok) => {
         if (!ok) {
           S.toast?.("No corresponding component exists in the diagram for this file.", "error", { timeoutMs: 3000 });
         }
-	      });
-	    };
+        });
+      };
 
-	    S.routeDiagramComponentTarget = (targetNode) => {
-	      if (!S.__striffsSvg || !targetNode) return false;
-	      const target =
-	        targetNode.matches?.("g.entity[data-qualified-name]") ? targetNode :
-	        targetNode.closest?.("g.entity[data-qualified-name]");
-	      if (!target) return false;
-	      const qn = target.getAttribute("data-qualified-name");
-	      // Convert hyphenated to dotted for engagement telemetry and debug state
-	      const dottedQn = qn ? qn.replace(/-/g, '.') : null;
-	      if (S.isReviewNoteQualifiedName?.(qn)) {
-	        S.syncDiagramClickDebugState?.("ignored-note", {
-	          componentQualifiedName: dottedQn || null,
-	          reason: "review note nodes are not navigable",
-	          targetFound: true
-	        });
-	        return false;
-	      }
-	      S.syncDiagramClickDebugState?.("received", {
-	        componentQualifiedName: dottedQn || null,
-	        targetFound: true
-	      });
-	      const ownerSvg = target.ownerSVGElement || target.closest("svg");
-	      if (ownerSvg !== S.__striffsSvg) {
-	        S.syncDiagramClickDebugState?.("ignored-foreign-svg", {
-	          componentQualifiedName: dottedQn || null,
-	          reason: "target belongs to a different svg",
-	          targetFound: true
-	        });
-	        return false;
-	      }
+      S.routeDiagramComponentTarget = (targetNode) => {
+        if (!S.__striffsSvg || !targetNode) return false;
+        const target =
+          targetNode.matches?.("g.entity[data-qualified-name]") ? targetNode :
+          targetNode.closest?.("g.entity[data-qualified-name]");
+        if (!target) return false;
+        const qn = target.getAttribute("data-qualified-name");
+        // Convert hyphenated to dotted for engagement telemetry and debug state
+        const dottedQn = S.toDottedName(qn);
+        if (S.isReviewNoteQualifiedName?.(qn)) {
+          S.syncDiagramClickDebugState?.("ignored-note", {
+            componentQualifiedName: dottedQn || null,
+            reason: "review note nodes are not navigable",
+            targetFound: true
+          });
+          return false;
+        }
+        S.syncDiagramClickDebugState?.("received", {
+          componentQualifiedName: dottedQn || null,
+          targetFound: true
+        });
+        const ownerSvg = target.ownerSVGElement || target.closest("svg");
+        if (ownerSvg !== S.__striffsSvg) {
+          S.syncDiagramClickDebugState?.("ignored-foreign-svg", {
+            componentQualifiedName: dottedQn || null,
+            reason: "target belongs to a different svg",
+            targetFound: true
+          });
+          return false;
+        }
 
-	      const file = S.__striffsComponentIdToFile.get(qn);
-	      const diffId = file ? (S.__filePathToDiffId.get(file) || S.__filePathToDiffId.get(S.normalizePath(file))) : null;
+        return S.routeDiagramComponentId?.(qn) || false;
+      };
 
-	      S.emitEngagementEvent?.("diagram_component_clicked", {
-	        componentQualifiedName: dottedQn || null,
-	        mappedFile: file || null,
-	        hasMappedFile: Boolean(file),
-	        diffId: diffId || null,
-	        hasDiffTarget: Boolean(diffId)
-	      });
-	      if (file) {
-	        if (diffId) {
-	          S.showDiffView();
-	          S.setActiveButtons("diffs");
-	          S.saveActiveTab("diffs");
+        S.__onDiagramClick = (e) => {
+        if (!S.__striffsSvg) return;
+        const target = e.target.closest("g.entity[data-qualified-name]");
+        if (!target) return;
+        if (S.isReviewNoteNode?.(target)) {
+          S.syncDiagramClickDebugState?.("ignored-note", {
+            componentQualifiedName: target.getAttribute("data-qualified-name") || null,
+            reason: "review note nodes are not navigable",
+            targetFound: true
+          });
+          return;
+        }
+        const debounceMs = S.PAN_CLICK_DEBOUNCE_MS || 250;
+        if (S.__recentPanAt && (Date.now() - S.__recentPanAt) < debounceMs) {
+          S.__recentPanAt = 0;
+          S.syncDiagramClickDebugState?.("ignored-recent-pan", {
+            componentQualifiedName: target.getAttribute("data-qualified-name") || null,
+            reason: "recent pan debounce",
+            targetFound: true
+          });
+          return;
+        }
+          S.routeDiagramComponentTarget(target);
+        };
 
-	          if (location.hash !== `#${diffId}`) history.replaceState(null, "", `#${diffId}`);
-	          const diffEl = document.getElementById(diffId);
-	          if (diffEl) diffEl.scrollIntoView({ block: "start", behavior: "smooth" });
-	          S.syncDiagramClickDebugState?.("navigated", {
-	            componentQualifiedName: dottedQn || null,
-	            file,
-	            diffId,
-	            targetFound: true,
-	            diffElementFound: Boolean(diffEl)
-	          });
-	          return true;
-	        }
-
-	        S.cwarn?.('Striffs component click: file missing in diff map', { id: qn, file });
-	        S.syncDiagramClickDebugState?.("missing-diff", {
-	          componentQualifiedName: dottedQn || null,
-	          file,
-	          reason: "file missing in diff map",
-	          targetFound: true
-	        });
-	        S.toast?.("No corresponding file exists in this Pull Request’s changeset.", "error", { timeoutMs: 3000 });
-	        return false;
-	      }
-
-	      S.cwarn?.('Striffs component click: no file mapped for component', { id: qn });
-	      S.syncDiagramClickDebugState?.("missing-file", {
-	        componentQualifiedName: dottedQn || null,
-	        reason: "component missing file mapping",
-	        targetFound: true
-	      });
-	      S.toast?.("No corresponding file exists in this Pull Request’s changeset.", "error", { timeoutMs: 3000 });
-	      return false;
-	    };
-
-		    S.__onDiagramClick = (e) => {
-	      if (!S.__striffsSvg) return;
-	      const target = e.target.closest("g.entity[data-qualified-name]");
-	      if (!target) return;
-	      if (S.isReviewNoteNode?.(target)) {
-	        S.syncDiagramClickDebugState?.("ignored-note", {
-	          componentQualifiedName: target.getAttribute("data-qualified-name") || null,
-	          reason: "review note nodes are not navigable",
-	          targetFound: true
-	        });
-	        return;
-	      }
-	      const debounceMs = S.PAN_CLICK_DEBOUNCE_MS || 250;
-	      if (S.__recentPanAt && (Date.now() - S.__recentPanAt) < debounceMs) {
-	        S.__recentPanAt = 0;
-	        S.syncDiagramClickDebugState?.("ignored-recent-pan", {
-	          componentQualifiedName: target.getAttribute("data-qualified-name") || null,
-	          reason: "recent pan debounce",
-	          targetFound: true
-	        });
-	        return;
-	      }
-		      S.routeDiagramComponentTarget(target);
-		    };
+        S.__onHashChange = () => {
+          try {
+            if (S.getCurrentView && S.getCurrentView() !== 'striffs') return;
+            const hash = String(window.location.hash || '').trim();
+            if (!/^#diff-/i.test(hash)) return;
+            const filePath = S.findFilePathByDiffId?.(hash);
+            if (!filePath) return;
+            const normalizedPath = `/${S.normalizePath(filePath)}`;
+            const mappedComponentId = S.findMappedComponentIdForPath?.(normalizedPath) || null;
+            if (!mappedComponentId) return;
+            S.focusMappedComponentForFile?.(normalizedPath, mappedComponentId);
+          } catch {}
+        };
 
         S.__onFileMenuClick = (e) => {
           const option = e.target?.closest?.('[data-striffs-view-striff-option="1"]');
@@ -4035,7 +4729,10 @@
             if (!enabled) return;
             const details = option.closest?.('details[open]');
             if (details) details.removeAttribute('open');
-            S.focusFileInStriffs?.(filePath).then((ok) => {
+            const directFocused = componentId
+              ? S.focusMappedComponentForFile?.(filePath, componentId)
+              : false;
+            Promise.resolve(directFocused || S.focusFileInStriffs?.(filePath)).then((ok) => {
               S.syncFileMenuDebugState?.(ok ? 'focused' : 'focus-failed', {
                 filePath,
                 componentId,
@@ -4055,6 +4752,7 @@
 
           const inFile = S.getFileNodeFromElement?.(e.target);
           if (inFile) {
+            S.__lastFileMenuFileNode = inFile;
             S.debugFileMenu?.('click:file-shell', {
               path: String(inFile.getAttribute?.('data-path') || ''),
               sourceTag: String(e.target?.tagName || ''),
@@ -4062,6 +4760,8 @@
             });
             requestAnimationFrame(() => {
               S.updateFileMenuOptionForFile?.(inFile);
+              setTimeout(() => S.updateFileMenuOptionForFile?.(inFile), 50);
+              setTimeout(() => S.updateFileMenuOptionForFile?.(inFile), 150);
             });
           } else {
             S.debugFileMenu?.('click:no-file-shell', {
@@ -4091,130 +4791,132 @@
             path: String(inFile.getAttribute?.('data-path') || ''),
             detailsClass: String(details.className || '')
           });
+          S.__lastFileMenuFileNode = inFile;
           S.updateFileMenuOptionForFile?.(inFile);
         };
 
-		    S.__onStriffsTestMessage = async (event) => {
-		      const data = event.data || {};
-		      if (data?.source !== "striffs-test" || data?.type !== "routeDiagramComponent") return;
-	      let isTestMode = false;
-	      try {
-	        isTestMode = localStorage.getItem("striffsTest") === "1";
-	      } catch {}
-	      if (!isTestMode) return;
+        S.__onStriffsTestMessage = async (event) => {
+          const data = event.data || {};
+          if (data?.source !== "striffs-test" || data?.type !== "routeDiagramComponent") return;
+        let isTestMode = false;
+        try {
+          isTestMode = localStorage.getItem("striffsTest") === "1";
+        } catch {}
+        if (!isTestMode) return;
 
-	      const requestId = String(data.requestId || "");
-	      const componentId = String(data.componentId || "");
-	      const filePath = String(data.filePath || "");
-	      try {
-	        if (filePath) {
-	          await S.focusFileInStriffs?.(filePath);
-	        }
-	        const svg = S.__striffsSvg || document.querySelector("#striffs-content svg");
-	        const selector = componentId ? `[data-qualified-name="${S.cssEscape(componentId)}"]` : "";
-	        const node = selector ? (svg?.querySelector(selector) || null) : null;
-	        const ok = Boolean(node) && Boolean(S.routeDiagramComponentTarget?.(node));
-	        window.postMessage({
-	          source: "striffs-test",
-	          type: "routeDiagramComponentResult",
-	          requestId,
-	          ok,
-	          componentId,
-	          filePath
-	        }, "*");
-	      } catch (err) {
-	        window.postMessage({
-	          source: "striffs-test",
-	          type: "routeDiagramComponentResult",
-	          requestId,
-	          ok: false,
-	          componentId,
-	          filePath,
-	          error: String(err?.message || err)
-		        }, "*");
-		      }
-		    };
+        const requestId = String(data.requestId || "");
+        const componentId = String(data.componentId || "");
+        const filePath = String(data.filePath || "");
+        try {
+          if (filePath) {
+            await S.focusFileInStriffs?.(filePath);
+          }
+          const svg = S.__striffsSvg || document.querySelector("#striffs-content svg");
+          const selector = componentId ? `[data-qualified-name="${S.cssEscape(componentId)}"]` : "";
+          const node = selector ? (svg?.querySelector(selector) || null) : null;
+          const ok = Boolean(node) && Boolean(S.routeDiagramComponentTarget?.(node));
+          window.postMessage({
+            source: "striffs-test",
+            type: "routeDiagramComponentResult",
+            requestId,
+            ok,
+            componentId,
+            filePath
+          }, "*");
+        } catch (err) {
+          window.postMessage({
+            source: "striffs-test",
+            type: "routeDiagramComponentResult",
+            requestId,
+            ok: false,
+            componentId,
+            filePath,
+            error: String(err?.message || err)
+            }, "*");
+          }
+        };
 
-		    S.__onStriffsTestRouteEvent = async (event) => {
-		      let isTestMode = false;
-		      try {
-		        isTestMode = localStorage.getItem("striffsTest") === "1";
-		      } catch {}
-		      if (!isTestMode) return;
+        S.__onStriffsTestRouteEvent = async (event) => {
+          let isTestMode = false;
+          try {
+            isTestMode = localStorage.getItem("striffsTest") === "1";
+          } catch {}
+          if (!isTestMode) return;
 
-		      const detail = event?.detail || {};
-		      const requestId = String(detail.requestId || "");
-		      const componentId = String(detail.componentId || "");
-		      const filePath = String(detail.filePath || "");
-		      const root = document.documentElement;
-		      try {
-		        if (filePath) {
-		          await S.focusFileInStriffs?.(filePath);
-		        }
-		        const svg = S.__striffsSvg || document.querySelector("#striffs-content svg");
-		        const selector = componentId ? `[data-qualified-name="${S.cssEscape(componentId)}"]` : "";
-		        const node = selector ? (svg?.querySelector(selector) || null) : null;
-		        const ok = Boolean(node) && Boolean(S.routeDiagramComponentTarget?.(node));
-		        if (root) {
-		          root.dataset.striffsTestRouteRequestId = requestId;
-		          root.dataset.striffsTestRouteOk = ok ? "1" : "0";
-		          root.dataset.striffsTestRouteError = ok ? "" : "route failed";
-		        }
-		      } catch (err) {
-		        if (root) {
-		          root.dataset.striffsTestRouteRequestId = requestId;
-		          root.dataset.striffsTestRouteOk = "0";
-		          root.dataset.striffsTestRouteError = String(err?.message || err);
-		        }
-		      }
-		    };
+          const detail = event?.detail || {};
+          const requestId = String(detail.requestId || "");
+          const componentId = String(detail.componentId || "");
+          const filePath = String(detail.filePath || "");
+          const root = document.documentElement;
+          try {
+            if (filePath) {
+              await S.focusFileInStriffs?.(filePath);
+            }
+            const svg = S.__striffsSvg || document.querySelector("#striffs-content svg");
+            const selector = componentId ? `[data-qualified-name="${S.cssEscape(componentId)}"]` : "";
+            const node = selector ? (svg?.querySelector(selector) || null) : null;
+            const ok = Boolean(node) && Boolean(S.routeDiagramComponentTarget?.(node));
+            if (root) {
+              root.dataset.striffsTestRouteRequestId = requestId;
+              root.dataset.striffsTestRouteOk = ok ? "1" : "0";
+              root.dataset.striffsTestRouteError = ok ? "" : "route failed";
+            }
+          } catch (err) {
+            if (root) {
+              root.dataset.striffsTestRouteRequestId = requestId;
+              root.dataset.striffsTestRouteOk = "0";
+              root.dataset.striffsTestRouteError = String(err?.message || err);
+            }
+          }
+        };
 
-		    const handleDatasetRouteRequest = async () => {
-		      let isTestMode = false;
-		      try {
-		        isTestMode = localStorage.getItem("striffsTest") === "1";
-		      } catch {}
-		      if (!isTestMode) return;
+        const handleDatasetRouteRequest = async () => {
+          let isTestMode = false;
+          try {
+            isTestMode = localStorage.getItem("striffsTest") === "1";
+          } catch {}
+          if (!isTestMode) return;
 
-		      const root = document.documentElement;
-		      if (!root?.dataset) return;
-		      const requestId = String(root.dataset.striffsTestRouteRequestId || "");
-		      if (!requestId || requestId === S.__lastHandledStriffsTestRouteRequestId) return;
-		      S.__lastHandledStriffsTestRouteRequestId = requestId;
-		      const componentId = String(root.dataset.striffsTestRouteComponent || "");
-		      const filePath = String(root.dataset.striffsTestRouteFile || "");
-		      try {
-		        if (filePath) {
-		          await S.focusFileInStriffs?.(filePath);
-		        }
-		        const svg = S.__striffsSvg || document.querySelector("#striffs-content svg");
-		        const selector = componentId ? `[data-qualified-name="${S.cssEscape(componentId)}"]` : "";
-		        const node = selector ? (svg?.querySelector(selector) || null) : null;
-		        const ok = Boolean(node) && Boolean(S.routeDiagramComponentTarget?.(node));
-		        root.dataset.striffsTestRouteOk = ok ? "1" : "0";
-		        root.dataset.striffsTestRouteError = ok ? "" : "route failed";
-		      } catch (err) {
-		        root.dataset.striffsTestRouteOk = "0";
-		        root.dataset.striffsTestRouteError = String(err?.message || err);
-		      }
-		    };
-		    S.__striffsTestRouteObserver = new MutationObserver(() => {
-		      void handleDatasetRouteRequest();
-		    });
-		    S.__striffsTestRouteObserver.observe(document.documentElement, {
-		      attributes: true,
-		      attributeFilter: ["data-striffs-test-route-request-id"]
-		    });
+          const root = document.documentElement;
+          if (!root?.dataset) return;
+          const requestId = String(root.dataset.striffsTestRouteRequestId || "");
+          if (!requestId || requestId === S.__lastHandledStriffsTestRouteRequestId) return;
+          S.__lastHandledStriffsTestRouteRequestId = requestId;
+          const componentId = String(root.dataset.striffsTestRouteComponent || "");
+          const filePath = String(root.dataset.striffsTestRouteFile || "");
+          try {
+            if (filePath) {
+              await S.focusFileInStriffs?.(filePath);
+            }
+            const svg = S.__striffsSvg || document.querySelector("#striffs-content svg");
+            const selector = componentId ? `[data-qualified-name="${S.cssEscape(componentId)}"]` : "";
+            const node = selector ? (svg?.querySelector(selector) || null) : null;
+            const ok = Boolean(node) && Boolean(S.routeDiagramComponentTarget?.(node));
+            root.dataset.striffsTestRouteOk = ok ? "1" : "0";
+            root.dataset.striffsTestRouteError = ok ? "" : "route failed";
+          } catch (err) {
+            root.dataset.striffsTestRouteOk = "0";
+            root.dataset.striffsTestRouteError = String(err?.message || err);
+          }
+        };
+        S.__striffsTestRouteObserver = new MutationObserver(() => {
+          void handleDatasetRouteRequest();
+        });
+        S.__striffsTestRouteObserver.observe(document.documentElement, {
+          attributes: true,
+          attributeFilter: ["data-striffs-test-route-request-id"]
+        });
 
-		    document.addEventListener("click", S.__onFileTreeClick);
-		    document.addEventListener("click", S.__onDiagramClick);
+        document.addEventListener("click", S.__onFileTreeClick, true);
+        document.addEventListener("click", S.__onDiagramClick);
         document.addEventListener("click", S.__onFileMenuClick);
-		    document.addEventListener("toggle", S.__onFileMenuToggle, true);
-		    document.addEventListener("striffs:routeDiagramComponent", S.__onStriffsTestRouteEvent);
-		    window.addEventListener("message", S.__onStriffsTestMessage);
+        document.addEventListener("toggle", S.__onFileMenuToggle, true);
+        window.addEventListener("hashchange", S.__onHashChange);
+        document.addEventListener("striffs:routeDiagramComponent", S.__onStriffsTestRouteEvent);
+        window.addEventListener("message", S.__onStriffsTestMessage);
 
-	    S.__domListenersRegistered = true;
-	  }
+      S.__domListenersRegistered = true;
+    }
 
   // ---------- Toast (legacy view-local) ----------
   S.showToast = (msg) => {
@@ -4279,12 +4981,160 @@
   S.readCacheFromChromeStorage = readCacheFromChromeStorage;
   S.removeCacheFromChromeStorage = removeCacheFromChromeStorage;
 
+  const STRIFFS_CACHE_DB = 'striffs-cache-db';
+  const STRIFFS_CACHE_STORE = 'diagrams';
+
+  function openStriffsCacheDb() {
+    return new Promise((resolve) => {
+      try {
+        if (!('indexedDB' in window)) return resolve(null);
+        const req = indexedDB.open(STRIFFS_CACHE_DB, 1);
+        req.onupgradeneeded = () => {
+          const db = req.result;
+          if (!db.objectStoreNames.contains(STRIFFS_CACHE_STORE)) {
+            db.createObjectStore(STRIFFS_CACHE_STORE);
+          }
+        };
+        req.onsuccess = () => resolve(req.result || null);
+        req.onerror = () => resolve(null);
+      } catch {
+        resolve(null);
+      }
+    });
+  }
+
+  async function withCacheStore(mode, fn) {
+    const db = await openStriffsCacheDb();
+    if (!db) return null;
+    return new Promise((resolve) => {
+      try {
+        const tx = db.transaction(STRIFFS_CACHE_STORE, mode);
+        const store = tx.objectStore(STRIFFS_CACHE_STORE);
+        Promise.resolve(fn(store, tx)).then(resolve).catch(() => resolve(null));
+        tx.oncomplete = () => { try { db.close(); } catch {} };
+        tx.onerror = () => { try { db.close(); } catch {} };
+        tx.onabort = () => { try { db.close(); } catch {} };
+      } catch {
+        try { db.close(); } catch {}
+        resolve(null);
+      }
+    });
+  }
+
+  function writeCacheToIndexedDb(payload) {
+    const key = S.cacheKey?.();
+    if (!key) return Promise.resolve(false);
+    return withCacheStore('readwrite', (store) => new Promise((resolve) => {
+      try {
+        const req = store.put(payload, key);
+        req.onsuccess = () => resolve(true);
+        req.onerror = () => resolve(false);
+      } catch {
+        resolve(false);
+      }
+    })).then((ok) => Boolean(ok));
+  }
+
+  function readCacheFromIndexedDb() {
+    const key = S.cacheKey?.();
+    if (!key) return Promise.resolve(null);
+    return withCacheStore('readonly', (store) => new Promise((resolve) => {
+      try {
+        const req = store.get(key);
+        req.onsuccess = () => resolve(req.result || null);
+        req.onerror = () => resolve(null);
+      } catch {
+        resolve(null);
+      }
+    }));
+  }
+
+  function removeCacheFromIndexedDb() {
+    const key = S.cacheKey?.();
+    if (!key) return Promise.resolve(false);
+    return withCacheStore('readwrite', (store) => new Promise((resolve) => {
+      try {
+        const req = store.delete(key);
+        req.onsuccess = () => resolve(true);
+        req.onerror = () => resolve(false);
+      } catch {
+        resolve(false);
+      }
+    })).then((ok) => Boolean(ok));
+  }
+
+  function clearIndexedDbCacheStore() {
+    return withCacheStore('readwrite', (store) => new Promise((resolve) => {
+      try {
+        const req = store.clear();
+        req.onsuccess = () => resolve(true);
+        req.onerror = () => resolve(false);
+      } catch {
+        resolve(false);
+      }
+    })).then((ok) => Boolean(ok));
+  }
+
+  S.writeCacheToIndexedDb = writeCacheToIndexedDb;
+  S.readCacheFromIndexedDb = readCacheFromIndexedDb;
+  S.removeCacheFromIndexedDb = removeCacheFromIndexedDb;
+  S.clearIndexedDbCacheStore = clearIndexedDbCacheStore;
+
+  function writeCacheToLocalStorage(payload) {
+    try {
+      const key = S.cacheKey?.();
+      if (!key) return false;
+      let wrotePayload = false;
+      try {
+        localStorage.setItem(key, JSON.stringify(payload));
+        wrotePayload = true;
+      } catch {}
+      try {
+        localStorage.setItem(`striffsCacheMeta:${key}`, String(payload?.savedAt || ''));
+      } catch {}
+      return wrotePayload;
+    } catch {
+      return false;
+    }
+  }
+
+  function readCacheFromLocalStorage() {
+    try {
+      const key = S.cacheKey?.();
+      if (!key) return null;
+      const raw = localStorage.getItem(key);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function removeCacheFromLocalStorage() {
+    try {
+      const key = S.cacheKey?.();
+      if (!key) return false;
+      localStorage.removeItem(key);
+      localStorage.removeItem(`striffsCacheMeta:${key}`);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  S.writeCacheToLocalStorage = writeCacheToLocalStorage;
+  S.readCacheFromLocalStorage = readCacheFromLocalStorage;
+  S.removeCacheFromLocalStorage = removeCacheFromLocalStorage;
+
   async function readCachedDiagram(meta) {
     const clearAt = await S.getCacheClearAt?.();
-    const parsed = await readCacheFromChromeStorage();
+    const parsed = await readCacheFromChromeStorage() || readCacheFromLocalStorage() || await readCacheFromIndexedDb();
     if (!parsed) return null;
     if (clearAt && parsed?.savedAt && Number(parsed.savedAt) <= clearAt) {
       await removeCacheFromChromeStorage();
+      removeCacheFromLocalStorage();
+      await removeCacheFromIndexedDb();
       return null;
     }
     const commitCount = meta?.commit_count;
@@ -4293,12 +5143,12 @@
     return parsed.result || null;
   }
 
-  function writeCachedDiagram(result, meta) {
+  async function writeCachedDiagram(result, meta) {
     const updatedAt = meta?.updated_at; // retained for logging; not used for cache validity
     const commitCount = meta?.commit_count;
     try {
       const key = S.cacheKey();
-      if (!key) return;
+      if (!key) return false;
       const payload = {
         result,
         updated_at: updatedAt,
@@ -4315,14 +5165,29 @@
       };
       try { window.__striffsCacheMeta = payload.savedAt; window.__striffsCacheKey = key; } catch {}
       setCacheDataset(payload.savedAt);
-      void writeCacheToChromeStorage(payload).then((ok) => {
-        if (!ok) {
-          try { window.__striffsCacheTooLarge = true; } catch {}
-          try { document.documentElement.dataset.striffsCacheTooLarge = "1"; } catch {}
-        }
-      });
+      const localOk = writeCacheToLocalStorage(payload);
+      const [chromeOk, indexedOk] = await Promise.all([
+        writeCacheToChromeStorage(payload),
+        writeCacheToIndexedDb(payload)
+      ]);
+      const anyOk = Boolean(localOk || chromeOk || indexedOk);
+      try {
+        document.documentElement.dataset.striffsCacheStorage = JSON.stringify({
+          local: !!localOk,
+          chrome: !!chromeOk,
+          indexedDb: !!indexedOk
+        });
+      } catch {}
+      if (!anyOk) {
+        try { window.__striffsCacheTooLarge = true; } catch {}
+        try { document.documentElement.dataset.striffsCacheTooLarge = "1"; } catch {}
+      } else {
+        try { delete document.documentElement.dataset.striffsCacheTooLarge; } catch {}
+      }
+      return anyOk;
     } catch (e) {
       S.cwarn?.("Cache write failed", e);
+      return false;
     }
   }
 
@@ -4332,9 +5197,10 @@
     S.__lastRequestType = 'token';
     try { document.documentElement.dataset.striffsLastRequestType = 'token'; } catch {}
     if (!quiet) {
-      S.updateStriffButton({ loading: true, phase: " Loading diagram...", tooltip: "Generating Striffs…" });
+      S.updateStriffButton({ loading: true, phase: "Loading", tooltip: "Generating Striffs…" });
     }
     S.cinfo?.("Striffs request (token)", { owner, repo, pull_number, updated_at });
+
     const resp = await S.bgRequest({
       type: "fetchStriffsWithToken",
       owner,
@@ -4343,22 +5209,32 @@
       updated_at,
       token,
     }, timeoutFor("bgToken", timeoutFor("message", 7000)));
+
     if (!resp?.ok) {
-      throw new Error(resp?.error || 'API request failed');
+      const error = new Error(resp?.error || 'API request failed');
+      error.status = resp?.status ?? null;
+      error.errorCode = resp?.errorCode || null;
+      error.detail = resp?.detail || null;
+      throw error;
     }
+
     const durationMs = Date.now() - reqStart;
     S.cinfo?.("Striffs timings", resp?.timings || { type: "token", durationMs, note: "no timings payload from background" });
     S.__debugLastApiResponse = resp?.json || null;
     const componentRecords = S.extractApiComponentRecords?.(resp?.json) || [];
     const componentFilenames = S.extractApiComponentFilenames?.(resp?.json) || [];
-    S.debugDump?.("api response (token request)", {
+    const debugPayload = {
       striffsCount: Array.isArray(resp?.json?.striffs) ? resp.json.striffs.length : 0,
       componentCount: componentRecords.length,
       componentFilenames,
       componentUniqueFilenames: Array.from(new Set(componentFilenames)),
-      components: componentRecords,
-      fullApiResponse: resp?.json  // Add full API response in debug mode
-    });
+      components: componentRecords
+    };
+    // Only include full API response in debug mode to avoid constructing large objects unnecessarily
+    if (S.isDebug?.()) {
+      debugPayload.fullApiResponse = resp?.json;
+    }
+    S.debugDump?.("api response (token request)", debugPayload);
     return resp.json;
   }
 
@@ -4368,7 +5244,7 @@
     S.__lastRequestType = 'zips';
     try { document.documentElement.dataset.striffsLastRequestType = 'zips'; } catch {}
     if (!quiet) {
-      S.updateStriffButton({ loading: true, phase: "Generating diagram...", tooltip: "Generating Striffs…" });
+      S.updateStriffButton({ loading: true, phase: "Generating", tooltip: "Generating Striffs…" });
     }
     const filterFiles = S.getFilterFilesFromNav();
     const { baseOwner, baseRepo, baseBranch, headOwner, headRepo, headBranch } = S.extractHeadBaseRefs();
@@ -4377,6 +5253,7 @@
       filterFilesCount: filterFiles.length,
       filterFilesPreview: filterFiles.slice(0, 20)
     });
+
     const resp = await S.bgRequest({
       type: "generateStriffs",
       baseOwner, baseRepo, baseBranch,
@@ -4384,24 +5261,158 @@
       filterFiles,
       updated_at,
     }, timeoutFor("bgGenerate", timeoutFor("message", 7000)));
+
     if (!resp?.ok) {
-      throw new Error(resp?.error || 'API request failed');
+      const error = new Error(resp?.error || 'API request failed');
+      error.status = resp?.status ?? null;
+      error.errorCode = resp?.errorCode || null;
+      error.detail = resp?.detail || null;
+      throw error;
     }
+
     const durationMs = Date.now() - reqStart;
     S.cinfo?.("Striffs timings", resp?.timings || { type: "generate", durationMs, note: "no timings payload from background" });
     S.__debugLastApiResponse = resp?.json || null;
     const componentRecords = S.extractApiComponentRecords?.(resp?.json) || [];
     const componentFilenames = S.extractApiComponentFilenames?.(resp?.json) || [];
-    S.debugDump?.("api response (zip request)", {
+    const debugPayload = {
       striffsCount: Array.isArray(resp?.json?.striffs) ? resp.json.striffs.length : 0,
       componentCount: componentRecords.length,
       componentFilenames,
       componentUniqueFilenames: Array.from(new Set(componentFilenames)),
-      components: componentRecords,
-      fullApiResponse: resp?.json  // Add full API response in debug mode
-    });
+      components: componentRecords
+    };
+    // Only include full API response in debug mode to avoid constructing large objects unnecessarily
+    if (S.isDebug?.()) {
+      debugPayload.fullApiResponse = resp?.json;
+    }
+    S.debugDump?.("api response (zip request)", debugPayload);
     return resp.json;
   }
+
+  const ZIP_LIMIT_ERROR_CODES = new Set([
+    'ZIP_ENTRY_TOO_LARGE',
+    'ZIP_TOO_MANY_ENTRIES',
+    'ZIP_UNCOMPRESSED_SIZE_TOO_LARGE',
+    'GITHUB_ZIP_DOWNLOAD_FAILED'
+  ]);
+
+  const ZIP_REDUCE_SCOPE_ERROR_CODES = new Set([
+    'ZIP_FILE_TOO_LARGE',
+    'ZIP_UPLOAD_TOO_LARGE',
+    'TOO_MANY_COMPONENTS',
+    'PAYLOAD_TOO_LARGE'
+  ]);
+
+  const TOKEN_GUIDANCE_ERROR_CODES = new Set([
+    'NOT_FOUND',
+    ...ZIP_LIMIT_ERROR_CODES
+  ]);
+
+  const shouldPromptForTokenForZipLimit = ({ token, status, errorCode, message }) => {
+    if (token) return false;
+    if (!(status === 400 || status === 413)) return false;
+    if (errorCode && ZIP_LIMIT_ERROR_CODES.has(String(errorCode).trim().toUpperCase())) return true;
+    return /zip entry exceeds maximum allowed size|too many changes|request too large|repo too large/i.test(String(message || ''));
+  };
+
+  const describeApiError = ({ token, status, errorCode, message }) => {
+    const code = String(errorCode || '').trim().toUpperCase();
+    const text = String(message || '').trim() || `API request failed${status ? ` (${status})` : ''}`;
+
+    if ((status === 404 && code === 'NOT_FOUND') || (status === 404 && !code)) {
+      return {
+        tooltip: "PR/repo not found OR token lacks access. Verify token scopes/org access and PR exists.",
+        toast: token
+          ? "<strong>Token issue.</strong> Please verify your token has access to this repo and org."
+          : "PR/repo not found OR token lacks access. Verify token scopes/org access and PR exists.",
+        tone: token ? 'error' : 'neutral',
+        disabled: true,
+        waitingForToken: Boolean(token && S.isPrivateRepo?.())
+      };
+    }
+
+    if (status === 403 || code === 'FORBIDDEN' || code === 'ACCESS_DENIED') {
+      return {
+        tooltip: text,
+        toast: text,
+        tone: 'error',
+        disabled: true,
+        waitingForToken: true
+      };
+    }
+
+    if ((!token && TOKEN_GUIDANCE_ERROR_CODES.has(code)) || shouldPromptForTokenForZipLimit({ token, status, errorCode: code, message: text })) {
+      return {
+        tooltip: "This repo or PR is too large for anonymous zip generation. Add a GitHub token and try again.",
+        toast: "<strong>Connect a GitHub token.</strong> This repo or PR is too large for anonymous zip generation.",
+        tone: 'error',
+        disabled: true,
+        waitingForToken: false
+      };
+    }
+
+    if (code === 'ZIP_INVALID_FILE_TYPE' || code === 'ZIP_FILE_MISSING_OR_EMPTY' || code === 'INVALID_MULTIPART_REQUEST' || code === 'INVALID_ARGUMENT') {
+      return {
+        tooltip: text,
+        toast: text,
+        tone: 'neutral',
+        disabled: true
+      };
+    }
+
+    if (code === 'ZIP_ENTRY_PATH_UNSAFE') {
+      return {
+        tooltip: text,
+        toast: text,
+        tone: 'error',
+        disabled: true
+      };
+    }
+
+    if (ZIP_REDUCE_SCOPE_ERROR_CODES.has(code) || status === 413) {
+      return {
+        tooltip: text,
+        toast: text,
+        tone: 'neutral',
+        disabled: true
+      };
+    }
+
+    if (code === 'SOURCE_PARSE_FAILED') {
+      return {
+        tooltip: text,
+        toast: text,
+        tone: 'neutral',
+        disabled: false
+      };
+    }
+
+    if (code === 'UPSTREAM_SERVICE_ERROR' || status === 502) {
+      return {
+        tooltip: text,
+        toast: text,
+        tone: 'neutral',
+        disabled: false
+      };
+    }
+
+    if (code === 'INTERNAL_ERROR' || status === 500) {
+      return {
+        tooltip: text,
+        toast: text,
+        tone: 'neutral',
+        disabled: false
+      };
+    }
+
+    return {
+      tooltip: text,
+      toast: text,
+      tone: 'neutral',
+      disabled: false
+    };
+  };
 
   async function refreshEngagementContextFromFreshResult(meta) {
     if (S.__engagementRefreshPromise) return S.__engagementRefreshPromise;
@@ -4526,12 +5537,14 @@
       const { updated_at } = meta;
 
       if (!token && S.isPrivateRepo?.()) {
+        S.__waitingForToken = true;
         S.updateStriffButton({ neutral: true, disabled: true, tooltip: "Private repo requires a token" });
-        S.toast?.("<strong>Private repo detected.</strong> Please add a GitHub token: click the Striffs extension icon, choose \"Set Token\", and paste a PAT with repo read access.", "error", { timeoutMs: 9000 });
+        S.toast?.("<strong>Private repo detected.</strong> Click the Striffs extension icon and paste a GitHub token with repo read access.", "error", { timeoutMs: 9000 });
         return false;
       }
 
-      S.buildFilePathToDiffIdMapAsync?.(); // parallel, but safe
+      // Start building the file path to diff ID map early
+      const diffMapPromise = S.buildFilePathToDiffIdMapAsync?.();
 
       try {
         S.__striffsNoChanges = false;
@@ -4549,25 +5562,37 @@
         }
 
         await renderStriffsResult(result, meta, { fromCache });
+
+        // Ensure diff map is built before we continue
+        if (diffMapPromise) await diffMapPromise;
+
+        // Now update debug datasets after both maps are built
+        S.updateDebugDatasets?.();
         return true;
       } catch (err) {
         let message = err?.message || String(err);
+        const status = Number(err?.status || 0) || null;
+        const errorCode = String(err?.errorCode || '').trim().toUpperCase();
         cerr("autoFetchStriffs error:", message, err);
         S.__striffsReady = false;
 
-        // Check for HTTP 413 (Payload Too Large) error
-        if (message.includes('413') || message.includes('Too many changes') || message.includes('Unable to generate AI review: request too large')) {
-          message = "Unable to generate AI review: this PR has too many changes.";
-          S.updateStriffButton({ neutral: true, disabled: true, tooltip: message });
-          S.toast?.(message, "neutral", { timeoutMs: 8000 });
-          // Skip reconcile since we've already set the desired button state
+        const handled = describeApiError({ token, status, errorCode, message });
+        message = handled.tooltip || message;
+        if (handled.waitingForToken) {
+          S.__waitingForToken = true;
+        }
+        S.updateStriffButton({
+          ...(handled.tone === 'neutral' ? { neutral: true } : { failure: true }),
+          disabled: handled.disabled === true,
+          tooltip: handled.tooltip
+        });
+        S.toast?.(handled.toast, handled.tone, { timeoutMs: 10000 });
+        if (handled.disabled === true || handled.waitingForToken) {
           skipReconcile = true;
           return false;
         }
 
         terminalErrorMessage = message;
-        S.updateStriffButton({ failure: true, tooltip: message });
-        S.toast?.(message, "neutral", { timeoutMs: 8000 });
         return false;
       } finally {
         if (!skipReconcile) {
@@ -4585,7 +5610,7 @@
   // ---------- UI Events ----------
 
   // Shared helpers used by initial boot + navigation boot
-  S.waitForToolbar = S.waitForToolbar || async function waitForToolbar(maxMs = timeoutFor("waitForToolbar", 8000)) {
+  S.waitForToolbar = S.waitForToolbar || async function waitForToolbar(maxMs = timeoutFor("waitForToolbar", 20000)) {
     let toolbar = typeof S.getMainToolbar === 'function' ? S.getMainToolbar() : null;
     if (toolbar) return toolbar;
     if (typeof MutationObserver !== 'function') {
@@ -4771,24 +5796,30 @@
     const btn = document.getElementById("striffs-btn");
     if (!btn) return S.cwarn("Striffs button not found");
 
-	    S.__striffsReady = false;
-	    S.__striffsNoChanges = false;
-	    S.__lastFetchedUpdatedAt = null;
-	    S.__striffsSvg = null;
+      S.__striffsReady = false;
+      S.__striffsNoChanges = false;
+      S.__lastFetchedUpdatedAt = null;
+      S.__striffsSvg = null;
     S.clearReviewNoteFeedback?.();
     S.__striffsPathToComponentId.clear();
     S.__striffsComponentIdToFile.clear();
+    S.__striffsComponentIdToDiffId?.clear?.();
+    S.__striffsComponentIdToSvgElement?.clear?.();
+    S.__stablePathToComponentId?.clear?.();
+    S.__stableComponentIdToFile?.clear?.();
+    S.__stableComponentIdToDiffId?.clear?.();
+    S.__stableFilePathToDiffId?.clear?.();
     S.__lastPanState = null;
 
     await removeCacheFromChromeStorage();
-    try { localStorage.removeItem(S.cacheKey()); } catch {}
+    S.removeCacheFromLocalStorage?.();
 
     const view = document.getElementById("striff-diagram-view");
     if (view) {
       view.innerHTML = S.getStriffsContainerMarkup('<p>Reloading…</p>');
     }
 
-    S.updateStriffButton({ loading: true, tooltip: "Force reloading…", phase: "Bypassing cache..." });
+    S.updateStriffButton({ loading: true, tooltip: "Force reloading…", phase: "Bypassing" });
     const ok = await S.autoFetchStriffs();
     if (ok && S.__striffsReady) {
       S.updateStriffButton({ success: true, tooltip: "Reloaded fresh." });
@@ -4799,7 +5830,7 @@
 
   // ---------- BOOT ----------
   const isPR = (p) => /\/[^/]+\/[^/]+\/pull\/\d+/.test(p);
-  const isPRFiles = (p) => /\/[^/]+\/[^/]+\/pull\/\d+\/files/.test(p);
+  const isPRFiles = (p) => /\/[^/]+\/[^/]+\/pull\/\d+\/(files|changes)/.test(p);
   const isPRList = (p) => /\/[^/]+\/[^/]+\/pulls/.test(p);
   S.isPRPath = S.isPRPath || isPR;
   S.isPRFilesPath = S.isPRFilesPath || isPRFiles;
@@ -4825,10 +5856,11 @@
     const hasIntent = Boolean(S.hasAutoGenerateIntent?.());
     const shouldAutoGenerate = cacheStatus === 'stale' || (hasIntent && cacheStatus === 'empty');
     if (shouldAutoGenerate) {
-      S.updateStriffButton?.({ loading: true, tooltip: "Refreshing Striffs…", phase: "Refreshing…" });
+      S.updateStriffButton?.({ loading: true, tooltip: "Refreshing Striffs…", phase: "Refreshing" });
       await S.autoFetchStriffs?.();
     } else if (cacheStatus === 'fresh') {
-      await S.refreshEngagementContextFromFreshResult?.(S.extractPRMetadata?.());
+      // Engagement context refresh failures are silent
+      try { await S.refreshEngagementContextFromFreshResult?.(S.extractPRMetadata?.()); } catch {}
     }
 
     S.setDefaultButtonIfIdle?.();
@@ -4837,6 +5869,32 @@
     S.setActiveButtons?.("diffs");
     S.showDiffView?.();
     S.saveActiveTab?.("diffs");
+  };
+
+  S.completeFilesPageBoot = async (filesRoot) => {
+    if (!filesRoot) return false;
+    S.ensureFilesObserver?.(filesRoot);
+    S.buildFilePathToDiffIdMapAsync?.();
+    S.refreshSupportedFilesState?.();
+    const cacheStatus = await S.primeDiagramFromCache?.();
+    await S.restoreViewAfterBoot?.({ cacheStatus });
+    return true;
+  };
+
+  S.scheduleFilesPageBootRetry = () => {
+    if (S.__filesPageBootRetryScheduled) return;
+    S.__filesPageBootRetryScheduled = true;
+    setTimeout(async () => {
+      S.__filesPageBootRetryScheduled = false;
+      try {
+        if (!S.isPRFilesPath?.(location.pathname)) return;
+        const filesRoot = await S.waitForFilesRoot?.(30000);
+        if (!filesRoot) return;
+        await S.completeFilesPageBoot?.(filesRoot);
+      } catch (e) {
+        S.cwarn?.('Late files root boot retry failed', e);
+      }
+    }, 2000);
   };
 
   const relevantPage = isPR(location.pathname);
@@ -4891,14 +5949,11 @@
 
   const filesRoot = await filesRootPromise;
   if (!filesRoot) {
-    S.cwarn?.('Files root not found; skipping initial boot');
+    S.cwarn?.('Files root not found during initial boot; scheduling retry');
+    S.scheduleFilesPageBootRetry?.();
     return;
   }
-  S.ensureFilesObserver?.(filesRoot);
-  S.buildFilePathToDiffIdMapAsync?.();
-  S.refreshSupportedFilesState?.();
-  const cacheStatus = await S.primeDiagramFromCache();
-  await S.restoreViewAfterBoot?.({ cacheStatus });
+  await S.completeFilesPageBoot?.(filesRoot);
 })();
 
 (() => {
@@ -4907,7 +5962,7 @@
   let navIntervalId = null;
 
   const isPR = S.isPRPath || ((p) => /\/[^/]+\/[^/]+\/pull\/\d+/.test(p));
-  const isPRFiles = S.isPRFilesPath || ((p) => /\/[^/]+\/[^/]+\/pull\/\d+\/files/.test(p));
+  const isPRFiles = S.isPRFilesPath || ((p) => /\/[^/]+\/[^/]+\/pull\/\d+\/(files|changes)/.test(p));
 
   async function bootIfNeeded() {
     if (!isPR(location.pathname)) return;
@@ -4951,14 +6006,12 @@
       await extsPromise;
 
       const filesRoot = await filesRootPromise;
-      if (!filesRoot) return;
+      if (!filesRoot) {
+        S.scheduleFilesPageBootRetry?.();
+        return;
+      }
 
-      S.ensureFilesObserver?.(filesRoot);
-      S.buildFilePathToDiffIdMapAsync?.();
-      S.refreshSupportedFilesState?.();
-
-      const cacheStatus = await S.primeDiagramFromCache?.();
-      await S.restoreViewAfterBoot?.({ cacheStatus });
+      await S.completeFilesPageBoot?.(filesRoot);
     } catch (e) {
       console.warn('[Striffs] nav boot skipped', e);
     }
@@ -5005,4 +6058,37 @@
   }
 
   registerNavListeners();
+})();
+
+// Listen for token changes and re-enable button if token was added
+(() => {
+  const S = window.Striffs;
+  if (!S) return;
+
+  // Initialize flag
+  S.__waitingForToken = false;
+
+  // Listen for storage changes
+  if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.onChanged) {
+    chrome.storage.onChanged.addListener(async (changes, areaName) => {
+      if (areaName !== 'local' && areaName !== 'sync') return;
+      if (!changes.ghToken) return;
+
+      const hadToken = Boolean(changes.ghToken.oldValue && changes.ghToken.oldValue.trim());
+      const hasToken = Boolean(changes.ghToken.newValue && changes.ghToken.newValue.trim());
+
+      // If token was just added, clear all waiting state and re-enable the button
+      if (!hadToken && hasToken) {
+        S.__waitingForToken = false;
+        S.cinfo?.('Token saved, clearing any cached state and re-enabling Striffs button');
+        // Clear any cached state that might prevent token usage
+        S.__striffsReady = false;
+        S.__striffsSvg = null;
+        S.updateStriffButton?.({ disabled: false, neutral: false, tooltip: 'Generate Striffs' });
+      } else if (hadToken && !hasToken) {
+        // Token was removed - update UI to show no token
+        S.setTokenBadge?.(false);
+      }
+    });
+  }
 })();
