@@ -2961,30 +2961,42 @@
           li.querySelector?.('button'),
           li.querySelector?.('[role="button"]')
         ].filter(Boolean);
+        const containerTargets = [
+          li.closest?.("li[id^='file-tree-item-diff-']"),
+          li.closest?.("[data-testid='file-tree'] li"),
+          li.closest?.("li[data-tree-entry-type='file']"),
+          li.closest?.("li[role='treeitem']"),
+          li.closest?.('.file-info'),
+          li.closest?.('.js-navigation-item'),
+          li.closest?.('.Link--primary')
+        ].filter(Boolean);
+        const relatedTargets = Array.from(new Set([...containerTargets, ...actionTargets]));
         if (hasComponent) {
-          li.classList.remove('striffs-file-disabled');
-          li.removeAttribute('aria-disabled');
-          li.setAttribute('data-striffs-mapped', '1');
-          li.setAttribute('data-striffs-file-path', filePath);
-          li.setAttribute('data-striffs-component-id', String(componentId));
-          actionTargets.forEach((el) => {
+          relatedTargets.forEach((el) => {
             try {
+              el.classList?.remove?.('striffs-file-disabled');
+              el.removeAttribute?.('aria-disabled');
               el.setAttribute('data-striffs-mapped', '1');
               el.setAttribute('data-striffs-file-path', filePath);
               el.setAttribute('data-striffs-component-id', String(componentId));
+              if (el.style) {
+                el.style.pointerEvents = '';
+                el.style.opacity = '';
+              }
             } catch {}
           });
         } else {
-          li.classList.add('striffs-file-disabled');
-          li.setAttribute('aria-disabled', 'true');
-          li.setAttribute('data-striffs-mapped', '0');
-          li.removeAttribute('data-striffs-file-path');
-          li.removeAttribute('data-striffs-component-id');
-          actionTargets.forEach((el) => {
+          relatedTargets.forEach((el) => {
             try {
+              el.classList?.add?.('striffs-file-disabled');
+              el.setAttribute?.('aria-disabled', 'true');
               el.setAttribute('data-striffs-mapped', '0');
               el.removeAttribute('data-striffs-file-path');
               el.removeAttribute('data-striffs-component-id');
+              if (el.style) {
+                el.style.pointerEvents = 'none';
+                el.style.opacity = '0.35';
+              }
             } catch {}
           });
         }
@@ -2995,10 +3007,44 @@
           const mappedPath = S.findFilePathByDiffId?.(href);
           const normalizedPath = mappedPath ? `/${S.normalizePath(mappedPath)}` : '';
           const componentId = normalizedPath ? (S.findMappedComponentIdForPath?.(normalizedPath) || '') : '';
+          const relatedTargets = Array.from(new Set([
+            link,
+            link.closest?.("li[id^='file-tree-item-diff-']"),
+            link.closest?.("[data-testid='file-tree'] li"),
+            link.closest?.("li[data-tree-entry-type='file']"),
+            link.closest?.("li[role='treeitem']"),
+            link.closest?.('.file-info'),
+            link.closest?.('.js-navigation-item'),
+            link.closest?.('.Link--primary')
+          ].filter(Boolean)));
           if (normalizedPath && componentId) {
-            link.setAttribute('data-striffs-mapped', '1');
-            link.setAttribute('data-striffs-file-path', normalizedPath);
-            link.setAttribute('data-striffs-component-id', String(componentId));
+            relatedTargets.forEach((el) => {
+              try {
+                el.classList?.remove?.('striffs-file-disabled');
+                el.removeAttribute?.('aria-disabled');
+                el.setAttribute('data-striffs-mapped', '1');
+                el.setAttribute('data-striffs-file-path', normalizedPath);
+                el.setAttribute('data-striffs-component-id', String(componentId));
+                if (el.style) {
+                  el.style.pointerEvents = '';
+                  el.style.opacity = '';
+                }
+              } catch {}
+            });
+          } else {
+            relatedTargets.forEach((el) => {
+              try {
+                el.classList?.add?.('striffs-file-disabled');
+                el.setAttribute?.('aria-disabled', 'true');
+                el.setAttribute('data-striffs-mapped', '0');
+                el.removeAttribute('data-striffs-file-path');
+                el.removeAttribute('data-striffs-component-id');
+                if (el.style) {
+                  el.style.pointerEvents = 'none';
+                  el.style.opacity = '0.35';
+                }
+              } catch {}
+            });
           }
         } catch {}
       });
@@ -3330,6 +3376,15 @@
     return '';
   };
 
+  const extractLongestPathLikeSubstring = (value) => {
+    const text = String(value || '').trim();
+    if (!text) return '';
+    const matches = text.match(/(?:[A-Za-z0-9._-]+\/)+[A-Za-z0-9._-]+\.[A-Za-z0-9._-]+/g) || [];
+    if (!matches.length) return '';
+    const best = matches.sort((a, b) => b.length - a.length)[0] || '';
+    return getNormalizedFilePathCandidate(best);
+  };
+
   S.getFilePathFromTreeItem = (node) => {
     try {
       const li = node?.closest?.("li[data-tree-entry-type='file'], li[id^='file-tree-item-diff-'], li[role='treeitem']") || node?.closest?.('li') || node || null;
@@ -3358,14 +3413,12 @@
         label?.id,
         label?.getAttribute?.('title'),
         label?.getAttribute?.('aria-label'),
+        extractLongestPathLikeSubstring(label?.textContent),
+        extractLongestPathLikeSubstring(li.textContent),
         link?.textContent,
         label?.textContent,
         li.textContent
       ];
-      for (const candidate of candidates) {
-        const normalized = getNormalizedFilePathCandidate(candidate);
-        if (normalized) return normalized;
-      }
       const href = String(link?.getAttribute?.('href') || '');
       const diffId = href.startsWith('#') ? href.slice(1) : (href.match(/#(.+)$/)?.[1] || '');
       if (diffId && S.__filePathToDiffId?.entries) {
@@ -3374,6 +3427,10 @@
             return S.normalizePath(filePath);
           }
         }
+      }
+      for (const candidate of candidates) {
+        const normalized = getNormalizedFilePathCandidate(candidate);
+        if (normalized) return normalized;
       }
     } catch {}
     return '';
@@ -3396,6 +3453,7 @@
         root.querySelector?.("a[href*='#diff-'][aria-label]")?.getAttribute?.('aria-label'),
         root.querySelector?.("[data-testid='file-header'] a")?.getAttribute?.('title'),
         root.querySelector?.(".file-info a.Link--primary")?.getAttribute?.('title'),
+        extractLongestPathLikeSubstring(root.textContent),
         root.querySelector?.("[data-testid='file-header'] a")?.textContent,
         root.querySelector?.(".file-info a.Link--primary")?.textContent
       ];

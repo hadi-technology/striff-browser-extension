@@ -406,7 +406,80 @@ const setRemoteConfigUrlData = async (jsonObj) => {
     return state;
   };
 
+  const ensureOldUiExperience = async ({ navigate = true, targetUrl = INITIAL_URL } = {}) => {
+    log(`Ensuring GitHub old UI via ${targetUrl}`);
+    if (navigate) {
+      await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT_MS });
+      await page.waitForTimeout(1000);
+    }
+
+    let state = await inspectGitHubExperience();
+    log(`GitHub old-ui state before classic switch: ${JSON.stringify(state)}`);
+    if (state?.onFiles && !state?.onChanges) {
+      pass(`GitHub already in old UI (${state.path})`);
+      return state;
+    }
+
+    const classicButton = page.getByRole('button', { name: /switch to the classic experience/i });
+    const classicLink = page.getByRole('link', { name: /switch to the classic experience/i });
+    const classicText = page.getByText(/switch to the classic experience/i);
+    const previewButton = page.getByRole('button', { name: /^preview$/i });
+
+    if (await previewButton.isVisible({ timeout: 2000 }).catch(() => false)) {
+      log('Opening "Preview" menu to access classic experience switch');
+      await previewButton.click({ timeout: 5000 }).catch(() => null);
+      await page.waitForTimeout(500);
+    }
+
+    if (await classicButton.isVisible({ timeout: 2000 }).catch(() => false)) {
+      log('Clicking "Switch to the classic experience" button');
+      await classicButton.click({ timeout: 5000, noWaitAfter: true }).catch(() => null);
+    } else if (await classicLink.isVisible({ timeout: 2000 }).catch(() => false)) {
+      log('Clicking "Switch to the classic experience" link');
+      await classicLink.click({ timeout: 5000, noWaitAfter: true }).catch(() => null);
+    } else if (await classicText.isVisible({ timeout: 2000 }).catch(() => false)) {
+      log('Clicking "Switch to the classic experience" text node');
+      await classicText.click({ timeout: 5000, noWaitAfter: true }).catch(() => null);
+    } else if (state?.onChanges) {
+      const fallbackUrl = String(state.href || page.url() || targetUrl || '').replace(/\/changes([?#].*)?$/, '/files$1');
+      if (fallbackUrl && fallbackUrl !== page.url()) {
+        log(`Falling back to direct /files navigation (${fallbackUrl})`);
+        await page.goto(fallbackUrl, { waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT_MS }).catch(() => null);
+      }
+    }
+
+    await page.waitForURL(/\/pull\/\d+\/files(?:[?#].*)?$/, { timeout: 15000 }).catch(() => null);
+    await page.waitForTimeout(1500);
+    state = await inspectGitHubExperience().catch(() => null);
+    if (!state?.onFiles) {
+      await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT_MS }).catch(() => null);
+      await page.waitForTimeout(1500);
+      state = await inspectGitHubExperience().catch(() => null);
+    }
+    log(`GitHub old-ui state after classic switch: ${JSON.stringify(state)}`);
+    if (!state?.onFiles) {
+      fail(`Failed to activate GitHub old UI (path=${state?.path || 'unknown'}, classicToggleVisible=${state?.classicToggleVisible}, tryNewVisible=${state?.tryNewVisible})`);
+      return null;
+    }
+    pass(`Activated GitHub old UI (${state.path})`);
+    return state;
+  };
+
   const ensureButtonsRendered = async (label, { softFail = false } = {}) => {
+    if (!NEW_UI) {
+      const state = await inspectGitHubExperience().catch(() => null);
+      if (state && !state.onFiles) {
+        const restored = await ensureOldUiExperience({ navigate: false, targetUrl: INITIAL_URL }).catch(() => null);
+        if (!restored?.onFiles) {
+          if (softFail) {
+            warn(`GitHub old UI unavailable before button render check (${label})`);
+          } else {
+            fail(`GitHub old UI unavailable before button render check (${label})`);
+          }
+          return false;
+        }
+      }
+    }
     // Ensure Striffs is bootstrapped by checking observable output: the buttons it renders.
     await page.evaluate(() => {
       try { window.Striffs?.mountMainBarButtons?.(); } catch {}
@@ -563,7 +636,8 @@ const setRemoteConfigUrlData = async (jsonObj) => {
       const state = await ensureNewUiExperience();
       if (!state) return;
     } else {
-      await page.goto(INITIAL_URL, { waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT_MS });
+      const state = await ensureOldUiExperience();
+      if (!state) return;
     }
   } catch (e) {
     fail(`Navigation to PR page timed out: ${e.message || e}`);
@@ -1352,8 +1426,8 @@ const setRemoteConfigUrlData = async (jsonObj) => {
     fileTreeDiffsOk = { ok: false, reason: String(e?.message || e) };
   }
   if (!fileTreeDiffsOk?.ok) {
-    if (NEW_UI && fileTreeDiffsOk?.reason === 'no file tree link') {
-      warn(`New UI diffs-mode file tree stability check skipped (${JSON.stringify(fileTreeDiffsOk)})`);
+    if (fileTreeDiffsOk?.reason === 'no file tree link') {
+      warn(`${NEW_UI ? 'New UI' : 'Old UI'} diffs-mode file tree stability check skipped (${JSON.stringify(fileTreeDiffsOk)})`);
     } else {
     fail(`File tree click switched views in diffs mode (beforeActive=${fileTreeDiffsOk?.beforeActive}, afterActive=${fileTreeDiffsOk?.afterActive}, striffsActive=${fileTreeDiffsOk?.striffsActive}, reason=${fileTreeDiffsOk?.reason || 'unknown'})`);
     return;
@@ -1390,8 +1464,8 @@ const setRemoteConfigUrlData = async (jsonObj) => {
     fileTreeStriffsOk = { ok: false, reason: String(e?.message || e) };
   }
   if (!fileTreeStriffsOk?.ok) {
-    if (NEW_UI && fileTreeStriffsOk?.reason === 'no file tree link') {
-      warn(`New UI striffs-mode file tree stability check skipped (${JSON.stringify(fileTreeStriffsOk)})`);
+    if (fileTreeStriffsOk?.reason === 'no file tree link') {
+      warn(`${NEW_UI ? 'New UI' : 'Old UI'} striffs-mode file tree stability check skipped (${JSON.stringify(fileTreeStriffsOk)})`);
     } else {
     fail(`File tree click did not stay in Striffs view or changed hash (beforeActive=${fileTreeStriffsOk?.beforeActive}, afterActive=${fileTreeStriffsOk?.afterActive}, beforeHash="${fileTreeStriffsOk?.beforeHash}", afterHash="${fileTreeStriffsOk?.afterHash}", reason=${fileTreeStriffsOk?.reason || 'unknown'})`);
     return;
@@ -2082,14 +2156,20 @@ const setRemoteConfigUrlData = async (jsonObj) => {
       const dataset = document.documentElement?.dataset || {};
       const datasetSaved = !!dataset.striffsCacheSavedAt;
       const datasetTooLarge = dataset.striffsCacheTooLarge === "1";
+      const datasetStorage = dataset.striffsCacheStorage || '';
       let chrome = false;
       if (typeof window.Striffs?.readCacheFromChromeStorage === 'function') {
         const parsed = await window.Striffs.readCacheFromChromeStorage();
         chrome = !!parsed;
       }
-      return { local, chrome, meta, tooLarge, datasetSaved, datasetTooLarge };
+      let indexedDb = false;
+      if (typeof window.Striffs?.readCacheFromIndexedDb === 'function') {
+        const parsed = await window.Striffs.readCacheFromIndexedDb();
+        indexedDb = !!parsed;
+      }
+      return { local, chrome, indexedDb, meta, tooLarge, datasetSaved, datasetTooLarge, datasetStorage };
     } catch {
-      return { local: false, chrome: false, meta: false, tooLarge: false, datasetSaved: false, datasetTooLarge: false };
+      return { local: false, chrome: false, indexedDb: false, meta: false, tooLarge: false, datasetSaved: false, datasetTooLarge: false, datasetStorage: '' };
     }
   });
   const cacheFlag = await page.evaluate(() => window.__striffsCacheMeta || null).catch(() => null);
@@ -2115,19 +2195,26 @@ const setRemoteConfigUrlData = async (jsonObj) => {
       const dataset = document.documentElement?.dataset || {};
       const datasetSaved = !!dataset.striffsCacheSavedAt;
       const datasetTooLarge = dataset.striffsCacheTooLarge === "1";
+      const datasetStorage = dataset.striffsCacheStorage || '';
       let chrome = false;
       if (typeof window.Striffs?.readCacheFromChromeStorage === 'function') {
         const parsed = await window.Striffs.readCacheFromChromeStorage();
         chrome = !!parsed;
       }
-      return { local, chrome, meta, tooLarge, datasetSaved, datasetTooLarge };
+      let indexedDb = false;
+      if (typeof window.Striffs?.readCacheFromIndexedDb === 'function') {
+        const parsed = await window.Striffs.readCacheFromIndexedDb();
+        indexedDb = !!parsed;
+      }
+      return { local, chrome, indexedDb, meta, tooLarge, datasetSaved, datasetTooLarge, datasetStorage };
     } catch {
-      return { local: false, chrome: false, meta: false, tooLarge: false, datasetSaved: false, datasetTooLarge: false };
+      return { local: false, chrome: false, indexedDb: false, meta: false, tooLarge: false, datasetSaved: false, datasetTooLarge: false, datasetStorage: '' };
     }
   }).catch(() => cacheAfter);
+  log(`Cache state after render ${JSON.stringify(cacheAfterSettled)}`);
   if (cacheAfterSettled?.tooLarge || cacheAfterSettled?.datasetTooLarge) {
     warn('Cache skipped (payload too large for storage)');
-  } else if (!cacheAfterSettled?.local && !cacheAfterSettled?.chrome && !cacheAfterSettled?.meta && !cacheAfterSettled?.datasetSaved && !cacheFlag) {
+  } else if (!cacheAfterSettled?.local && !cacheAfterSettled?.chrome && !cacheAfterSettled?.indexedDb && !cacheAfterSettled?.meta && !cacheAfterSettled?.datasetSaved && !cacheFlag) {
     warn('No cache entry was written after Striffs render; live smoke will treat cache-hit validation as optional');
   } else {
     pass('Cache written after Striffs render');
@@ -2167,31 +2254,85 @@ const setRemoteConfigUrlData = async (jsonObj) => {
 
   // Verify file tree availability state in Striffs view (unmapped files disabled).
   const fileTreeState = await page.evaluate(() => {
-    const items = Array.from(document.querySelectorAll("li[id^='file-tree-item-diff-'], li[data-tree-entry-type='file'], [data-testid='file-tree'] li, li[role='treeitem'], [data-striffs-mapped]"));
+    const items = Array.from(document.querySelectorAll(
+      "li[id^='file-tree-item-diff-'], li[data-tree-entry-type='file'], [data-testid='file-tree'] li, li[role='treeitem'], [data-striffs-mapped], a[href^='#diff-'], a[href*='#diff-']"
+    ));
     let unmappedTotal = 0;
     let unmappedDisabled = 0;
     let total = 0;
     let mappedAttrCount = 0;
+    let mappedEnabled = 0;
+    let mappedEnabledCode = 0;
     const d = document.documentElement?.dataset || {};
     const mappedCount = Number(d.striffsPathToComponentSize || 0);
     for (const li of items) {
-      const raw =
+      const href = String(li.getAttribute?.('href') || li.querySelector?.("a[href^='#diff-'], a[href*='#diff-']")?.getAttribute?.('href') || '');
+      const path =
+        (href ? window.Striffs?.findFilePathByDiffId?.(href) : '') ||
         window.Striffs?.getFilePathFromTreeItem?.(li) ||
+        li.getAttribute?.('data-striffs-file-path') ||
         li.getAttribute?.('data-path') ||
         li.getAttribute?.('data-file-path') ||
         li.id ||
         li.textContent ||
         "";
-      if (!String(raw).trim()) continue;
+      if (!String(path).trim()) continue;
       total += 1;
       if (li.hasAttribute('data-striffs-mapped')) mappedAttrCount += 1;
-      const norm = String(raw).trim();
+      const norm = String(path).trim();
       if (!norm) continue;
-      // We can't check exact mapping here; only track disabled count for items present.
-      if (li.classList.contains('striffs-file-disabled')) unmappedDisabled += 1;
+      const container = li.closest?.("li[id^='file-tree-item-diff-'], [data-testid='file-tree'] li, li[data-tree-entry-type='file'], li[role='treeitem'], .file-info, .js-navigation-item") || li;
+      const mapped = li.getAttribute('data-striffs-mapped') === '1' ||
+        !!li.querySelector?.('[data-striffs-mapped="1"]') ||
+        container.getAttribute?.('data-striffs-mapped') === '1' ||
+        !!window.Striffs?.findMappedComponentIdForPath?.(norm);
+      const disabled =
+        li.classList.contains('striffs-file-disabled') ||
+        li.getAttribute('aria-disabled') === 'true' ||
+        container.classList?.contains?.('striffs-file-disabled') ||
+        container.getAttribute?.('aria-disabled') === 'true';
+      if (mapped && !disabled) mappedEnabled += 1;
+      if (mapped && !disabled && /\.(java|ts|tsx|js|jsx|py|cs|go)$/i.test(norm)) mappedEnabledCode += 1;
+      if (disabled) unmappedDisabled += 1;
       unmappedTotal += 1;
     }
-    return { total, unmappedTotal, unmappedDisabled, mappedCount, mappedAttrCount };
+    const sample = items
+      .map((li) => {
+        const href = String(li.getAttribute('href') || li.querySelector?.('a[href]')?.getAttribute('href') || '');
+        const path = String(
+          li.getAttribute('data-striffs-file-path') ||
+          li.querySelector?.('[data-striffs-file-path]')?.getAttribute?.('data-striffs-file-path') ||
+          window.Striffs?.findFilePathByDiffId?.(href) ||
+          window.Striffs?.getFilePathFromTreeItem?.(li) ||
+          ''
+        );
+        const norm = String(path).trim();
+        const container = li.closest?.("li[id^='file-tree-item-diff-'], [data-testid='file-tree'] li, li[data-tree-entry-type='file'], li[role='treeitem'], .file-info, .js-navigation-item") || li;
+        const mapped = li.getAttribute('data-striffs-mapped') === '1' ||
+          !!li.querySelector?.('[data-striffs-mapped="1"]') ||
+          container.getAttribute?.('data-striffs-mapped') === '1' ||
+          !!window.Striffs?.findMappedComponentIdForPath?.(norm);
+        return {
+          tag: li.tagName,
+          href,
+          path: norm,
+          text: String((li.textContent || '').trim()).slice(0, 120),
+          liMapped: li.getAttribute('data-striffs-mapped') || '',
+          liDisabledClass: li.classList.contains('striffs-file-disabled'),
+          liAriaDisabled: li.getAttribute('aria-disabled') || '',
+          containerTag: String(container?.tagName || ''),
+          containerClass: String(container?.className || ''),
+          containerMapped: container?.getAttribute?.('data-striffs-mapped') || '',
+          containerDisabledClass: container?.classList?.contains?.('striffs-file-disabled') || false,
+          containerAriaDisabled: container?.getAttribute?.('aria-disabled') || '',
+          childMapped: String(li.querySelector?.('[data-striffs-mapped]')?.getAttribute?.('data-striffs-mapped') || ''),
+          childDisabledClass: !!li.querySelector?.('.striffs-file-disabled'),
+          childAriaDisabled: String(li.querySelector?.('[aria-disabled]')?.getAttribute?.('aria-disabled') || '')
+        };
+      })
+      .filter(Boolean)
+      .slice(0, 12);
+    return { total, unmappedTotal, unmappedDisabled, mappedCount, mappedAttrCount, mappedEnabled, mappedEnabledCode, sample };
   }).catch(() => null);
   if (!fileTreeState || fileTreeState.total === 0) {
     warn(`File tree availability check skipped (state=${JSON.stringify(fileTreeState)})`);
@@ -2202,6 +2343,11 @@ const setRemoteConfigUrlData = async (jsonObj) => {
       warn(`File tree availability check found no disabled items (total=${fileTreeState.total}, mappedCount=${fileTreeState.mappedCount}, mappedAttrCount=${fileTreeState.mappedAttrCount})`);
     }
     pass('File tree availability reflects Striffs mapping');
+    if (Number(fileTreeState.mappedEnabledCode || 0) <= 0) {
+      fail(`No mapped code files were enabled in file explorer during Striffs view (${JSON.stringify({ mappedEnabled: fileTreeState.mappedEnabled, mappedEnabledCode: fileTreeState.mappedEnabledCode, mappedCount: fileTreeState.mappedCount, mappedAttrCount: fileTreeState.mappedAttrCount, sample: fileTreeState.sample || [] })})`);
+      return;
+    }
+    pass('Mapped code files are enabled in file explorer during Striffs view');
   }
 
   await page.waitForFunction(() => {
@@ -2761,28 +2907,37 @@ const setRemoteConfigUrlData = async (jsonObj) => {
   }
 
   if (striffsBtn) {
-    // Check cache state before clicking
-    const cacheStateBefore = await page.evaluate(() => {
+    const reloadBootHandle = await page.waitForFunction(() => {
+      const s = window.Striffs;
+      const source = s?.__lastLoadSource || '';
+      const ready = !!s?.__striffsReady;
+      const svg = !!document.querySelector('#striff-diagram-view svg');
+      const btn = document.querySelector('#striffs-btn');
+      const btnSuccess = !!(btn && /check-circle/.test(btn.innerHTML));
+      if (!source && !ready && !svg && !btnSuccess) return null;
+      return { source, ready, svg, btnSuccess };
+    }, { timeout: 10000 }).catch(() => null);
+    const reloadBootState = reloadBootHandle ? await reloadBootHandle.jsonValue() : null;
+    const reloadCacheDiag = await page.evaluate(async () => {
       try {
-        const key = window.Striffs?.cacheKey?.();
-        if (!key) return null;
-        const raw = localStorage.getItem(key);
-        return raw ? JSON.parse(raw) : null;
+        const dataset = document.documentElement?.dataset || {};
+        return {
+          loadSource: window.Striffs?.__lastLoadSource || null,
+          ready: !!window.Striffs?.__striffsReady,
+          cacheSavedAt: dataset.striffsCacheSavedAt || null,
+          cacheKey: dataset.striffsCacheKey || null,
+          cacheStorage: dataset.striffsCacheStorage || null,
+          primeCacheProbe: dataset.striffsPrimeCacheProbe || null,
+          primeCacheStatus: dataset.striffsPrimeCacheStatus || null
+        };
       } catch {
         return null;
       }
-    });
-    const chromeCacheStateBefore = await page.evaluate(() => {
-      return new Promise((resolve) => {
-        try {
-          const key = window.Striffs?.cacheStorageKey?.();
-          if (!key || !chrome?.storage?.local) return resolve(null);
-          chrome.storage.local.get([key], (res) => resolve(res?.[key] || null));
-        } catch {
-          resolve(null);
-        }
-      });
-    });
+    }).catch(() => null);
+    log(`Cache state before reload click ${JSON.stringify({
+      boot: reloadBootState,
+      diag: reloadCacheDiag
+    })}`);
 
     await clickStriffsButton('before reload click');
     const reloadedStateHandle = await page.waitForFunction(() => {
@@ -2848,17 +3003,17 @@ const setRemoteConfigUrlData = async (jsonObj) => {
     const loadSource = await page.evaluate(() => window.Striffs?.__lastLoadSource || 'unknown');
     const tooltip = await page.evaluate(() => document.querySelector('#striffs-btn')?.title || '');
     const cacheTooltip = /loaded from cache/i.test(tooltip);
-    if (!cacheStateBefore && !chromeCacheStateBefore) {
-      warn('No cache entry found before reload (local or chrome storage); skipping cache hit assertion');
-      pass('Striffs renders after reload');
-    } else if (loadSource === 'cache') {
+    const bootLoadSource = String(reloadBootState?.source || reloadCacheDiag?.loadSource || '');
+    if (bootLoadSource === 'cache' || loadSource === 'cache') {
       pass('Striffs renders after reload (cache hit)');
-    } else if (cacheStateBefore && !cacheTooltip) {
-      fail(`Striffs rendered after reload but did not report cache hit (loadSource=${loadSource})`);
     } else if (cacheTooltip) {
       pass('Striffs renders after reload (cache tooltip shows cache)');
+    } else if (reloadBootState?.ready || reloadBootState?.svg || reloadBootState?.btnSuccess) {
+      fail(`Striffs state existed after reload but did not report cache hit (bootLoadSource=${bootLoadSource || 'none'}, loadSource=${loadSource})`);
+    } else if (bootLoadSource && bootLoadSource !== 'unknown') {
+      fail(`Striffs rendered after reload but did not report cache hit (loadSource=${loadSource})`);
     } else {
-      pass(`Striffs renders after reload (loadSource=${loadSource})`);
+      fail(`Striffs reload did not establish a cache hit (bootLoadSource=${bootLoadSource || 'none'}, loadSource=${loadSource})`);
     }
   }
   }
