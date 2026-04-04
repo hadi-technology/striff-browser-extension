@@ -15,7 +15,7 @@
     bgToken: 180000,
   });
 
-  S.DEFAULT_SUPPORTED_EXTS = ['java', 'go', 'js', 'ts', 'py', 'cs', 'cpp', 'rb', 'rs', 'php', 'kt'];
+  S.DEFAULT_SUPPORTED_EXTS = ['java', 'ts', 'py'];
 
   S.__striffsSvg = null;
   S.__striffsPathToComponentId = new Map();
@@ -33,6 +33,12 @@
   S.__waitingForToken = false;
   S.__striffsZoom = 1;
   S.__recentPanAt = 0;
+  S.__aiReviewStatus = null;
+  S.__aiReviewId = null;
+  S.__aiReviewPollTimer = null;
+  S.__aiReviewPollInFlight = false;
+  S.__aiReviewLastCompletedReviewId = null;
+  S.__aiReviewOperationId = null;
   S.__supportedExtensionsForUi = S.__supportedExtensionsForUi ||
     (Array.isArray(S.DEFAULT_SUPPORTED_EXTS) ? [...S.DEFAULT_SUPPORTED_EXTS] : []);
   S.PAN_CLICK_DEBOUNCE_MS = 250;
@@ -229,6 +235,7 @@
     S.syncZoomedSvgLayout?.(view, svg);
     view.scrollLeft = (x * scaleRatio) - (clientX - rect.left);
     view.scrollTop = (y * scaleRatio) - (clientY - rect.top);
+    S.queueReviewNoteFeedbackLayout?.();
     return true;
   };
 
@@ -531,17 +538,13 @@
   };
 
   S.reviewNoteFeedbackIcon = (vote) => {
-    const iconName = vote === "down" ? "thumbsdown" : "thumbsup";
-    const pathMap = {
-      thumbsup: 'M8.347 1.631A1.75 1.75 0 0 1 10 3.375V6h2.68a1.82 1.82 0 0 1 1.79 2.146l-.765 4.593A2.75 2.75 0 0 1 11 15H5.72a2.75 2.75 0 0 1-1.887-.75l-.59-.554A1.75 1.75 0 0 1 2.7 12.42V7.75C2.7 6.784 3.484 6 4.45 6H6.5V3.92c0-.354.107-.7.307-.992ZM4.45 7.5a.25.25 0 0 0-.25.25v4.67c0 .07.03.136.08.184l.591.554c.237.222.549.342.872.342H11c.61 0 1.13-.439 1.23-1.04l.766-4.593a.32.32 0 0 0-.316-.377H9.25A.75.75 0 0 1 8.5 6.75V3.375a.25.25 0 0 0-.472-.121l-1.22 2.135a.75.75 0 0 1-.652.381Z',
-      thumbsdown: 'M7.653 14.369A1.75 1.75 0 0 1 6 12.625V10H3.32A1.82 1.82 0 0 1 1.53 7.854l.765-4.593A2.75 2.75 0 0 1 5 1h5.28c.695 0 1.364.266 1.887.75l.59.554c.356.333.558.799.558 1.276v4.67c0 .966-.784 1.75-1.75 1.75H9.5v2.08c0 .354-.107.7-.307.992ZM5 2.5c-.61 0-1.13.439-1.23 1.04l-.766 4.593a.32.32 0 0 0 .316.377H6.75A.75.75 0 0 1 7.5 9.25v3.375a.25.25 0 0 0 .472.121l1.22-2.135a.75.75 0 0 1 .652-.381h1.706a.25.25 0 0 0 .25-.25V3.58a.252.252 0 0 0-.08-.185l-.591-.554a1.25 1.25 0 0 0-.872-.341Z'
-    };
-    const d = pathMap[iconName] || pathMap.thumbsup;
-    return [
-      '<svg class="striffs-note-feedback-icon" aria-hidden="true" viewBox="0 0 16 16" width="16" height="16">',
-      `<path class="striffs-note-feedback-icon-glyph" d="${d}" />`,
-      '</svg>'
-    ].join('');
+    // Light colors: green #bff7ce for thumbs up, red #ffd5dc for thumbs down
+    const bgColor = vote === "up" ? "#bff7ce" : "#ffd5dc";
+    // Border colors: darkcyan for thumbs up, darkred for thumbs down
+    const borderColor = vote === "up" ? "darkcyan" : "darkred";
+    const emoji = vote === "up" ? "👍" : "👎";
+    // Use em-based sizing so it scales with the transform
+    return `<span style="background-color: ${bgColor}; padding: 0.25em 0.4em; border-radius: 4px; display: inline-block; border: 1px solid ${borderColor}; font-size: 1em;">${emoji}</span>`;
   };
 
   S.clearReviewNoteFeedback = () => {
@@ -578,22 +581,30 @@
         if (!bbox) continue;
         const shell = document.createElement("div");
         shell.className = "striffs-note-feedback";
-        shell.setAttribute("data-note-id", noteId);
         shell.setAttribute("data-note-qualified-name", qn);
-        // Position at the bottom-right corner of the note, accounting for button size
-        const buttonWidth = 26;
-        const buttonHeight = 26;
-        const buttonGap = 4;
-        const totalWidth = (buttonWidth * 2) + buttonGap;
-        shell.style.left = `${(bbox.x + bbox.width) * zoom - totalWidth - 6}px`;
-        shell.style.top = `${(bbox.y + bbox.height) * zoom - buttonHeight - 6}px`;
+        // Position below the note box, pushed towards center
+        // Mix of SVG offset (scales with zoom) and screen offset (fixed)
+        const svgOffset = 45; // Scales with zoom
+        const screenOffset = 25; // Fixed screen pixels
+        const verticalOffset = 4;
+        // Position: SVG coordinates scaled, minus fixed screen offset
+        shell.style.left = `${(bbox.x + bbox.width - svgOffset) * zoom - screenOffset}px`;
+        shell.style.top = `${(bbox.y + bbox.height + verticalOffset) * zoom}px`;
+        // Scale with zoom - using transform for better scaling
+        const scale = Math.max(0.8, Math.min(zoom, 2.0));
+        shell.style.transform = `scale(${scale})`;
+        shell.style.transformOrigin = 'top left';
+        shell.setAttribute("data-note-id", noteId);
 
         const currentVote = S.__reviewNoteVotes?.get?.(noteId) || null;
+        // If already voted, don't show buttons
+        if (currentVote) continue;
+
         const noteText = S.extractReviewNoteText?.(note) || "";
         const createVoteButton = (vote, icon, label) => {
           const btn = document.createElement("button");
           btn.type = "button";
-          btn.className = `striffs-note-feedback-btn${currentVote === vote ? " is-selected" : ""}`;
+          btn.className = `striffs-note-feedback-btn striffs-note-feedback-btn--${vote}`;
           btn.setAttribute("data-vote", vote);
           btn.setAttribute("aria-label", label);
           btn.title = label;
@@ -610,7 +621,8 @@
               noteText,
               noteQualifiedName: qn
             });
-            S.queueReviewNoteFeedbackLayout?.();
+            // Hide the feedback buttons after clicking
+            shell.remove();
           });
           return btn;
         };
@@ -633,9 +645,12 @@
       }
     } catch {}
     const schedule = window.requestAnimationFrame || ((fn) => setTimeout(fn, 16));
+    // Use double RAF to ensure SVG is fully rendered before positioning
     S.__reviewNoteFeedbackFrame = schedule(() => {
-      S.__reviewNoteFeedbackFrame = 0;
-      S.positionReviewNoteFeedback?.();
+      schedule(() => {
+        S.__reviewNoteFeedbackFrame = 0;
+        S.positionReviewNoteFeedback?.();
+      });
     });
   };
 
@@ -1131,6 +1146,16 @@
 
   // ---------- Utils ----------
   S.sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  S.cancelEnrichmentPolling = (reason = "") => {
+    if (S.__aiReviewPollTimer) {
+      clearTimeout(S.__aiReviewPollTimer);
+      S.__aiReviewPollTimer = null;
+    }
+    S.__aiReviewPollInFlight = false;
+    if (reason && S.isDebug?.()) {
+      S.cinfo?.("[Striffs] Enrichment polling cancelled", { reason });
+    }
+  };
 
   // ---------- Cache clearing (per-page) ----------
   S.clearLocalDiagramCaches = async (opts = {}) => {
@@ -1206,6 +1231,7 @@
     try { setTimeout(() => { S.__suppressViewPersist = false; }, 2000); } catch {}
 
     if (resetLiveDiagram) {
+        S.cancelEnrichmentPolling?.("clear-local-cache");
         S.__striffsReady = false;
         S.__striffsNoChanges = false;
         S.__striffsSvg = null;
@@ -1230,10 +1256,21 @@
     S.__remoteConfigFetchFailed = false;
     S.__remoteConfigFetchError = null;
     S.__remoteConfigPromise = null;
-    S.__supportedExtensionsForUi = [];
+    S.__supportedExtensionsForUi = Array.isArray(S.DEFAULT_SUPPORTED_EXTS) ? [...S.DEFAULT_SUPPORTED_EXTS] : [];
     S.__supportedExtensionsFetchedAt = 0;
     S.__supportedExtensionsPromise = null;
     S.__suppressCacheWritesUntil = Date.now() + 2000;
+
+    // Clear IndexedDB cache
+    try {
+      const deleteReq = indexedDB.deleteDatabase('striffs-cache-db');
+      await new Promise((resolve) => {
+        deleteReq.onsuccess = () => resolve(true);
+        deleteReq.onerror = () => resolve(true);
+        deleteReq.onblocked = () => resolve(true);
+      });
+    } catch (_) {}
+
     try { delete window.__striffsCacheMeta; delete window.__striffsCacheKey; delete window.__striffsCacheTooLarge; } catch {}
     try {
       const d = document.documentElement?.dataset;
@@ -1256,6 +1293,7 @@
       if (!ts) return false;
       const seen = Math.max(Number(S.__cacheClearSeenAt || 0), Number(seenAt || 0));
       if (ts > seen) {
+        S.cancelEnrichmentPolling?.("global-cache-clear");
         await S.clearLocalDiagramCaches({ preserveClearFlag: true });
         S.__cacheClearSeenAt = ts;
         try {
@@ -1273,7 +1311,7 @@
       if (msg?.type === "clearStriffsCaches") {
         Promise.resolve()
           .then(async () => {
-            try { await S.clearLocalDiagramCaches({ preserveClearFlag: true }); } catch {}
+            try { await S.clearLocalDiagramCaches({ preserveClearFlag: true, resetLiveDiagram: true }); } catch {}
             try { S.showDiffView?.(); } catch {}
             sendResponse?.({ ok: true });
           })
@@ -1384,6 +1422,15 @@
       }
       throw err;
     }
+  };
+
+  S.fetchAiReviewStatus = async ({ operationId, engagementToken, timeoutMs } = {}) => {
+    return await S.bgRequest({
+      type: "fetchAiReviewStatus",
+      operationId,
+      engagementToken,
+      timeoutMs
+    }, timeoutMs ?? 15000);
   };
 
   S.getStoredToken = async () => {
@@ -1908,6 +1955,9 @@
               }
               // If diagram is ready, do not refetch; just show Striffs.
               if (S.__striffsReady && S.__striffsSvg) {
+                  if ((S.__aiReviewStatus === "PENDING" || S.__aiReviewStatus === "RUNNING") && !S.__aiReviewPollTimer) {
+                      S.startEnrichmentPolling?.({ immediate: true, reason: "button-resume" });
+                  }
                   S.showStriffView();
                   S.saveActiveTab('striffs');
                 return;
@@ -1973,6 +2023,7 @@
     // Button state / label updater
     S.updateStriffButton = function updateStriffButton({
         loading = false,
+        enriching = false,
         success = false,
         failure = false,
         disabled = false,
@@ -1982,6 +2033,7 @@
     }) {
         S.__lastStriffsButtonState = {
             loading,
+            enriching,
             success,
             failure,
             disabled,
@@ -2006,6 +2058,12 @@
             const phaseText = phase ? ` ${phase}` : " Loading...";
             btn.innerHTML =
                 `<span class="loader" style="display:inline-block;width:16px;height:16px;border:2px solid var(--borderColor-muted, var(--color-border-default, #ccc));border-top:2px solid var(--accent-fg, #0969da);border-radius:50%;animation:spin .8s linear infinite;vertical-align:middle;margin-right:8px;"></span>${phaseText}`;
+            return;
+        }
+
+        if (enriching) {
+            btn.innerHTML =
+                `<span class="loader" style="display:inline-block;width:16px;height:16px;border:2px solid var(--borderColor-muted, var(--color-border-default, #ccc));border-top:2px solid var(--success-fg, var(--color-success-fg, #1a7f37));border-radius:50%;animation:spin .8s linear infinite;vertical-align:middle;margin-right:8px;"></span><span class="striffs-local-btn-label">Enriching</span>`;
             return;
         }
 
@@ -2275,46 +2333,37 @@
   #striff-diagram-view .striffs-note-feedback{
     position: absolute;
     display: inline-flex;
+    flex-direction: row;
     align-items: center;
     gap: 4px;
     pointer-events: auto;
   }
   #striff-diagram-view .striffs-note-feedback-btn{
     appearance: none;
-    border: 1px solid rgba(120, 53, 15, 0.28);
-    background: rgba(255, 251, 235, 0.96);
-    color: #f4b400;
-    width: 26px;
-    height: 26px;
-    border-radius: 999px;
+    border: none;
+    background: transparent;
+    color: #333;
+    border-radius: 4px;
+    padding: 0;
+    width: auto;
+    height: auto;
     display: inline-flex;
     align-items: center;
     justify-content: center;
     cursor: pointer;
-    padding: 0;
-    box-shadow: 0 2px 8px rgba(120, 53, 15, 0.18);
-    transition: transform .12s ease, background-color .12s ease, color .12s ease, box-shadow .12s ease;
+    transition: transform .15s ease;
+    font-size: inherit;
+    line-height: 1;
   }
   #striff-diagram-view .striffs-note-feedback-btn:hover{
-    transform: translateY(-1px);
-    background: rgba(255, 247, 214, 1);
-    color: #f6bf26;
-    box-shadow: 0 4px 10px rgba(120, 53, 15, 0.22);
-  }
-  #striff-diagram-view .striffs-note-feedback-btn.is-selected{
-    background: rgba(255, 239, 184, 1);
-    color: #f2a900;
-    border-color: rgba(180, 83, 9, 0.4);
+    transform: scale(1.1);
   }
   #striff-diagram-view .striffs-note-feedback-btn svg{
-    width: 15px;
-    height: 15px;
+    width: 1em;
+    height: 1em;
   }
   #striff-diagram-view .striffs-note-feedback-icon{
     display: block;
-  }
-  #striff-diagram-view .striffs-note-feedback-icon-glyph{
-    fill: currentColor;
   }
   #striff-diagram-view svg{
     width: auto;
@@ -2384,6 +2433,7 @@
   .striffs-view-striff-option.is-disabled{
     opacity: 0.5;
     cursor: not-allowed;
+    padding: 0;
   }
   .striffs-view-striff-option-spacer{
     display: inline-flex;
@@ -2692,6 +2742,7 @@
                 panOp = null;
                 panMoved = false;
                 panDistance = 0;
+                S.queueReviewNoteFeedbackLayout?.();
             });
             scrollEl.addEventListener('wheel', (e) => {
                 const svg = S.__striffsSvg || striffView.querySelector('#striffs-content svg');
@@ -2804,6 +2855,14 @@
     S.scheduleFileTreeAvailabilityRefresh?.();
     const striffView = S.ensureStriffContainer();
     if (striffView) {
+      const content = striffView.querySelector('#striffs-content');
+      if (content && S.__striffsReady && S.__striffsSvg && !content.querySelector('svg')) {
+        const wrap = document.createElement('div');
+        wrap.className = 'striff-svg-wrap';
+        wrap.appendChild(S.__striffsSvg);
+        content.innerHTML = '';
+        content.appendChild(wrap);
+      }
       striffView.style.display = "block";
       S.resizeStriffView();
       if (!S.__striffsSvg) {
@@ -2820,6 +2879,9 @@
       }
         }
         S.setCurrentView('striffs');
+        if ((S.__aiReviewStatus === "PENDING" || S.__aiReviewStatus === "RUNNING") && !S.__aiReviewPollTimer) {
+          S.startEnrichmentPolling?.({ immediate: true, reason: "show-view" });
+        }
     };
 
     S.saveActiveTab = (tabName) => {
@@ -2914,6 +2976,30 @@
       li.classList.remove('striffs-file-disabled');
       li.removeAttribute('aria-disabled');
       li.removeAttribute('data-striffs-mapped');
+      // Clear inline styles that were set when disabling
+      if (li.style) {
+        li.style.pointerEvents = '';
+        li.style.opacity = '';
+      }
+    });
+    // Also clear styles from elements that may have been styled but didn't get the class
+    // (e.g., elements that were disabled after initial rendering)
+    const fileTreeItems = document.querySelectorAll([
+      "li[id^='file-tree-item-diff-']",
+      "li[data-tree-entry-type='file']",
+      "[data-testid='file-tree'] li[role='treeitem']",
+      "li[role='treeitem']"
+    ].join(','));
+    fileTreeItems.forEach(li => {
+      // Skip if already handled
+      if (li.classList.contains('striffs-file-disabled')) return;
+      // Check if it has disabled inline styles but not the class
+      if (li.style.pointerEvents === 'none' || li.style.opacity === '0.35' || li.getAttribute('aria-disabled') === 'true') {
+        li.style.pointerEvents = '';
+        li.style.opacity = '';
+        li.removeAttribute('aria-disabled');
+        li.removeAttribute('data-striffs-mapped');
+      }
     });
   };
 
@@ -2931,15 +3017,25 @@
   S.updateFileTreeAvailability = () => {
     try {
       if (!S.__striffsPathToComponentId || !S.__striffsPathToComponentId.size) return;
-      // Include new UI selectors
+      // Include new UI selectors, but exclude directories explicitly
       const items = S.$$all?.([
         "li[id^='file-tree-item-diff-']",
         "li[data-tree-entry-type='file']",
-        "[data-testid='file-tree'] li",
-        "[role='treeitem']"
+        "[data-testid='file-tree'] li"
       ]) || [];
+
+      // Also include treeitems but exclude those marked as directories
+      const allTreeitems = document.querySelectorAll("[role='treeitem']");
+      for (const ti of allTreeitems) {
+        // Skip if it's marked as a directory
+        if (ti.getAttribute?.('data-tree-entry-type') === 'directory') continue;
+        // Skip if it contains other treeitems (it's a folder)
+        if (ti.querySelector('[role="treeitem"]')) continue;
+        items.push(ti);
+      }
+
       items.forEach(li => {
-        // Skip folders (items that contain other tree items)
+        // Additional check: skip folders (items that contain other tree items)
         if (li.querySelector('ul, ol, [role="group"], [role="tree"]')) return;
 
         const span =
@@ -3477,6 +3573,12 @@
       titles = treeEls
         .map(el => S.getFilePathFromTreeItem?.(el) || "")
         .filter(Boolean);
+      // Filter out directory entries (paths without file extensions)
+      titles = titles.filter(path => {
+        const lastSlash = path.lastIndexOf('/');
+        const filename = lastSlash >= 0 ? path.slice(lastSlash + 1) : path;
+        return filename.includes('.');
+      });
     }
     if (titles.length === 0) {
       const dataPathEls = document.querySelectorAll('div.js-file[data-file-type="file"][data-path], div.js-file[data-path], div[data-file-type="file"][data-path]');
@@ -4089,7 +4191,18 @@
             };
             const items = S.$$all(["li[id^='file-tree-item-diff-']", "li[data-tree-entry-type='file']", "li[role='treeitem']"]);
             for (const li of items) {
+              // Skip directory items - check if li has data-tree-entry-type='directory'
+              // or if it contains nested treeitems (it's a folder)
+              if (li.getAttribute?.('data-tree-entry-type') === 'directory') continue;
+              if (li.querySelector?.('[role="treeitem"]')) continue;
+
               const fullPath = S.getFilePathFromTreeItem?.(li) || '';
+              // Only map if the path looks like a file (has an extension after the last slash)
+              if (!fullPath) continue;
+              const lastSlash = fullPath.lastIndexOf('/');
+              const filename = lastSlash >= 0 ? fullPath.slice(lastSlash + 1) : fullPath;
+              if (!filename.includes('.')) continue; // Skip directories
+
               const a = li.querySelector("a.ActionList-content, a.ActionListContent, a[href^='#diff-'], a[href*='#diff-']");
               const href = a?.getAttribute("href") || "";
               const diffId = (href.startsWith("#") ? href.slice(1) : (href.match(/#(.+)$/)?.[1] || null));
@@ -4200,6 +4313,30 @@
     };
 
     S.isValidStriffsResult = (result) => !S.getStriffsResultValidationError?.(result);
+    S.getAiReviewStatusFromResult = (result) => {
+        const raw = String(
+            result?.aiReviewStatus || result?.ai_review_status || result?.reviewStatus || ""
+        ).trim().toUpperCase();
+        if (!raw || raw === "NOT_REQUESTED") {
+            return null;
+        }
+        return raw;
+    };
+
+    S.syncAiReviewStateFromResult = (result, { cachedStatus = null } = {}) => {
+        const status = cachedStatus || S.getAiReviewStatusFromResult?.(result) || null;
+        S.__aiReviewStatus = status;
+        S.__aiReviewId = String(
+            result?.aiReviewId || result?.ai_review_id || ""
+        ).trim() || null;
+        S.__aiReviewOperationId = String(
+            result?.operationId || result?.operationID || result?.operation_id || ""
+        ).trim() || null;
+        if (status === "READY" && S.__aiReviewId) {
+            S.__aiReviewLastCompletedReviewId = S.__aiReviewId;
+        }
+        return status;
+    };
 
     // Ensure we have cssEscape on S (used by previous logic)
     S.cssEscape = S.cssEscape || function cssEscape(id) {
@@ -4324,19 +4461,29 @@
               : `invalid_payload:${validationError}`;
           S.cwarn?.('[Striffs] Cache rejected', { cacheKey: key, reason });
           return false;
-        }
-        S.updateEngagementContextFromResult?.(parsed.result);
-        const container = S.ensureStriffContainer();
-        if (!container) return false;
-        const rendered = S.renderStriffsInto(container, parsed.result);
+	        }
+	        S.updateEngagementContextFromResult?.(parsed.result);
+          S.syncAiReviewStateFromResult?.(parsed.result, {
+            cachedStatus: String(parsed?.cachedAiReviewStatus || "").trim().toUpperCase() || null
+          });
+	        const container = S.ensureStriffContainer();
+	        if (!container) return false;
+	        const rendered = S.renderStriffsInto(container, parsed.result);
         if (!rendered) return false;
-        S.__lastLoadSource = 'cache';
-        S.__striffsReady = true;
-        S.__lastFetchedUpdatedAt = updated_at;
-        S.setAutoGenerateIntent?.(true);
-        S.updateStriffButton({ success: true, tooltip: "Striffs loaded from cache. Click to view." });
-        return true;
-      };
+	        S.__lastLoadSource = 'cache';
+	        S.__striffsReady = true;
+	        S.__lastFetchedUpdatedAt = updated_at;
+	        S.setAutoGenerateIntent?.(true);
+          if (S.__aiReviewStatus === "PENDING" || S.__aiReviewStatus === "RUNNING") {
+            S.updateStriffButton({ enriching: true, tooltip: "Base Striffs loaded from cache. AI enrichment is still running." });
+            setTimeout(() => {
+              S.startEnrichmentPolling?.({ immediate: false, reason: "cache-load" });
+            }, 0);
+          } else {
+            S.updateStriffButton({ success: true, tooltip: "Striffs loaded from cache. Click to view." });
+          }
+	        return true;
+	      };
 
       if (clearAt && parsed?.savedAt && Number(parsed.savedAt) <= clearAt) {
         await S.removeCacheFromChromeStorage?.();
@@ -4467,6 +4614,8 @@
                     if (!didFit) {
                       S.syncZoomedSvgLayout?.(scrollEl, svg);
                     }
+                    // Trigger feedback layout after SVG is sized
+                    setTimeout(() => S.queueReviewNoteFeedbackLayout?.(), 50);
                     try {
                       if (S.isDebug?.()) {
                         const serializer = new XMLSerializer();
@@ -4486,6 +4635,8 @@
                     S.applyHoverability(); // now colors clickable text
                     S.applyPendingFocus?.();
                     S.queueReviewNoteFeedbackLayout?.();
+                    // Also trigger after a short delay to ensure proper positioning
+                    setTimeout(() => S.queueReviewNoteFeedbackLayout?.(), 100);
                 }
 
                 const s = document.getElementById("striffs-status");
@@ -4524,19 +4675,26 @@
       });
       return;
     }
-    if (S.state?.isTooLarge?.()) {
-      S.updateStriffButton({
-        neutral: true,
-        disabled: true,
-        tooltip: "Diagram too large to render"
-      });
-      return;
-    }
-    if (S.__striffsReady && S.__striffsSvg) {
-      S.updateStriffButton({
-        success: true,
-        tooltip: "Striffs loaded. Click to view."
-      });
+	    if (S.state?.isTooLarge?.()) {
+	      S.updateStriffButton({
+	        neutral: true,
+	        disabled: true,
+	        tooltip: "Diagram too large to render"
+	      });
+	      return;
+	    }
+	    if (S.__striffsReady && S.__striffsSvg) {
+        if (S.__aiReviewStatus === "PENDING" || S.__aiReviewStatus === "RUNNING") {
+          S.updateStriffButton({
+            enriching: true,
+            tooltip: "Base Striffs are ready. AI enrichment is still running."
+          });
+          return;
+        }
+	      S.updateStriffButton({
+	        success: true,
+	        tooltip: "Striffs loaded. Click to view."
+	      });
       return;
     }
     if (errorMessage) {
@@ -4602,7 +4760,14 @@
       if (!link) return;
       if (S.getCurrentView && S.getCurrentView() !== 'striffs') return;
 
-	      const li = link.closest("li[id^='file-tree-item-diff-'], [data-testid='file-tree'] li, li[data-tree-entry-type='file'], li[role='treeitem'], li");
+	      // Use more specific selectors to avoid matching directory treeitems.
+	      // The :not() ensures we don't match directories even with role='treeitem'.
+	      const li = link.closest(
+	        "li[id^='file-tree-item-diff-'], " +
+	        "li[data-tree-entry-type='file'], " +
+	        "li:not([data-tree-entry-type='directory']):not(:has([role='treeitem']))[role='treeitem']"
+	      );
+	      // Double-check it's not a directory
 	      if (S.isDirectoryNode?.(li)) return;
 	      const annotatedFilePath = String(
           link?.getAttribute?.('data-striffs-file-path') ||
@@ -5207,12 +5372,13 @@
     try {
       const key = S.cacheKey();
       if (!key) return false;
-      const payload = {
-        result,
-        updated_at: updatedAt,
-        commit_count: commitCount != null ? commitCount : null,
-        savedAt: Date.now(),
-      };
+	      const payload = {
+	        result,
+          cachedAiReviewStatus: S.getAiReviewStatusFromResult?.(result),
+	        updated_at: updatedAt,
+	        commit_count: commitCount != null ? commitCount : null,
+	        savedAt: Date.now(),
+	      };
       const setCacheDataset = (savedAtValue) => {
         try {
           const d = document.documentElement?.dataset;
@@ -5248,6 +5414,107 @@
       return false;
     }
   }
+
+  S.refreshDiagramWithEnrichment = async (result, meta = null) => {
+    const container = S.ensureStriffContainer?.();
+    if (!container) return false;
+    const scrollEl = container.querySelector('#striffs-scroll') || container;
+    const previousScrollTop = Number(scrollEl.scrollTop || 0);
+    const previousScrollLeft = Number(scrollEl.scrollLeft || 0);
+    const previousZoom = Number(S.__striffsZoom || 1);
+    const rendered = S.renderStriffsInto(container, result);
+    if (!rendered) return false;
+    if (S.__striffsSvg) {
+      S.__striffsZoom = previousZoom;
+      S.syncZoomedSvgLayout?.(scrollEl, S.__striffsSvg);
+    }
+    try {
+      scrollEl.scrollTop = previousScrollTop;
+      scrollEl.scrollLeft = previousScrollLeft;
+    } catch {}
+    if (meta) {
+      await writeCachedDiagram(result, meta);
+    }
+    if (S.getCurrentView?.() === 'striffs') {
+      S.toast?.("AI enrichment applied.", "info", { timeoutMs: 3000 });
+    }
+    return true;
+  };
+
+  S.startEnrichmentPolling = ({ immediate = false, reason = "" } = {}) => {
+    if (S.__aiReviewPollTimer) {
+      clearTimeout(S.__aiReviewPollTimer);
+      S.__aiReviewPollTimer = null;
+    }
+    const status = String(S.__aiReviewStatus || "").trim().toUpperCase();
+    const operationId = String(S.__aiReviewOperationId || S.__engagementCtx?.operationId || "").trim();
+    const engagementToken = String(S.__engagementCtx?.engagementWriteToken || "").trim();
+    if (!(status === "PENDING" || status === "RUNNING")) return false;
+    if (!operationId || !engagementToken) return false;
+    const expectedOperationId = operationId;
+    const pollDelayMs = immediate ? 0 : Math.max(1000, Number(S.__lastAiReviewPollAfterMs || 5000));
+
+    const poll = async () => {
+      if (S.__aiReviewPollInFlight) return;
+      if (String(S.__aiReviewOperationId || S.__engagementCtx?.operationId || "").trim() !== expectedOperationId) {
+        S.cancelEnrichmentPolling?.("operation-mismatch");
+        return;
+      }
+      S.__aiReviewPollInFlight = true;
+      try {
+        const resp = await S.fetchAiReviewStatus?.({
+          operationId: expectedOperationId,
+          engagementToken,
+          timeoutMs: 15000
+        });
+        if (!resp?.ok) {
+          if (Number(resp?.status || 0) === 403) {
+            S.cancelEnrichmentPolling?.("poll-forbidden");
+            S.updateStriffButton?.({ success: true, tooltip: "AI enrichment polling stopped due to authorization." });
+            return;
+          }
+          const retryMs = Math.max(2000, Number(S.__lastAiReviewPollAfterMs || 5000));
+          S.__aiReviewPollTimer = setTimeout(() => S.startEnrichmentPolling?.({ immediate: true, reason: "retry-error" }), retryMs);
+          return;
+        }
+        const result = resp.json || {};
+        const nextStatus = S.syncAiReviewStateFromResult?.(result);
+        S.__lastAiReviewPollAfterMs = Number(result?.aiReviewPollAfterMs || result?.pollAfterMs || 5000);
+        if (nextStatus === "READY") {
+          S.cancelEnrichmentPolling?.("ready");
+          if (Array.isArray(result?.striffs) && result.striffs.length > 0) {
+            const meta = S.extractPRMetadata?.() || null;
+            await S.refreshDiagramWithEnrichment?.(result, meta);
+          }
+          S.updateStriffButton?.({ success: true, tooltip: "Striffs enriched. Click to view." });
+          return;
+        }
+        if (nextStatus === "FAILED") {
+          S.cancelEnrichmentPolling?.("failed");
+          S.updateStriffButton?.({ success: true, tooltip: result?.aiReviewErrorMessage || "AI enrichment failed. Base Striffs remain available." });
+          return;
+        }
+        if (nextStatus === "PENDING" || nextStatus === "RUNNING") {
+          S.updateStriffButton?.({ enriching: true, tooltip: "Base Striffs are ready. AI enrichment is still running." });
+          const retryMs = Math.max(1000, Number(result?.aiReviewPollAfterMs || result?.pollAfterMs || 5000));
+          S.__aiReviewPollTimer = setTimeout(() => S.startEnrichmentPolling?.({ immediate: true, reason: "continue" }), retryMs);
+          return;
+        }
+        S.cancelEnrichmentPolling?.("terminal-unknown");
+      } catch (e) {
+        const retryMs = Math.max(2000, Number(S.__lastAiReviewPollAfterMs || 5000));
+        S.__aiReviewPollTimer = setTimeout(() => S.startEnrichmentPolling?.({ immediate: true, reason: "retry-exception" }), retryMs);
+      } finally {
+        S.__aiReviewPollInFlight = false;
+      }
+    };
+
+    if (reason && S.isDebug?.()) {
+      S.cinfo?.("[Striffs] Enrichment polling scheduled", { reason, pollDelayMs, operationId: expectedOperationId });
+    }
+    S.__aiReviewPollTimer = setTimeout(poll, pollDelayMs);
+    return true;
+  };
 
   async function requestWithToken(token, meta, { quiet = false } = {}) {
     const { owner, repo, pull_number, updated_at } = meta;
@@ -5377,6 +5644,9 @@
   const describeApiError = ({ token, status, errorCode, message }) => {
     const code = String(errorCode || '').trim().toUpperCase();
     const text = String(message || '').trim() || `API request failed${status ? ` (${status})` : ''}`;
+    const isTransportFailure =
+      !status &&
+      /failed to fetch|networkerror|network error|timeout|background request failed|port closed|receiving end does not exist/i.test(text);
 
     if ((status === 404 && code === 'NOT_FOUND') || (status === 404 && !code)) {
       return {
@@ -5464,6 +5734,15 @@
       };
     }
 
+    if (isTransportFailure) {
+      return {
+        tooltip: text,
+        toast: text,
+        tone: 'error',
+        disabled: false
+      };
+    }
+
     return {
       tooltip: text,
       toast: text,
@@ -5533,14 +5812,16 @@
     if (validationError) {
       throw new Error(validationError);
     }
-    const engagementReady = S.updateEngagementContextFromResult?.(result);
-    if (!engagementReady) {
-      throw new Error("Invalid Striffs response: failed to initialize engagement telemetry.");
-    }
-    S.debugDump?.("render result payload summary", {
-      componentFilenames: S.extractApiComponentFilenames?.(result) || [],
-      fromCache,
-      striffsCount: Array.isArray(result?.striffs) ? result.striffs.length : 0,
+	    const engagementReady = S.updateEngagementContextFromResult?.(result);
+	    if (!engagementReady) {
+	      throw new Error("Invalid Striffs response: failed to initialize engagement telemetry.");
+	    }
+      const aiReviewStatus = S.syncAiReviewStateFromResult?.(result);
+	    S.debugDump?.("render result payload summary", {
+        aiReviewStatus,
+	      componentFilenames: S.extractApiComponentFilenames?.(result) || [],
+	      fromCache,
+	      striffsCount: Array.isArray(result?.striffs) ? result.striffs.length : 0,
       componentCount: (S.extractApiComponentRecords?.(result) || []).length,
       components: S.extractApiComponentRecords?.(result) || []
     });
@@ -5575,13 +5856,24 @@
       }
     }
 
-    S.__striffsReady = true;
-    S.__lastFetchedUpdatedAt = updated_at;
-    S.setAutoGenerateIntent?.(true);
-    S.updateStriffButton({ success: true, tooltip: "Striffs loaded. Click to view." });
-  }
+	    S.__striffsReady = true;
+	    S.__lastFetchedUpdatedAt = updated_at;
+	    S.setAutoGenerateIntent?.(true);
+      if (aiReviewStatus === "PENDING" || aiReviewStatus === "RUNNING") {
+        S.__lastAiReviewPollAfterMs = Number(result?.aiReviewPollAfterMs || result?.pollAfterMs || 5000);
+        S.updateStriffButton({ enriching: true, tooltip: "Base Striffs are ready. AI enrichment is still running." });
+        S.startEnrichmentPolling?.({ immediate: false, reason: "fresh-render" });
+        return;
+      }
+      if (aiReviewStatus === "FAILED") {
+        S.updateStriffButton({ success: true, tooltip: result?.aiReviewErrorMessage || "AI enrichment failed. Base Striffs are still available." });
+        return;
+      }
+	    S.updateStriffButton({ success: true, tooltip: "Striffs loaded. Click to view." });
+	  }
 
   S.autoFetchStriffs = async () => {
+    S.cancelEnrichmentPolling?.("auto-fetch");
     if (S.__autoFetchPromise) return S.__autoFetchPromise;
     S.__autoFetchPromise = (async () => {
       let terminalErrorMessage = "";
@@ -5778,6 +6070,424 @@
           .catch((e) => {
             window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: { error: String(e?.message || e) } }, '*');
           });
+        return;
+      }
+      if (data.fn === 'runAiReviewManualChecks') {
+        Promise.resolve((async () => {
+          const container = S.ensureStriffContainer?.();
+          const currentSvg = container?.querySelector?.('#striffs-content svg') || document.querySelector('#striff-diagram-view svg');
+          if (!container || !currentSvg) {
+            return {
+              ok: false,
+              reason: 'missing-svg',
+              hasContainer: Boolean(container),
+              hasDiagramView: Boolean(document.querySelector('#striff-diagram-view'))
+            };
+          }
+
+          const serializer = new XMLSerializer();
+          const originalSvg = serializer.serializeToString(currentSvg);
+          const operationId = String(S.__engagementCtx?.operationId || '').trim();
+          const engagementWriteToken = String(S.__engagementCtx?.engagementWriteToken || '').trim();
+          if (!operationId || !engagementWriteToken) {
+            return { ok: false, reason: 'missing-engagement-context', operationId, hasToken: Boolean(engagementWriteToken) };
+          }
+
+          const makeResult = (status, svgText, extras = {}) => ({
+            operationId,
+            engagementWriteToken,
+            aiReviewStatus: status,
+            aiReviewPollAfterMs: status === 'READY' || status === 'FAILED' ? null : 25,
+            aiReviewId: extras.aiReviewId || `manual-${status.toLowerCase()}`,
+            aiReviewErrorCode: extras.aiReviewErrorCode || null,
+            aiReviewErrorMessage: extras.aiReviewErrorMessage || null,
+            striffs: [{
+              svgCode: svgText,
+              size: 1,
+              title: 'manual-smoke',
+              createdAt: new Date().toISOString()
+            }]
+          });
+
+          const applyResult = async (resultPayload) => {
+            S.updateEngagementContextFromResult?.(resultPayload);
+            const aiReviewStatus = S.syncAiReviewStateFromResult?.(resultPayload);
+            const rendered = S.renderStriffsInto?.(container, resultPayload);
+            if (!rendered) {
+              return { ok: false, reason: 'render-failed', aiReviewStatus };
+            }
+            S.__striffsReady = true;
+            S.__lastFetchedUpdatedAt = Date.now();
+            S.setAutoGenerateIntent?.(true);
+            if (aiReviewStatus === 'PENDING' || aiReviewStatus === 'RUNNING') {
+              S.updateStriffButton?.({ enriching: true, tooltip: 'Base Striffs are ready. AI enrichment is still running.' });
+            } else if (aiReviewStatus === 'FAILED') {
+              S.updateStriffButton?.({ success: true, tooltip: resultPayload.aiReviewErrorMessage || 'AI enrichment failed. Base Striffs remain available.' });
+            } else {
+              S.updateStriffButton?.({ success: true, tooltip: 'Striffs loaded. Click to view.' });
+            }
+            const cachePayload = {
+              result: resultPayload,
+              cachedAiReviewStatus: S.getAiReviewStatusFromResult?.(resultPayload),
+              updated_at: null,
+              commit_count: null,
+              savedAt: Date.now()
+            };
+            await S.writeCacheToChromeStorage?.(cachePayload);
+            S.writeCacheToLocalStorage?.(cachePayload);
+            S.showStriffView?.();
+            return { ok: true, aiReviewStatus };
+          };
+
+          const pendingResult = makeResult('PENDING', originalSvg, { aiReviewId: 'manual-pending' });
+          const pendingApplied = await applyResult(pendingResult);
+          if (!pendingApplied?.ok) return pendingApplied;
+
+          const btnAfterPending = document.querySelector('#striffs-btn');
+          const pendingState = {
+            status: String(S.__aiReviewStatus || ''),
+            title: String(btnAfterPending?.title || ''),
+            html: String(btnAfterPending?.innerHTML || '')
+          };
+          const key = S.cacheKey?.();
+          let cachedAiReviewStatus = null;
+          try {
+            const parsed = JSON.parse(localStorage.getItem(key) || 'null');
+            cachedAiReviewStatus = parsed?.cachedAiReviewStatus || null;
+          } catch {}
+
+          const enrichedSvg = originalSvg.replace('<svg', '<svg data-manual-enriched="1"');
+          const readyResult = makeResult('READY', enrichedSvg, { aiReviewId: 'manual-ready' });
+          const failedResult = makeResult('FAILED', originalSvg, {
+            aiReviewId: 'manual-failed',
+            aiReviewErrorCode: 'MANUAL_FAIL',
+            aiReviewErrorMessage: 'Manual smoke failure'
+          });
+
+          const originalFetchAiReviewStatus = S.fetchAiReviewStatus;
+          try {
+            let readyCalls = 0;
+            S.fetchAiReviewStatus = async () => {
+              readyCalls += 1;
+              return { ok: true, status: 200, json: readyResult };
+            };
+            S.__lastAiReviewPollAfterMs = 10;
+            S.startEnrichmentPolling?.({ immediate: true, reason: 'manual-ready' });
+            const readyOutcome = await new Promise((resolve) => {
+              const started = Date.now();
+              const tick = () => {
+                const enrichedNode = document.querySelector('#striff-diagram-view svg[data-manual-enriched="1"]');
+                const btn = document.querySelector('#striffs-btn');
+                const buttonLooksReady = !!(btn && (/check-circle/.test(btn.innerHTML) || /enriched/i.test(btn.title || '')));
+                if (enrichedNode && buttonLooksReady) {
+                  resolve({
+                    ok: true,
+                    calls: readyCalls,
+                    html: String(btn?.innerHTML || ''),
+                    title: String(btn?.title || ''),
+                    enriched: true,
+                    pollTimerActive: Boolean(S.__aiReviewPollTimer)
+                  });
+                  return;
+                }
+                if (Date.now() - started > 4000) {
+                  resolve({
+                    ok: false,
+                    calls: readyCalls,
+                    html: String(btn?.innerHTML || ''),
+                    title: String(btn?.title || ''),
+                    enriched: Boolean(enrichedNode),
+                    pollTimerActive: Boolean(S.__aiReviewPollTimer)
+                  });
+                  return;
+                }
+                setTimeout(tick, 40);
+              };
+              tick();
+            });
+
+            const reAppliedPending = await applyResult(pendingResult);
+            if (!reAppliedPending?.ok) return { ok: false, reason: 'reapply-pending-failed' };
+
+            let failedCalls = 0;
+            S.fetchAiReviewStatus = async () => {
+              failedCalls += 1;
+              return { ok: true, status: 200, json: failedResult };
+            };
+            S.__lastAiReviewPollAfterMs = 10;
+            S.startEnrichmentPolling?.({ immediate: true, reason: 'manual-failed' });
+            const failedOutcome = await new Promise((resolve) => {
+              const started = Date.now();
+              const tick = () => {
+                const enrichedNode = document.querySelector('#striff-diagram-view svg[data-manual-enriched="1"]');
+                const btn = document.querySelector('#striffs-btn');
+                const buttonShowsBase = !!(btn && (/check-circle/.test(btn.innerHTML) || /failed|failure/i.test(btn.title || '')));
+                const title = String(btn?.title || '');
+                if (!S.__aiReviewPollTimer && buttonShowsBase && /failed|failure/i.test(title)) {
+                  resolve({
+                    ok: true,
+                    calls: failedCalls,
+                    title,
+                    enrichedStillPresent: Boolean(enrichedNode),
+                    status: String(S.__aiReviewStatus || '')
+                  });
+                  return;
+                }
+                if (Date.now() - started > 4000) {
+                  resolve({
+                    ok: false,
+                    calls: failedCalls,
+                    title,
+                    enrichedStillPresent: Boolean(enrichedNode),
+                    status: String(S.__aiReviewStatus || ''),
+                    pollTimerActive: Boolean(S.__aiReviewPollTimer)
+                  });
+                  return;
+                }
+                setTimeout(tick, 40);
+              };
+              tick();
+            });
+
+            return {
+              ok: pendingState.status === 'PENDING' &&
+                pendingState.html.includes('Enriching') &&
+                cachedAiReviewStatus === 'PENDING' &&
+                readyOutcome?.ok &&
+                failedOutcome?.ok &&
+                failedOutcome.enrichedStillPresent === false,
+              pendingState,
+              cachedAiReviewStatus,
+              readyOutcome,
+              failedOutcome
+            };
+          } finally {
+            S.fetchAiReviewStatus = originalFetchAiReviewStatus;
+            const restored = makeResult('READY', originalSvg, { aiReviewId: 'manual-restored' });
+            await applyResult(restored).catch(() => {});
+          }
+        })())
+          .then((result) => {
+            window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result }, '*');
+          })
+          .catch((e) => {
+            window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: { ok: false, reason: String(e?.message || e) } }, '*');
+          });
+        return;
+      }
+      if (data.fn === 'runLiveAiReviewCheck') {
+        Promise.resolve((async () => {
+          const timeoutMs = Math.max(1000, Number(data.timeoutMs || 180000));
+          const startedAt = Date.now();
+          const currentSvgNode = document.querySelector('#striff-diagram-view svg') || S.__striffsSvg || null;
+          if (!currentSvgNode) {
+            return { ok: false, reason: 'missing-base-svg' };
+          }
+          const serializer = new XMLSerializer();
+          const baseSvg = serializer.serializeToString(currentSvgNode);
+          const operationId = String(S.__aiReviewOperationId || S.__engagementCtx?.operationId || '').trim();
+          const engagementWriteToken = String(S.__engagementCtx?.engagementWriteToken || '').trim();
+          if (!operationId || !engagementWriteToken) {
+            return {
+              ok: false,
+              reason: 'missing-engagement-context',
+              operationId,
+              hasToken: Boolean(engagementWriteToken)
+            };
+          }
+
+          let status = String(S.__aiReviewStatus || '').trim().toUpperCase();
+          let reviewId = String(S.__aiReviewId || '').trim();
+          let lastResponse = null;
+
+          while ((Date.now() - startedAt) < timeoutMs) {
+            const resp = await S.fetchAiReviewStatus?.({
+              operationId,
+              engagementToken: engagementWriteToken,
+              timeoutMs: 15000
+            });
+            if (!resp?.ok) {
+              return {
+                ok: false,
+                reason: 'poll-failed',
+                status: Number(resp?.status || 0),
+                error: String(resp?.error || '')
+              };
+            }
+            const result = resp.json || {};
+            lastResponse = result;
+            status = String(S.syncAiReviewStateFromResult?.(result) || '').trim().toUpperCase();
+            reviewId = String(result?.aiReviewId || result?.ai_review_id || reviewId || '').trim();
+
+            if (status === 'READY') {
+              if (Array.isArray(result?.striffs) && result.striffs.length > 0) {
+                const meta = S.extractPRMetadata?.() || null;
+                await S.refreshDiagramWithEnrichment?.(result, meta);
+              }
+              const liveSvgNode = document.querySelector('#striff-diagram-view svg') || S.__striffsSvg || null;
+              const finalSvg = liveSvgNode ? serializer.serializeToString(liveSvgNode) : '';
+              const hasNote = finalSvg.includes(S.REVIEW_NOTE_PREFIX);
+              return {
+                ok: Boolean(hasNote && finalSvg && finalSvg !== baseSvg),
+                status,
+                reviewId,
+                changed: Boolean(finalSvg && finalSvg !== baseSvg),
+                hasNote,
+                baseLength: baseSvg.length,
+                finalLength: finalSvg.length
+              };
+            }
+            if (status === 'FAILED') {
+              return {
+                ok: false,
+                reason: 'review-failed',
+                status,
+                reviewId,
+                errorCode: String(result?.aiReviewErrorCode || ''),
+                errorMessage: String(result?.aiReviewErrorMessage || '')
+              };
+            }
+            await S.sleep(Math.max(1000, Number(result?.aiReviewPollAfterMs || result?.pollAfterMs || 5000)));
+          }
+
+          return {
+            ok: false,
+            reason: 'timeout',
+            status,
+            reviewId,
+            lastStatus: String(lastResponse?.aiReviewStatus || '')
+          };
+        })()).then((result) => {
+          window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result }, '*');
+        }).catch((e) => {
+          window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: { ok: false, reason: String(e?.message || e) } }, '*');
+        });
+        return;
+      }
+      if (data.fn === 'getMappingSnapshot') {
+        Promise.resolve().then(() => {
+          S.restoreStableMappings?.();
+          const result = {
+            ok: true,
+            pathToComponent: Array.from(S.__striffsPathToComponentId?.entries?.() || []),
+            componentToFile: Array.from(S.__striffsComponentIdToFile?.entries?.() || []),
+            filePathToDiffId: Array.from(S.__filePathToDiffId?.entries?.() || []),
+            canonicalRoute: S.getCanonicalMappedRoute?.() || null,
+            exampleMappedComponent: String(document.documentElement?.dataset?.striffsExampleMappedComponent || ''),
+            exampleMappedFile: String(document.documentElement?.dataset?.striffsExampleMappedFile || ''),
+            exampleMappedDiffHash: String(document.documentElement?.dataset?.striffsExampleMappedDiffHash || '')
+          };
+          window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result }, '*');
+        }).catch((e) => {
+          window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: { ok: false, reason: String(e?.message || e) } }, '*');
+        });
+        return;
+      }
+      if (data.fn === 'getCacheSnapshot') {
+        Promise.resolve((async () => {
+          const key = S.cacheKey?.() || '';
+          const chromeKey = S.cacheStorageKey?.() || '';
+          const localKeys = [];
+          for (let i = 0; i < localStorage.length; i += 1) {
+            const k = localStorage.key(i);
+            if (k) localKeys.push(k);
+          }
+          const sessionKeys = [];
+          for (let i = 0; i < sessionStorage.length; i += 1) {
+            const k = sessionStorage.key(i);
+            if (k) sessionKeys.push(k);
+          }
+          let chromeKeys = [];
+          try {
+            const stored = await new Promise((resolve) => {
+              try {
+                chrome.storage.local.get(null, (items) => resolve(items || {}));
+              } catch {
+                resolve({});
+              }
+            });
+            chromeKeys = Object.keys(stored || {});
+          } catch {}
+          return {
+            ok: true,
+            key,
+            chromeKey,
+            localKeys,
+            sessionKeys,
+            chromeKeys
+          };
+        })()).then((result) => {
+          window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result }, '*');
+        }).catch((e) => {
+          window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: { ok: false, reason: String(e?.message || e) } }, '*');
+        });
+        return;
+      }
+      if (data.fn === 'focusMappedFile') {
+        Promise.resolve((async () => {
+          const filePath = String(data.filePath || '');
+          if (!filePath) return { ok: false, reason: 'missing-file-path' };
+          const root = document.documentElement;
+          if (root?.dataset) {
+            delete root.dataset.striffsLastFocusedFile;
+            delete root.dataset.striffsLastFocusedComponent;
+            delete root.dataset.striffsLastFocusedAt;
+          }
+          const ok = await S.focusFileInStriffs?.(filePath);
+          await new Promise((resolve) => setTimeout(resolve, 150));
+          const focusedFile = String(root?.dataset?.striffsLastFocusedFile || '');
+          const focusedComponent = String(root?.dataset?.striffsLastFocusedComponent || '');
+          const normalizedFile = focusedFile.replace(/^\/+/, '');
+          const actualDiffId = String(
+            S.__filePathToDiffId?.get?.(focusedFile) ||
+            S.__filePathToDiffId?.get?.(normalizedFile) ||
+            ''
+          );
+          return {
+            ok: Boolean(ok),
+            requestedFilePath: filePath,
+            actualFocusedFile: focusedFile,
+            actualFocusedComponent: focusedComponent,
+            actualDiffId
+          };
+        })()).then((result) => {
+          window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result }, '*');
+        }).catch((e) => {
+          window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: { ok: false, reason: String(e?.message || e) } }, '*');
+        });
+        return;
+      }
+      if (data.fn === 'routeComponentId') {
+        Promise.resolve((async () => {
+          const componentId = String(data.componentId || '');
+          if (!componentId) return { ok: false, reason: 'missing-component-id' };
+          const root = document.documentElement;
+          if (root?.dataset) {
+            delete root.dataset.striffsLastDiagramClickStatus;
+            delete root.dataset.striffsLastDiagramClickComponent;
+            delete root.dataset.striffsLastDiagramClickFile;
+            delete root.dataset.striffsLastDiagramClickDiffId;
+            delete root.dataset.striffsLastDiagramClickReason;
+            delete root.dataset.striffsLastDiagramClickTargetFound;
+            delete root.dataset.striffsLastDiagramClickDiffElementFound;
+          }
+          const routeOk = Boolean(S.routeDiagramComponentId?.(componentId));
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          return {
+            ok: routeOk,
+            status: String(root?.dataset?.striffsLastDiagramClickStatus || ''),
+            componentId: String(root?.dataset?.striffsLastDiagramClickComponent || ''),
+            filePath: String(root?.dataset?.striffsLastDiagramClickFile || ''),
+            diffId: String(root?.dataset?.striffsLastDiagramClickDiffId || ''),
+            reason: String(root?.dataset?.striffsLastDiagramClickReason || ''),
+            currentView: String(root?.dataset?.striffsCurrentView || ''),
+            hash: String(window.location.hash || '')
+          };
+        })()).then((result) => {
+          window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result }, '*');
+        }).catch((e) => {
+          window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: { ok: false, reason: String(e?.message || e) } }, '*');
+        });
       }
     } catch {}
   });
@@ -6029,6 +6739,7 @@
     lastPath = location.pathname;
 
     try {
+      S.cancelEnrichmentPolling?.("navigation");
       if (!isPRFiles(location.pathname)) return;
 
       S.__remoteConfigPostMountApplied = false;
@@ -6077,6 +6788,7 @@
 
   S.teardownNavListeners = function teardownNavListeners() {
     if (!S.__navListenersRegistered) return;
+    S.cancelEnrichmentPolling?.("teardown-nav");
     document.removeEventListener('turbo:load', bootIfNeeded);
     document.removeEventListener('turbo:render', bootIfNeeded);
     document.removeEventListener('pjax:end', bootIfNeeded);
