@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 80 80">
+<defs>
+<filter id="ds" x="-25%" y="-15%" width="150%" height="160%">
+<feGaussianBlur in="SourceAlpha" stdDeviation="1.5" result="shadow"/>
+<feOffset dx="0" dy="1.5" result="offsetShadow"/>
+<feFlood flood-color="#000" flood-opacity=".3" result="color"/>
+<feComposite in="color" in2="offsetShadow" operator="in" result="colorShadow"/>
+<feMerge><feMergeNode in="colorShadow"/><feMergeNode in="SourceGraphic"/></feMerge>
+</filter>
+<filter id="eglow" x="-40%" y="-40%" width="180%" height="180%">
+<feGaussianBlur stdDeviation="2.5"/>
+</filter>
+</defs>
+<!-- Line glow -->
+<g opacity=".5" filter="url(#eglow)">
+<line x1="15" y1="63" x2="40" y2="11" stroke="#8b949e" stroke-width="4" stroke-linecap="round"/>
+<line x1="40" y1="11" x2="65" y2="63" stroke="#8b949e" stroke-width="4" stroke-linecap="round"/>
+</g>
+<!-- Lines -->
+<line x1="15" y1="63" x2="40" y2="11" stroke="#8b949e" stroke-width="3" stroke-linecap="round"/>
+<line x1="40" y1="11" x2="65" y2="63" stroke="#8b949e" stroke-width="3" stroke-linecap="round"/>
+<!-- Nodes - solid colors, no glare -->
+<circle cx="40" cy="11" r="13" fill="#3cb85e" filter="url(#ds)" stroke="#fff" stroke-width="1" stroke-opacity=".3"/>
+<circle cx="15" cy="63" r="13" fill="#d44a5c" filter="url(#ds)" stroke="#fff" stroke-width="1" stroke-opacity=".3"/>
+<circle cx="65" cy="63" r="13" fill="#3874c4" filter="url(#ds)" stroke="#fff" stroke-width="1" stroke-opacity=".3"/>
+</svg>

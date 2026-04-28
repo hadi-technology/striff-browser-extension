@@ -4,31 +4,178 @@
   <meta charset="utf-8" />
   <title>Striffs</title>
   <style>
-    body { font-family: system-ui, sans-serif; padding: 12px; width: 240px; }
-    h3 { margin: 0 0 8px; font-size: 16px; }
-    #status { margin: 6px 0 10px; }
-    button { margin-top: 6px; padding: 6px 10px; cursor: pointer; }
-    .row { margin-top: 10px; }
-    .debug-label { display: flex; align-items: center; gap: 8px; cursor: pointer; }
-    .debug-note { margin: 4px 0 0 24px; color: #666; font-size: 12px; }
-    small { color: #666; display: block; margin-top: 8px; }
+    body {
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, sans-serif;
+      padding: 14px;
+      width: 280px;
+      box-sizing: border-box;
+    }
+    h3 {
+      margin: 0 0 10px;
+      font-size: 16px;
+      font-weight: 600;
+    }
+    #status {
+      margin: 6px 0 10px;
+      font-size: 13px;
+    }
+    .status-ok { color: #1a7f37; }
+    .status-error { color: #d1242f; }
+    label {
+      display: block;
+      margin: 12px 0 6px;
+      font-weight: 500;
+      font-size: 13px;
+    }
+    #ghToken {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 8px;
+      border: 1px solid #d0d7de;
+      border-radius: 6px;
+      font-size: 13px;
+    }
+    .button-row {
+      display: flex;
+      gap: 8px;
+      margin-top: 8px;
+    }
+    button {
+      padding: 8px 12px;
+      cursor: pointer;
+      font-size: 13px;
+      border: 1px solid #d0d7de;
+      border-radius: 6px;
+      background: #f6f8fa;
+      white-space: nowrap;
+    }
+    button:hover {
+      background: #eaeef2;
+    }
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+    button.primary {
+      background: #1a7f37;
+      color: white;
+      border-color: #1a7f37;
+    }
+    button.primary:hover {
+      background: #176f31;
+    }
+    button.danger {
+      color: #d1242f;
+      border-color: #ffa8b8;
+      background: #fff;
+    }
+    button.danger:hover {
+      background: #ffebe9;
+    }
+    .spacer {
+      margin-top: 16px;
+    }
+    .section {
+      margin-top: 16px;
+      padding-top: 12px;
+      border-top: 1px solid #eaeef2;
+    }
+    .section-title {
+      font-weight: 600;
+      font-size: 13px;
+      margin-bottom: 8px;
+    }
+    .section-note {
+      color: #57606a;
+      font-size: 12px;
+      margin-bottom: 8px;
+      line-height: 1.4;
+    }
+    .debug-label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+      font-size: 13px;
+    }
+    .token-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      margin-left: 8px;
+      border: 1px solid #d0d7de;
+      background: #f6f8fa;
+      color: #57606a;
+    }
+    .token-badge.ok {
+      border-color: #1a7f37;
+      color: #1a7f37;
+      background: #eef7f0;
+    }
+    .note-link {
+      color: #0969da;
+      text-decoration: none;
+      font-size: 12px;
+    }
+    .note-link:hover {
+      text-decoration: underline;
+    }
   </style>
 </head>
 <body>
-  <h3>Striffs Extension</h3>
-  <p id="status" aria-live="polite">Checking token...</p>
-  <button id="openOptionsBtn" type="button">Open Settings</button>
-  <button id="resetCacheBtn" type="button">Clear Cache</button>
-  <small>Tip: set your GitHub token in Settings.</small>
-  <div class="row">
+  <h3>
+    Striffs Extension
+    <span id="tokenBadge" class="token-badge" title="Shows whether a token is currently saved">No token set</span>
+  </h3>
+  <p id="status" aria-live="polite" style="display: none;"></p>
+
+  <div id="onboarding" style="display: none; margin-bottom: 12px; padding: 10px; background: #f6f8fa; border-radius: 6px; border: 1px solid #d0d7de;">
+    <div style="font-weight: 600; font-size: 13px; margin-bottom: 6px;">Welcome to Striffs! 👋</div>
+    <div class="section-note" style="margin-bottom: 0;">
+      Striffs generates architecture diagrams for GitHub PRs. Click the <strong>Striffs</strong> button on any PR page to generate a diagram.
+      <br><br>
+      <a href="https://striff.io" target="_blank" rel="noopener noreferrer" class="note-link">Learn more</a> about how Striffs works.
+    </div>
+    <button id="dismissOnboarding" type="button" style="margin-top: 8px; font-size: 12px; padding: 4px 8px;">Got it</button>
+  </div>
+
+  <label for="ghToken">GitHub Token (<a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noreferrer noopener" class="note-link">Create one here</a>)</label>
+  <div class="section-note" style="margin-top: 4px; margin-bottom: 8px;">
+    Required for private repos.
+  </div>
+  <input type="password" id="ghToken" placeholder="Paste token here..." autocomplete="off" />
+  <div class="button-row">
+    <button id="saveBtn" type="button" class="primary">Save</button>
+    <button id="clearBtn" type="button" class="danger">Clear</button>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Cache</div>
+    <div class="section-note">Clear all saved diagrams and Striffs cache/state.</div>
+    <div class="button-row">
+      <button id="resetCacheBtn" type="button">Clear Cache</button>
+    </div>
+  </div>
+
+  <div class="section">
     <label class="debug-label" for="debugToggle">
       <input id="debugToggle" type="checkbox" />
       <span>Debug mode</span>
     </label>
   </div>
 
+  <div class="section" style="text-align: center; border-top: none; padding-top: 8px;">
+    <a id="reportIssueLink" href="https://github.com/hadii-tech/striff-browser-extension/issues" target="_blank" rel="noopener noreferrer" class="note-link" style="font-size: 12px;">
+      Report an issue
+    </a>
+  </div>
+
   <!-- MV3: no inline scripts; use external file -->
   <script src="../src/webext-shim.js"></script>
+  <script src="shared.js"></script>
   <script src="popup.js" defer></script>
 </body>
 </html>

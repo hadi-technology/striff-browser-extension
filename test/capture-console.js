@@ -17,15 +17,24 @@ const EXT_PATH = path.resolve(__dirname, '..');
 const OUTPUT_DIR = '/tmp';
 const AUTO_CLOSE = process.env.AUTO_CLOSE === '1';
 const WAIT_MS = Number(process.env.WAIT_MS || '8000');
+const HEADED = (process.env.HEADED || '') === '1';
+const HEADLESS = HEADED ? false : (process.env.HEADLESS || '1') !== '0';
 
 async function captureConsole(url) {
   const browser = await chromium.launchPersistentContext('', {
-    headless: false,
+    headless: HEADLESS,
     viewport: { width: 1920, height: 1080 },
     args: [
       `--disable-extensions-except=${EXT_PATH}`,
       `--load-extension=${EXT_PATH}`,
       '--enable-logging=stderr',
+      '--disable-gpu',
+      '--disable-dev-shm-usage',
+      '--disable-backgrounding-occluded-windows',
+      '--disable-renderer-backgrounding',
+      '--disable-features=CalculateNativeWinOcclusion,Vulkan',
+      '--no-first-run',
+      '--no-default-browser-check'
     ],
   });
 

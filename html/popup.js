@@ -1,97 +1,193 @@
-// Use local storage for reliability in MV3 popups
-const storageArea = chrome.storage?.local;
-const DEBUG_KEY = "striffsDebug";
+// popup.js — token management, cache clearing, debug mode
 
-// Minimal safe render
-function renderStatus(hasToken, fallbackText) {
+const DEBUG_KEY = "striffsDebug";
+const shared = window.StriffsUiShared;
+
+// Status display
+function setStatus(text, kind = "") {
   const el = document.getElementById("status");
   if (!el) return;
-  if (typeof hasToken === "boolean") {
-    el.textContent = hasToken ? "✅ Token set" : "⚠️ No token set";
-  } else {
-    el.textContent = fallbackText || "⚠️ Could not load token";
-  }
-}
-
-function readTokenOnce() {
-  if (!storageArea) {
-    renderStatus(null, "⚠️ Storage unavailable");
+  if (!text) {
+    el.style.display = "none";
     return;
   }
-  try {
-    storageArea.get(["ghToken"], (items) => {
-      // Callback always fires; items may be {} if key missing
-      const hasToken = !!items.ghToken;
-      renderStatus(hasToken);
-    });
-  } catch (e) {
-    console.error("Storage read error:", e);
-    renderStatus(null, "⚠️ Could not load token");
+  el.textContent = text;
+  el.className = kind === "ok" ? "status-ok" : kind === "error" ? "status-error" : "";
+  el.style.display = "";
+}
+
+function setBusy(busy) {
+  for (const id of ["saveBtn", "clearBtn", "resetCacheBtn"]) {
+    const el = document.getElementById(id);
+    if (el) el.disabled = busy;
   }
 }
 
-function openOptions() {
-  // You have "options_page": "html/options.html" in manifest
-  if (chrome.runtime.openOptionsPage) {
-    chrome.runtime.openOptionsPage();
+function setTokenBadge(has) {
+  const badge = document.getElementById("tokenBadge");
+  if (!badge) return;
+  if (has) {
+    badge.textContent = "Token saved";
+    badge.classList.add("ok");
+    badge.title = "A GitHub token is saved.";
   } else {
-    window.open(chrome.runtime.getURL("html/options.html"));
+    badge.textContent = "No token set";
+    badge.classList.remove("ok");
+    badge.title = "No GitHub token is saved.";
   }
 }
 
-function resetCache() {
-  const statusEl = document.getElementById("status");
-  const setMsg = (msg) => { if (statusEl) statusEl.textContent = msg; };
-
-  setMsg("Clearing caches…");
-  try {
-    chrome.runtime.sendMessage({ type: "clearStriffsCaches" }, (resp) => {
-      if (chrome.runtime.lastError) {
-        setMsg("⚠️ Could not reset cache.");
-        return;
-      }
-      if (resp?.ok) {
-        setMsg("✅ Striffs cache cleared.");
-      } else {
-        setMsg("⚠️ Could not reset cache.");
-      }
-    });
-  } catch (e) {
-    setMsg("⚠️ Could not reset cache.");
-  }
+// Validate token permissions
+async function validateToken(token) {
+  return shared.validateToken(token, {
+    invalidTokenMessage: "Invalid token",
+    genericErrorPrefix: "GitHub error",
+    missingRepoScopeMessage: (scopeList) => `Missing 'repo' scope (has: ${scopeList})`
+  });
 }
 
+// ---- Debug mode ----
 function readDebugOnce() {
-  if (!storageArea) {
-    return;
-  }
-  try {
-    storageArea.get([DEBUG_KEY], (items) => {
-      const enabled = items?.[DEBUG_KEY] === true;
-      const toggle = document.getElementById("debugToggle");
-      if (toggle) toggle.checked = enabled;
-    });
-  } catch (e) {
-    console.error("Debug storage read error:", e);
-  }
+  shared.readFlagOnce(DEBUG_KEY, (enabled) => {
+    const toggle = document.getElementById("debugToggle");
+    if (toggle) toggle.checked = enabled;
+  });
 }
 
 function setDebug(enabled) {
-  if (!storageArea) return;
-  storageArea.set({ [DEBUG_KEY]: !!enabled });
+  shared.writeFlag(DEBUG_KEY, enabled);
 }
 
-document.addEventListener("DOMContentLoaded", () => {
-  // Initial read
-  readTokenOnce();
-  readDebugOnce();
+// ---- Initialization ----
+async function refreshBadgeFromStorage() {
+  const hasToken = await shared.tokenExists();
+  setTokenBadge(hasToken);
+  updateSaveButtonText(hasToken);
+}
 
-  // Live update if Options changes the token while popup is open
+function updateSaveButtonText(hasToken) {
+  const saveBtn = document.getElementById("saveBtn");
+  if (saveBtn) {
+    saveBtn.textContent = hasToken ? "Overwrite" : "Save";
+  }
+}
+
+async function init() {
+  const input = document.getElementById("ghToken");
+  const saveBtn = document.getElementById("saveBtn");
+  const clearBtn = document.getElementById("clearBtn");
+  const resetCacheBtn = document.getElementById("resetCacheBtn");
+  const debugToggle = document.getElementById("debugToggle");
+
+  await refreshBadgeFromStorage();
+  readDebugOnce();
+  setStatus(""); // start clean
+
+  // First-run onboarding
+  const ONBOARDED_KEY = "striffsOnboarded";
+  const onboarding = document.getElementById("onboarding");
+  const dismissOnboarding = document.getElementById("dismissOnboarding");
+
+  if (onboarding && dismissOnboarding) {
+    // Check if user has been onboarded
+    chrome.storage.local.get([ONBOARDED_KEY], (result) => {
+      if (!result[ONBOARDED_KEY]) {
+        onboarding.style.display = "block";
+      }
+    });
+
+    dismissOnboarding.addEventListener("click", () => {
+      chrome.storage.local.set({ [ONBOARDED_KEY]: true });
+      onboarding.style.display = "none";
+    });
+  }
+
+  // Save token
+  saveBtn.addEventListener("click", async () => {
+    const token = (input.value || "").trim();
+    if (!token) {
+      setStatus("Please paste a token.", "error");
+      return;
+    }
+
+    setBusy(true);
+    setStatus("Validating token…");
+
+    const v = await validateToken(token);
+    if (!v.ok) {
+      setStatus(`${v.reason}`, "error");
+      setBusy(false);
+      return;
+    }
+
+    try {
+      await shared.saveToken(token);
+      input.value = ""; // never persist in the field
+      setStatus(`Saved for @${v.login} (${v.type}).`, "ok");
+      await refreshBadgeFromStorage();
+    } catch (e) {
+      console.error("Save error:", e);
+      setStatus("Failed to save token.", "error");
+    } finally {
+      setBusy(false);
+    }
+  });
+
+  // Clear token
+  clearBtn.addEventListener("click", async () => {
+    setBusy(true);
+    try {
+      await shared.clearTokenEverywhere();
+      input.value = "";
+      setStatus("Token cleared.", "ok");
+      await refreshBadgeFromStorage();
+    } catch (e) {
+      console.error("Clear error:", e);
+      setStatus("Failed to clear token.", "error");
+    } finally {
+      setBusy(false);
+    }
+  });
+
+  // Clear cache
+  resetCacheBtn.addEventListener("click", async () => {
+    setBusy(true);
+    setStatus("Clearing caches…");
+    try {
+      const { tabsTouched } = await shared.clearAllCaches();
+      setStatus(`Cleared. Updated ${tabsTouched} tab${tabsTouched === 1 ? "" : "s"}.`, "ok");
+    } catch (e) {
+      console.error("Cache clear error:", e);
+      setStatus("Failed to clear caches.", "error");
+    } finally {
+      setBusy(false);
+    }
+  });
+
+  // Debug toggle
+  if (debugToggle) {
+    debugToggle.addEventListener("change", () => {
+      setDebug(debugToggle.checked);
+    });
+  }
+
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (msg?.type === "tokenStateChanged") {
+      const hasToken = msg?.hasToken === true;
+      setTokenBadge(hasToken);
+      updateSaveButtonText(hasToken);
+      if (hasToken) {
+        setStatus("Token set.", "ok");
+      } else {
+        setStatus(""); // Clear status, don't show "No token set"
+      }
+      return;
+    }
+  });
+
+  // Live update if storage changes while popup is open
   chrome.storage.onChanged.addListener((changes, areaName) => {
     if (areaName !== "local") return;
-    if ("ghToken" in changes) {
-      renderStatus(!!changes.ghToken.newValue);
-    }
     if (DEBUG_KEY in changes) {
       const enabled = changes[DEBUG_KEY]?.newValue === true;
       const toggle = document.getElementById("debugToggle");
@@ -99,24 +195,9 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
 
-  // Wire the button
-  const btn = document.getElementById("openOptionsBtn");
-  if (btn) btn.addEventListener("click", openOptions);
+  // Show initial status
+  const hasToken = await shared.tokenExists();
+  setStatus(hasToken ? "Token set." : "", hasToken ? "ok" : "");
+}
 
-  const resetBtn = document.getElementById("resetCacheBtn");
-  if (resetBtn) resetBtn.addEventListener("click", resetCache);
-
-  const debugToggle = document.getElementById("debugToggle");
-  if (debugToggle) {
-    debugToggle.addEventListener("change", () => {
-      setDebug(debugToggle.checked);
-    });
-  }
-
-  // Fallback retry in rare cases
-  setTimeout(() => {
-    const stillChecking = (document.getElementById("status")?.textContent || "")
-      .includes("Checking token");
-    if (stillChecking) readTokenOnce();
-  }, 250);
-});
+document.addEventListener("DOMContentLoaded", init);

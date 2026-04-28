@@ -1,5 +1,34 @@
+# IDE
 .vscode/
+.idea/
+
+# Test artifacts
 test/.pw-profile/
 .pw-profile/
 test/.pw-*/
 test/.pw-profile-*/
+dist/
+
+# Node
+node_modules/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build
+*.zip
+build/
+dist/
+
+# Local config (test-only)
+html/config-local-test.json
+
+# Dev screenshots
+preview-menu.png
+*.png
+!icons/*.png

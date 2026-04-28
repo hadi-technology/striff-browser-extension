@@ -1,0 +1,69 @@
+{
+  "cookies": [
+    {
+      "name": "_gh_sess",
+      "value": "9YYjMua6nL0Ix3fqy16LOqR7rZ6yAXtvGb1tSAQVmivTMmpZmO2vmqzKfV%2FoKBfnZOZ1zYEZgP%2FlvvrBiRkyDwCY1ZB%2FNBIokN%2BzFSqhSJwSrYIQhBufcG08DwI68cXJSEU5Ut11FsNxXVslgT2skXoON%2Fr0d5PlN7P1yg3dIAdt%2F6VzwF9A4MmFxNMkw5bXdQGujw5jzgmmRC6FI%2BkYmi0Zl3v3MP5HrRdjOmRUjiUQ6ecR%2FjWmmGKbg1mS5oocNlApyrxtXiu06qEi7r4I%2FA%3D%3D--GgDr61HSdcK%2BhU07--ZNnpXf0K%2FdM%2BFV4UxH6fXw%3D%3D",
+      "domain": "github.com",
+      "path": "/",
+      "expires": -1,
+      "httpOnly": true,
+      "secure": true,
+      "sameSite": "Lax"
+    },
+    {
+      "name": "_octo",
+      "value": "GH1.1.50569697.1777328066",
+      "domain": ".github.com",
+      "path": "/",
+      "expires": 1808864072.686113,
+      "httpOnly": false,
+      "secure": true,
+      "sameSite": "Lax"
+    },
+    {
+      "name": "logged_in",
+      "value": "no",
+      "domain": ".github.com",
+      "path": "/",
+      "expires": 1808864072.686268,
+      "httpOnly": true,
+      "secure": true,
+      "sameSite": "Lax"
+    },
+    {
+      "name": "cpu_bucket",
+      "value": "lg",
+      "domain": ".github.com",
+      "path": "/",
+      "expires": -1,
+      "httpOnly": false,
+      "secure": true,
+      "sameSite": "Lax"
+    },
+    {
+      "name": "preferred_color_mode",
+      "value": "light",
+      "domain": ".github.com",
+      "path": "/",
+      "expires": -1,
+      "httpOnly": false,
+      "secure": true,
+      "sameSite": "Lax"
+    }
+  ],
+  "origins": [
+    {
+      "origin": "https://github.com",
+      "localStorage": [
+        {
+          "name": "COPILOT_SAVED_USER_MESSAGE_dashboard_null",
+          "value": ""
+        },
+        {
+          "name": "COPILOT_SAVED_USER_MESSAGE_dashboard_null:expiry",
+          "value": "1777414447077"
+        }
+      ]
+    }
+  ]
+}

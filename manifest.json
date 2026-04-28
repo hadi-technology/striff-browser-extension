@@ -2,15 +2,21 @@
   "manifest_version": 3,
   "name": "Striffs for GitHub",
   "description": "Adds an architectural diff tab to GitHub pull requests.",
-  "version": "1.0.2",
-  "permissions": ["storage", "tabs", "scripting"],
+  "version": "1.0.3",
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  },
+  "permissions": ["storage"],
   "host_permissions": [
     "*://github.com/*",
     "*://*.github.com/*",
     "https://codeload.github.com/*",
+    "https://striff.io/*",
     "https://striffs-config.tor1.cdn.digitaloceanspaces.com/*",
-    "http://localhost/*",
-    "http://127.0.0.1/*"
+    "http://localhost:*/*",
+    "http://127.0.0.1:*/*",
+    "http://localhost:8080/*",
+    "http://127.0.0.1:8080/*"
   ],
   "background": {
     "service_worker": "src/background.js"
@@ -22,27 +28,28 @@
         "*://*.github.com/*"
       ],
       "js": [
-        "lib/fflate.min.js",
         "src/webext-shim.js",
         "src/pr-metadata-utils.js",
+        "src/striffs-config-utils.js",
         "src/striffs.js"
       ],
       "run_at": "document_idle"
-    }
-  ],
-  "web_accessible_resources": [
-    {
-      "resources": [],
-      "matches": ["<all_urls>"]
     }
   ],
   "options_page": "html/options.html",
   "action": {
     "default_popup": "html/popup.html",
     "default_icon": {
-      "16": "icons/clarity-bot16.png",
-      "48": "icons/clarity-bot48.png",
-      "128": "icons/clarity-bot128.png"
+      "16": "icons/striff-16.png",
+      "32": "icons/striff-32.png",
+      "48": "icons/striff-48.png",
+      "128": "icons/striff-128.png"
     }
+  },
+  "icons": {
+    "16": "icons/striff-16.png",
+    "32": "icons/striff-32.png",
+    "48": "icons/striff-48.png",
+    "128": "icons/striff-128.png"
   }
 }

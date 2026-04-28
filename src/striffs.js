@@ -3,10 +3,12 @@
 // Striffs — core (state, logging, messaging, storage, languages)
 (() => {
   const S = (window.Striffs = window.Striffs || {});
+  const ConfigUtils = globalThis.StriffsConfigUtils || {};
 
   // ---------- Constants / State ----------
   S.MAX_UNAUTH_ZIP_SIZE_MB = 50;
   S.CACHE_TTL_MS = 60 * 60 * 1000; // 1h
+  S.ENRICHMENT_POLL_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
   S.TIMEOUTS = Object.freeze({
     message: 7000,
     ping: 1000,
@@ -39,6 +41,7 @@
   S.__aiReviewPollInFlight = false;
   S.__aiReviewLastCompletedReviewId = null;
   S.__aiReviewOperationId = null;
+  S.__aiReviewPollStartedAt = null;
   S.__supportedExtensionsForUi = S.__supportedExtensionsForUi ||
     (Array.isArray(S.DEFAULT_SUPPORTED_EXTS) ? [...S.DEFAULT_SUPPORTED_EXTS] : []);
   S.PAN_CLICK_DEBOUNCE_MS = 250;
@@ -65,6 +68,7 @@
   S.__remoteDisableMessage = null;
   S.__disabledByRemote = false;
   S.__debugEnabled = false;
+  S.__testModeEnabled = false;
   S.__engagementCtx = S.__engagementCtx || {
     sessionId: null,
     operationId: null,
@@ -99,6 +103,29 @@
     }
     return S.__debugEnabled;
   });
+  S.loadTestFlag = S.loadTestFlag || (async () => {
+    try {
+      const store = chrome?.storage?.local;
+      if (!store || typeof store.get !== 'function') {
+        S.__testModeEnabled = false;
+        return S.__testModeEnabled;
+      }
+      const stored = await new Promise((resolve) => {
+        try {
+          const maybe = store.get(['striffsTest'], (res) => resolve(res || null));
+          if (maybe && typeof maybe.then === 'function') {
+            maybe.then((res) => resolve(res || null)).catch(() => resolve(null));
+          }
+        } catch {
+          resolve(null);
+        }
+      });
+      S.__testModeEnabled = stored?.striffsTest === true;
+    } catch {
+      S.__testModeEnabled = false;
+    }
+    return S.__testModeEnabled;
+  });
   S.isDebug = S.isDebug || (() => {
     try {
       if (window.__STRIFFS_DEBUG === true) return true;
@@ -108,13 +135,7 @@
       return false;
     }
   });
-  S.isTest = S.isTest || (() => {
-    try {
-      return localStorage.getItem('striffsTest') === '1';
-    } catch {
-      return false;
-    }
-  });
+  S.isTest = S.isTest || (() => S.__testModeEnabled === true);
   // ---------- GitHub DOM selectors (centralized for drift resilience) ----------
   const SELECTORS = S.SELECTORS = S.SELECTORS || Object.freeze({
     toolbar: [
@@ -557,6 +578,8 @@
     try {
       document.querySelectorAll?.(".striffs-note-feedback-layer").forEach((layer) => layer.remove?.());
     } catch {}
+    // Also clear the votes cache when fully clearing feedback
+    S.__reviewNoteVotes?.clear?.();
   };
 
   S.positionReviewNoteFeedback = () => {
@@ -569,31 +592,35 @@
       layer.className = "striffs-note-feedback-layer";
       wrap.appendChild(layer);
     }
-    layer.innerHTML = "";
+    // Only clear shells that haven't been voted on (preserve "thank you" messages)
+    const existingShells = layer.querySelectorAll(".striffs-note-feedback");
+    existingShells.forEach(shell => {
+      if (!shell.hasAttribute("data-voted")) {
+        shell.remove();
+      }
+    });
     const zoom = Number(S.__striffsZoom) || 1;
     const notes = S.getReviewNoteEntities?.(svg) || [];
     for (const note of notes) {
       const qn = String(note.getAttribute?.("data-qualified-name") || "").trim();
       const noteId = S.extractReviewNoteId?.(qn);
       if (!noteId) continue;
+      // Skip if we already have a shell for this note (including thank you messages)
+      if (layer.querySelector(`[data-note-qualified-name="${qn}"]`)) {
+        continue;
+      }
       try {
         const bbox = note.getBBox?.();
         if (!bbox) continue;
         const shell = document.createElement("div");
         shell.className = "striffs-note-feedback";
         shell.setAttribute("data-note-qualified-name", qn);
-        // Position below the note box, pushed towards center
-        // Mix of SVG offset (scales with zoom) and screen offset (fixed)
-        const svgOffset = 45; // Scales with zoom
-        const screenOffset = 25; // Fixed screen pixels
-        const verticalOffset = 4;
-        // Position: SVG coordinates scaled, minus fixed screen offset
-        shell.style.left = `${(bbox.x + bbox.width - svgOffset) * zoom - screenOffset}px`;
+        // Position below the note box, aligned to its right edge.
+        const verticalOffset = 8;
+        shell.style.left = `${(bbox.x + bbox.width) * zoom}px`;
         shell.style.top = `${(bbox.y + bbox.height + verticalOffset) * zoom}px`;
-        // Scale with zoom - using transform for better scaling
-        const scale = Math.max(0.8, Math.min(zoom, 2.0));
-        shell.style.transform = `scale(${scale})`;
-        shell.style.transformOrigin = 'top left';
+        shell.style.transform = `translate(-100%, 0) scale(${Math.max(0.8, Math.min(zoom, 2.0))})`;
+        shell.style.transformOrigin = 'top right';
         shell.setAttribute("data-note-id", noteId);
 
         const currentVote = S.__reviewNoteVotes?.get?.(noteId) || null;
@@ -601,6 +628,7 @@
         if (currentVote) continue;
 
         const noteText = S.extractReviewNoteText?.(note) || "";
+
         const createVoteButton = (vote, icon, label) => {
           const btn = document.createElement("button");
           btn.type = "button";
@@ -621,8 +649,25 @@
               noteText,
               noteQualifiedName: qn
             });
-            // Hide the feedback buttons after clicking
-            shell.remove();
+
+            // Hide all buttons and show thank you
+            const buttons = shell.querySelectorAll(".striffs-note-feedback-btn");
+            buttons.forEach(b => b.style.display = "none");
+
+            const thanks = document.createElement("span");
+            thanks.className = "striffs-note-feedback-thanks";
+            thanks.textContent = "Thanks for the feedback!";
+            shell.appendChild(thanks);
+
+            // Mark this shell as voted so it won't be removed on reposition
+            shell.setAttribute("data-voted", "true");
+
+            // Fade out and remove after a short delay
+            setTimeout(() => {
+              shell.style.transition = "opacity 0.3s ease";
+              shell.style.opacity = "0";
+              setTimeout(() => shell.remove(), 300);
+            }, 1500);
           });
           return btn;
         };
@@ -815,8 +860,8 @@
 
       return svg.outerHTML;
     } catch (e) {
-      S.cwarn?.('SVG sanitization failed, using original', e);
-      return svgString; // Fail safely by returning original
+      S.cwarn?.('SVG sanitization failed', e);
+      return '';
     }
   };
 
@@ -826,8 +871,16 @@
       S.__debugEnabled = changes?.striffsDebug?.newValue === true;
     });
   } catch {}
+  try {
+    chrome?.storage?.onChanged?.addListener?.((changes, areaName) => {
+      if (areaName !== 'local' || !changes || !Object.prototype.hasOwnProperty.call(changes, 'striffsTest')) return;
+      S.__testModeEnabled = changes?.striffsTest?.newValue === true;
+      S.syncTestHarnessState?.();
+    });
+  } catch {}
 
   S.loadDebugFlag?.();
+  S.loadTestFlag?.().then(() => S.syncTestHarnessState?.()).catch(() => {});
 
   S.emitEngagementEvent = (eventType, eventPayload = {}, metadataPayload = {}) => {
     try {
@@ -1152,6 +1205,7 @@
       S.__aiReviewPollTimer = null;
     }
     S.__aiReviewPollInFlight = false;
+    S.__aiReviewPollStartedAt = null;
     if (reason && S.isDebug?.()) {
       S.cinfo?.("[Striffs] Enrichment polling cancelled", { reason });
     }
@@ -1417,7 +1471,7 @@
     } catch (err) {
       const errMsg = err?.message || err;
       if (retryable(errMsg)) {
-        await S.waitForBackgroundReady({ attempts: 4, delayMs: 150 });
+        await S.waitForBackgroundReady({ attempts: 8, delayMs: 200 });
         return await send();
       }
       throw err;
@@ -1435,40 +1489,36 @@
 
   S.getStoredToken = async () => {
     try {
-      const l = await chrome.storage.local.get(["ghToken"]);
-      if (l && l.ghToken) return l.ghToken;
-    } catch { }
-    try {
-      const s = await chrome.storage.sync.get(["ghToken"]);
-      if (s && s.ghToken) return s.ghToken;
+      const resp = await S.bgRequest?.({ type: "getToken" }, 5000);
+      if (resp?.ok === true && typeof resp.token === 'string' && resp.token.trim()) return resp.token.trim();
     } catch { }
     return null;
   };
 
-  S.parseLangsToExts = (text) => {
+  S.parseLangsToExts = ConfigUtils.parseLangsToExts || ((text) => {
     const langs = String(text || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
     const langToExt = {
       java: "java", golang: "go", go: "go", javascript: "js", typescript: "ts", python: "py",
       csharp: "cs", cpp: "cpp", cplusplus: "cpp", ruby: "rb", rust: "rs", php: "php", kotlin: "kt"
     };
     return langs.map(l => langToExt[l]).filter(Boolean);
-  };
+  });
 
-  S.normalizeExtensions = (exts) => {
+  S.normalizeExtensions = ConfigUtils.normalizeExtensions || ((exts) => {
     if (!Array.isArray(exts)) return [];
     return exts
       .map((e) => String(e || '').trim().toLowerCase())
       .map((e) => (e.startsWith('.') ? e.slice(1) : e))
       .filter(Boolean);
-  };
+  });
 
-  S.extractSupportedExtensionsFromConfig = (cfg) => {
+  S.extractSupportedExtensionsFromConfig = ConfigUtils.extractSupportedExtensionsFromConfig || ((cfg) => {
     if (!cfg) return [];
     const byExt = S.normalizeExtensions(cfg.supportedExtensions);
     if (byExt.length) return byExt;
     const byLang = typeof cfg.supportedLanguages === 'string' ? S.parseLangsToExts(cfg.supportedLanguages) : [];
     return S.normalizeExtensions(byLang);
-  };
+  });
 })();
 
 
@@ -1613,7 +1663,7 @@
         const hasSupported = S.checkIfRelevantFilesExist(filesList, S.__supportedExtensionsForUi);
         if (hasSupported) {
             if (lastState.disabled || lastState.neutral) {
-                S.updateStriffButton({ tooltip: "Click to generate Striffs" });
+                S.updateStriffButton({ tooltip: "Generate" });
             }
         } else {
             S.updateStriffButton({ disabled: true, neutral: true, tooltip: "No supported files in PR" });
@@ -1829,6 +1879,12 @@
             // Using 'project' icon - better represents architecture/structure diagrams
             graph: 'M1.75 1h12.5c.966 0 1.75.784 1.75 1.75v10.5A1.75 1.75 0 0 1 14.25 15H1.75A1.75 1.75 0 0 1 0 13.25V2.75C0 1.784.784 1 1.75 1ZM1.5 2.75v10.5c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25V2.75a.25.25 0 0 0-.25-.25H1.75a.25.25 0 0 0-.25.25Zm7.5 3.75a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Zm-5 0a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Zm10 0a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Zm-10 5a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Zm5 0a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Zm5 0a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Z',
             workflow: 'M1.75 1h12.5c.966 0 1.75.784 1.75 1.75v10.5A1.75 1.75 0 0 1 14.25 15H1.75A1.75 1.75 0 0 1 0 13.25V2.75C0 1.784.784 1 1.75 1ZM1.5 2.75v10.5c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25V2.75a.25.25 0 0 0-.25-.25H1.75a.25.25 0 0 0-.25.25Zm7.5 3.75a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Zm-5 0a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Zm10 0a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Zm-10 5a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Zm5 0a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Zm5 0a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5Z',
+            // 'server' icon for component architecture diagrams
+            server: 'M1.75 1h12.5c.966 0 1.75.784 1.75 1.75v3.5A1.75 1.75 0 0 1 14.25 8H1.75A1.75 1.75 0 0 1 0 6.25v-3.5C0 1.784.784 1 1.75 1ZM1.5 2.75v3.5c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25v-3.5a.25.25 0 0 0-.25-.25H1.75a.25.25 0 0 0-.25.25Zm0 5.5v3.5c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25v-3.5a.25.25 0 0 0-.25-.25H1.75a.25.25 0 0 0-.25.25ZM3.75 4a.75.75 0 1 1 0 1.5.75.75 0 0 1 0-1.5Zm0 6a.75.75 0 1 1 0 1.5.75.75 0 0 1 0-1.5Z',
+            // GitHub diff icon for Diffs button
+            diff: 'M10.5 6.5a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0zm.936 2.052a3.998 3.998 0 0 0 1.148-3.07 4.002 4.002 0 0 0-7.768-1.557.75.75 0 0 1-1.38-.585A5.502 5.502 0 0 1 13.25 5.6a5.5 5.5 0 0 1-1.584 4.228l-.38.352-.76.703-.702.649a3.001 3.001 0 0 0-.913 1.87.75.75 0 0 1-1.498-.112 4.502 4.502 0 0 1 1.366-2.794l.76-.703.368-.34a2.5 2.5 0 0 0-3.37-3.656.75.75 0 0 1-.898-1.203 4.001 4.001 0 0 1 5.593 5.746l.252.231z',
+            // Striffs icon - represents structural changes/architecture
+            striffs: 'M1.75 1h12.5c.966 0 1.75.784 1.75 1.75v10.5A1.75 1.75 0 0 1 14.25 15H1.75A1.75 1.75 0 0 1 0 13.25V2.75C0 1.784.784 1 1.75 1ZM1.5 2.75v10.5c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25V2.75a.25.25 0 0 0-.25-.25H1.75a.25.25 0 0 0-.25.25Zm3.5 2.75a.75.75 0 0 1 .75.75v1.5h1.5a.75.75 0 0 1 0 1.5H5.5v1.5a.75.75 0 0 1-1.5 0v-1.5H2.5a.75.75 0 0 1 0-1.5h1.5v-1.5A.75.75 0 0 1 5 5.5Zm5.5 0a.75.75 0 0 1 .75-.75h2a.75.75 0 0 1 0 1.5h-2a.75.75 0 0 1-.75-.75Zm0 3a.75.75 0 0 1 .75-.75h2a.75.75 0 0 1 0 1.5h-2a.75.75 0 0 1-.75-.75Z',
 
             // status icons
             'check-circle': 'M8 15A7 7 0 1 0 8 1a7 7 0 0 0 0 14Zm3.78-8.72a.75.75 0 0 1 0 1.06l-4 4a.75.75 0 0 1-1.06 0l-2-2a.75.75 0 1 1 1.06-1.06L7 9.94l3.22-3.22a.75.75 0 0 1 1.06 0Z',
@@ -1841,6 +1897,18 @@
             'thumbsup': 'M8.347 1.631A1.75 1.75 0 0 1 10 3.375V6h2.68a1.82 1.82 0 0 1 1.79 2.146l-.765 4.593A2.75 2.75 0 0 1 11 15H5.72a2.75 2.75 0 0 1-1.887-.75l-.59-.554A1.75 1.75 0 0 1 2.7 12.42V7.75C2.7 6.784 3.484 6 4.45 6H6.5V3.92c0-.354.107-.7.307-.992ZM4.45 7.5a.25.25 0 0 0-.25.25v4.67c0 .07.03.136.08.184l.591.554c.237.222.549.342.872.342H11c.61 0 1.13-.439 1.23-1.04l.766-4.593a.32.32 0 0 0-.316-.377H9.25A.75.75 0 0 1 8.5 6.75V3.375a.25.25 0 0 0-.472-.121l-1.22 2.135a.75.75 0 0 1-.652.381Z',
             'thumbsdown': 'M7.653 14.369A1.75 1.75 0 0 1 6 12.625V10H3.32A1.82 1.82 0 0 1 1.53 7.854l.765-4.593A2.75 2.75 0 0 1 5 1h5.28c.695 0 1.364.266 1.887.75l.59.554c.356.333.558.799.558 1.276v4.67c0 .966-.784 1.75-1.75 1.75H9.5v2.08c0 .354-.107.7-.307.992ZM5 2.5c-.61 0-1.13.439-1.23 1.04l-.766 4.593a.32.32 0 0 0 .316.377H6.75A.75.75 0 0 1 7.5 9.25v3.375a.25.25 0 0 0 .472.121l1.22-2.135a.75.75 0 0 1 .652-.381h1.706a.25.25 0 0 0 .25-.25V3.58a.252.252 0 0 0-.08-.185l-.591-.554a1.25 1.25 0 0 0-.872-.341Z'
         };
+
+        // Custom SVG markup for special icons (returns full SVG instead of path data)
+        const customSvgMap = {
+            // GitHub logo mark for diff button (filled version)
+            github: `<svg aria-hidden="true" height="16" viewBox="0 0 16 16" width="16" style="vertical-align: text-bottom; fill: #24292f; margin-right: 6px;"><path d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"></path></svg>`,
+            // Striff.io icon - node graph with colored orbs (green, red, blue) from striff-io repo
+            striffs: `<svg aria-hidden="true" height="16" viewBox="0 0 16 16" width="16" style="vertical-align: text-bottom;"><circle cx="8" cy="4" r="2.5" fill="#3cb85e"/><circle cx="4.8" cy="11.2" r="2.5" fill="#d44a5c"/><circle cx="11.2" cy="11.2" r="2.5" fill="#3874c4"/><path d="M4.8 11.2L8 4M11.2 11.2L8 4" stroke="#c9a830" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>`
+        };
+
+        if (customSvgMap[name]) {
+            return customSvgMap[name];
+        }
         const d = pathMap[name] || pathMap.file;
         return `<svg aria-hidden="true" height="16" viewBox="0 0 16 16" width="16" style="vertical-align: text-bottom; fill: currentColor;"><path d="${d}"></path></svg>`;
     };
@@ -1854,6 +1922,7 @@
         btn.type = 'button';
         btn.className = `btn btn-sm striffs-local-btn ${extraClass}`.trim();
         btn.style.margin = '0';
+        btn.style.position = 'relative';
         btn.innerHTML = labelHtml;
         btn.addEventListener('click', (e) => { e.preventDefault(); onClick?.(e); });
         parent.appendChild(btn);
@@ -1953,6 +2022,12 @@
                   S.applyNoChangesUiState?.("No changes were found");
                   return;
               }
+              // Early check for private repo without token
+              const token = await S.getStoredToken?.();
+              if (!token && S.isPrivateRepo?.()) {
+                  S.updateStriffButton({ neutral: true, disabled: true, tooltip: "Token required" });
+                  return;
+              }
               // If diagram is ready, do not refetch; just show Striffs.
               if (S.__striffsReady && S.__striffsSvg) {
                   if ((S.__aiReviewStatus === "PENDING" || S.__aiReviewStatus === "RUNNING") && !S.__aiReviewPollTimer) {
@@ -1967,7 +2042,7 @@
             if (!S.__striffsReady || !S.__striffsSvg) {
                 S.updateStriffButton({
                     loading: true,
-                    tooltip: "Generating Striffs…",
+                    tooltip: "Generating",
                     phase: "Analyzing"
                 });
 
@@ -1990,13 +2065,13 @@
         S.ensureBtn(
             slot,
             'diffs-btn',
-            `<span class="striffs-local-btn-label">Diffs</span>`,
+            `${S.octicon('github')} <span class="striffs-local-btn-label">Diffs</span>`,
             onDiffClick
         );
         S.ensureBtn(
             slot,
             'striffs-btn',
-            `<span class="striffs-local-btn-label">Striffs</span>`,
+            `${S.octicon('striffs')} <span class="striffs-local-btn-label">Striffs</span>`,
             onStriffClick
         );
 
@@ -2052,29 +2127,177 @@
         btn.title = tooltip || "";
 
         const iconWrap = (svg, colorVar) =>
-            `<span class="striffs-status" style="display:inline-flex;align-items:center;justify-content:center;color: var(${colorVar});">${svg}</span>`;
+            `<span class="striffs-status" style="display:inline-flex;align-items:center;justify-content:center;color: var(${colorVar});font-size:0.85em;">${svg}</span>`;
+        const loadingIndicator = (label) =>
+            `<span class="striffs-running-indicator" aria-hidden="true"><span class="striffs-running-indicator__dot"></span></span><span class="striffs-local-btn-label striffs-shine-label">${label}<span class="striffs-anim-dots"><span>.</span><span>.</span><span>.</span></span></span>`;
+
+        // Helper to ensure progress bar exists and is animating
+        const ensureProgressBar = () => {
+            let progressWrap = btn.querySelector('.striffs-progress-wrap');
+            let progressBar = btn.querySelector('.striffs-progress-bar');
+            if (!progressWrap || !progressBar) {
+                // Only create if it doesn't exist - never recreate
+                if (progressWrap) progressWrap.remove(); // Clean up incomplete state
+                progressWrap = document.createElement('div');
+                progressWrap.className = 'striffs-progress-wrap';
+                progressBar = document.createElement('div');
+                progressBar.className = 'striffs-progress-bar animating';
+                progressWrap.appendChild(progressBar);
+                btn.appendChild(progressWrap);
+            }
+            // Don't reset animation if it's already animating
+            if (!progressBar.classList.contains('animating')) {
+                progressBar.classList.add('animating');
+            }
+            return { progressWrap, progressBar };
+        };
+
+        // Helper to update button content while preserving progress bar
+        const updateButtonContent = (html) => {
+            const progressWrap = btn.querySelector('.striffs-progress-wrap');
+            if (progressWrap) {
+                // Store reference to existing progress bar
+                const progressBar = progressWrap.querySelector('.striffs-progress-bar');
+                const wasAnimating = progressBar?.classList.contains('animating');
+
+                // Temporarily remove progress wrap
+                progressWrap.remove();
+                btn.innerHTML = html;
+
+                // Re-add the existing progress bar (preserves animation state)
+                btn.appendChild(progressWrap);
+
+                // Ensure animating class is preserved
+                if (wasAnimating && !progressBar.classList.contains('animating')) {
+                    progressBar.classList.add('animating');
+                }
+            } else {
+                btn.innerHTML = html;
+            }
+        };
+
+        // Helper to remove progress bar
+        const removeProgressBar = () => {
+            const progressWrap = btn.querySelector('.striffs-progress-wrap');
+            if (progressWrap) {
+                progressWrap.remove();
+            }
+        };
+
+        // Helper to complete progress bar
+        const completeProgressBar = () => {
+            const progressBar = btn.querySelector('.striffs-progress-bar');
+            if (progressBar && !progressBar.classList.contains('complete')) {
+                progressBar.classList.add('complete');
+                // Remove progress bar after animation completes
+                setTimeout(() => removeProgressBar(), 300);
+            }
+        };
 
         if (loading) {
-            const phaseText = phase ? ` ${phase}` : " Loading...";
-            btn.innerHTML =
-                `<span class="loader" style="display:inline-block;width:16px;height:16px;border:2px solid var(--borderColor-muted, var(--color-border-default, #ccc));border-top:2px solid var(--accent-fg, #0969da);border-radius:50%;animation:spin .8s linear infinite;vertical-align:middle;margin-right:8px;"></span>${phaseText}`;
+            // Phase messages - only "Generating" uses rotating Claude-style words
+            const phaseMessages = {
+                "Analyzing": "Analyzing",
+                "Fetching": "Fetching",
+                "Generating": "Cooking",
+                "Enriching": "Enriching",
+                "Loading": "Loading",
+                "default": "Loading"
+            };
+
+            // Claude-style thinking words for Generating phase
+            const generatingWords = [
+                "Cooking",
+                "Thinking",
+                "Pondering",
+                "Reasoning",
+                "Crafting",
+                "Building",
+                "Preparing",
+                "Considering",
+                "Deliberating"
+            ];
+
+            // Initialize word rotation state
+            if (!S.__generatingWordIndex) S.__generatingWordIndex = 0;
+            if (!S.__generatingWordStartTime) S.__generatingWordStartTime = Date.now();
+
+            let phaseText = phase ? (phaseMessages[phase] || phaseMessages.default) : phaseMessages.default;
+
+            // For Generating phase, use rotating words and set up interval
+            if (phase === "Generating") {
+                // Calculate current word based on elapsed time
+                const elapsed = Date.now() - S.__generatingWordStartTime;
+                const wordIndex = Math.floor(elapsed / 7000) % generatingWords.length;
+                phaseText = generatingWords[wordIndex];
+
+                // Start rotation interval if not already running
+                if (!S.__generatingInterval) {
+                    S.__generatingInterval = setInterval(() => {
+                        S.__generatingWordIndex = (S.__generatingWordIndex + 1) % generatingWords.length;
+                        const label = btn.querySelector('.striffs-local-btn-label');
+                        if (label) {
+                            label.innerHTML = generatingWords[S.__generatingWordIndex] + '<span class="striffs-anim-dots"><span>.</span><span>.</span><span>.</span></span>';
+                        }
+                    }, 7000);
+                }
+            } else {
+                // Not in Generating phase - clear rotation interval
+                if (S.__generatingInterval) {
+                    clearInterval(S.__generatingInterval);
+                    S.__generatingInterval = null;
+                }
+                // Reset rotation state when not in Generating phase
+                S.__generatingWordIndex = 0;
+                S.__generatingWordStartTime = null;
+            }
+
+            // Ensure progress bar exists and is animating
+            ensureProgressBar();
+
+            // Check if we have the loading indicator
+            const currentIndicator = btn.querySelector('.striffs-running-indicator');
+            const currentLabel = btn.querySelector('.striffs-local-btn-label');
+
+            if (currentIndicator && currentLabel) {
+                // Both exist, just update the label text
+                currentLabel.innerHTML = phaseText + '<span class="striffs-anim-dots"><span>.</span><span>.</span><span>.</span></span>';
+            } else {
+                // Missing indicator or label - recreate full loading content while preserving progress bar
+                updateButtonContent(loadingIndicator(phaseText));
+            }
             return;
         }
 
+        // Clear rotation interval when not in loading state
+        if (S.__generatingInterval) {
+            clearInterval(S.__generatingInterval);
+            S.__generatingInterval = null;
+        }
+
         if (enriching) {
-            btn.innerHTML =
-                `<span class="loader" style="display:inline-block;width:16px;height:16px;border:2px solid var(--borderColor-muted, var(--color-border-default, #ccc));border-top:2px solid var(--success-fg, var(--color-success-fg, #1a7f37));border-radius:50%;animation:spin .8s linear infinite;vertical-align:middle;margin-right:8px;"></span><span class="striffs-local-btn-label">Enriching</span>`;
+            ensureProgressBar();
+            const currentIndicator = btn.querySelector('.striffs-running-indicator');
+            const currentLabel = btn.querySelector('.striffs-local-btn-label');
+
+            if (currentIndicator && currentLabel) {
+                currentLabel.textContent = "Enriching";
+            } else {
+                updateButtonContent(loadingIndicator("Enriching"));
+            }
             return;
         }
 
         if (failure) {
             btn.classList.add('is-error');
+            removeProgressBar();
             const icon = iconWrap(S.octicon('alert'), '--color-danger-fg, #d1242f');
             btn.innerHTML = `${icon}<span class="striffs-local-btn-label">Striffs</span>`;
             return;
         }
 
         if (neutral) {
+            removeProgressBar();
             const icon = iconWrap(S.octicon('circle-slash'), '--fgColor-muted, #6e7781');
             btn.innerHTML = `${icon}<span class="striffs-local-btn-label">Striffs</span>`;
             return;
@@ -2082,17 +2305,33 @@
 
         if (success) {
             const icon = iconWrap(S.octicon('check-circle'), '--success-fg, var(--color-success-fg, #1a7f37)');
+            // Complete the progress bar first
+            const existingProgress = btn.querySelector('.striffs-progress-bar');
+            if (existingProgress && !existingProgress.classList.contains('complete')) {
+                completeProgressBar();
+                // Update to success state after progress bar completes
+                setTimeout(() => {
+                    if (btn) {
+                        removeProgressBar();
+                        btn.innerHTML = `${icon}<span class="striffs-local-btn-label">Striffs</span>`;
+                    }
+                }, 300);
+                return;
+            }
+            removeProgressBar();
             btn.innerHTML = `${icon}<span class="striffs-local-btn-label">Striffs</span>`;
             return;
         }
 
         if (disabled) {
+            removeProgressBar();
             const icon = iconWrap(S.octicon('circle-slash'), '--fgColor-muted, #6e7781');
             btn.innerHTML = `${icon}<span class="striffs-local-btn-label">Striffs</span>`;
             return;
         }
 
-        btn.innerHTML = `<span class="striffs-local-btn-label">Striffs</span>`;
+        // Default state - show striffs icon
+        btn.innerHTML = `${S.octicon('striffs')} <span class="striffs-local-btn-label">Striffs</span>`;
     };
 
     // --- Global toast helpers (theme-aware) ---
@@ -2108,15 +2347,37 @@
         return t;
     };
 
-    S.toast = function toast(message, type = 'info', { timeoutMs = 7500 } = {}) {
+    S.toast = function toast(message, type = 'info', { timeoutMs } = {}) {
         S.ensureGlobalToast();
+
+        // Error/warning toasts should persist longer (15-20s) as they may require user action
+        const defaultTimeout = (type === 'error' || type === 'warning') ? 18000 : 7500;
+        const actualTimeout = timeoutMs != null ? timeoutMs : defaultTimeout;
 
         const el = document.createElement('div');
         el.className = `striffs-toast-item striffs-toast-${type}`;
-        el.innerHTML = `
-    <span class="striffs-toast-dot" aria-hidden="true"></span>
-    <div class="striffs-toast-msg">${message}</div>
-  `;
+        const dot = document.createElement('span');
+        dot.className = 'striffs-toast-dot';
+        dot.setAttribute('aria-hidden', 'true');
+        const msgEl = document.createElement('div');
+        msgEl.className = 'striffs-toast-msg';
+        msgEl.textContent = String(message || '');
+        el.appendChild(dot);
+        el.appendChild(msgEl);
+
+        // For error messages, add a close button since they persist longer
+        if (type === 'error' || type === 'warning') {
+          const closeBtn = document.createElement('span');
+          closeBtn.className = 'striffs-toast-close';
+          closeBtn.innerHTML = '×';
+          closeBtn.title = 'Dismiss';
+          closeBtn.addEventListener('click', (e) => {
+              e.stopPropagation();
+              clearTimeout(removeTimeout);
+              remove();
+          });
+          el.appendChild(closeBtn);
+        }
 
         const host = document.getElementById('striffs-global-toast');
         host.appendChild(el);
@@ -2127,8 +2388,8 @@
             el.classList.remove('show');
             setTimeout(() => el.remove(), 240);
         };
-        const t = setTimeout(remove, Math.max(7500, timeoutMs));
-        el.addEventListener('click', () => { clearTimeout(t); remove(); }, { passive: true });
+        const removeTimeout = setTimeout(remove, actualTimeout);
+        el.addEventListener('click', () => { clearTimeout(removeTimeout); remove(); }, { passive: true });
     };
 
     // Compute and set #striff-diagram-view height (~80% viewport)
@@ -2143,7 +2404,7 @@
         const style = document.createElement("style");
         style.id = "striffs-style";
         style.textContent = `
-  @keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}
+  @keyframes striffsRunningRingSpin{from{transform:rotate(0)}to{transform:rotate(360deg)}}
 
   .striffs-local-btn {
     color: var(--fgColor-default, var(--color-fg-default, #24292f));
@@ -2172,6 +2433,134 @@
     cursor: not-allowed;
     filter: grayscale(0.2);
   }
+  .striffs-running-indicator{
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    margin-right: 8px;
+    flex: 0 0 16px;
+  }
+  .striffs-running-indicator::before{
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: 50%;
+    border: 2px solid transparent;
+    border-top-color: var(--color-attention-fg, #9a6700);
+    border-right-color: color-mix(in srgb, var(--color-attention-fg, #9a6700) 58%, transparent);
+    animation: striffsRunningRingSpin .9s linear infinite;
+  }
+  .striffs-running-indicator__dot{
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--color-attention-fg, #9a6700);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-attention-subtle, #fff8c5) 65%, transparent);
+  }
+  @media (prefers-reduced-motion: reduce){
+    .striffs-running-indicator::before{
+      animation-duration: 1.8s;
+    }
+  }
+
+  /* Horizontal shine effect on loading label */
+  .striffs-shine-label{
+    position: relative;
+    overflow: hidden;
+  }
+  .striffs-shine-label::before{
+    content: "";
+    position: absolute;
+    top: 0;
+    left: -100%;
+    width: 50%;
+    height: 100%;
+    background: linear-gradient(90deg,
+      transparent 0%,
+      rgba(255,255,255,0.4) 45%,
+      rgba(255,255,255,0.7) 50%,
+      rgba(255,255,255,0.4) 55%,
+      transparent 100%
+    );
+    animation: striffsShine 2s ease-in-out infinite;
+    pointer-events: none;
+  }
+  @keyframes striffsShine{
+    0%{
+      left: -100%;
+    }
+    50%, 100%{
+      left: 150%;
+    }
+  }
+
+  /* Animated three dots for loading labels */
+  .striffs-anim-dots{
+    display: inline-flex;
+    width: 1.5em;
+    margin-left: 1px;
+  }
+  .striffs-anim-dots span{
+    animation: striffsDotFade 1.4s infinite;
+    opacity: 0;
+  }
+  .striffs-anim-dots span:nth-child(1){
+    animation-delay: 0s;
+  }
+  .striffs-anim-dots span:nth-child(2){
+    animation-delay: 0.2s;
+  }
+  .striffs-anim-dots span:nth-child(3){
+    animation-delay: 0.4s;
+  }
+  @keyframes striffsDotFade{
+    0%, 20%{
+      opacity: 0;
+    }
+    40%{
+      opacity: 1;
+    }
+    60%, 100%{
+      opacity: 0;
+    }
+  }
+
+  /* Progress bar under striffs button */
+  .striffs-progress-wrap {
+    position: absolute;
+    bottom: -3px;
+    left: 0;
+    right: 0;
+    height: 3px;
+    overflow: hidden;
+    border-radius: 0 0 6px 6px;
+  }
+  .striffs-progress-bar {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, var(--color-accent-fg, #0969da), var(--color-success-fg, #1a7f37));
+    border-radius: 0 0 6px 6px;
+    transition: width 0.3s ease-out;
+  }
+  .striffs-progress-bar.animating {
+    animation: striffsProgress 15s ease-out forwards;
+  }
+  .striffs-progress-bar.complete {
+    width: 100% !important;
+    animation: none;
+    transition: width 0.5s ease-out;
+  }
+  @keyframes striffsProgress {
+    0% { width: 0%; }
+    80% { width: 80%; }
+    100% { width: 80%; }
+  }
+  .striffs-local-btn.is-active .striffs-progress-bar {
+    background: linear-gradient(90deg, var(--color-success-fg, #1a7f37), var(--color-accent-fg, #0969da));
+  }
 
   #striffs-global-toast {
     position: fixed;
@@ -2187,41 +2576,65 @@
     pointer-events: auto;
     display: flex;
     align-items: center;
-    gap: 10px;
-    max-width: min(640px, 92vw);
-    padding: 12px 14px;
-    border-radius: 10px;
-    box-shadow: 0 4px 16px rgba(0,0,0,.22);
-    border: 1px solid var(--borderColor-muted, var(--color-border-default, #d0d7de));
+    gap: 12px;
+    max-width: min(480px, 92vw);
+    padding: 14px 18px;
+    border-radius: 12px;
+    box-shadow: 0 8px 32px rgba(0,0,0,.12), 0 2px 8px rgba(0,0,0,.06);
+    border: 1px solid transparent;
     background: var(--bgColor-default, var(--color-canvas-default, #fff));
     color: var(--fgColor-default, var(--color-fg-default, #24292f));
-    font-weight: 700;
-    transform: translateY(-8px);
+    font-size: 13px;
+    font-weight: 450;
+    letter-spacing: 0.01em;
+    line-height: 1.45;
+    transform: translateX(20px);
     opacity: 0;
-    transition: opacity .2s ease, transform .2s ease, background-color .18s ease, border-color .18s ease;
-    font-size: 14px;
-    font-weight: 500;
+    transition: opacity .25s cubic-bezier(.4,0,.2,1), transform .25s cubic-bezier(.4,0,.2,1);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
   }
   .striffs-toast-item.show {
-    transform: translateY(0);
+    transform: translateX(0);
     opacity: 1;
+  }
+  .striffs-toast-msg {
+    flex: 1;
+    min-width: 0;
   }
 
   .striffs-toast-dot {
-    width: 10px; height: 10px; border-radius: 50%;
-    flex: 0 0 10px;
+    width: 8px; height: 8px; border-radius: 50%;
+    flex: 0 0 8px;
+    box-shadow: 0 0 0 3px rgba(9,105,218,.15);
   }
-  .striffs-toast-info     { border-color: var(--accent-fg, var(--color-accent-fg, #0969da)); }
-  .striffs-toast-info .striffs-toast-dot { background: var(--accent-fg, var(--color-accent-fg, #0969da)); }
 
-  .striffs-toast-success  { border-color: var(--success-fg, var(--color-success-fg, #1a7f37)); }
-  .striffs-toast-success .striffs-toast-dot { background: var(--success-fg, var(--color-success-fg, #1a7f37)); }
+  .striffs-toast-info     { border-left: 3px solid var(--accent-fg, var(--color-accent-fg, #0969da)); }
+  .striffs-toast-info .striffs-toast-dot { background: var(--accent-fg, var(--color-accent-fg, #0969da)); box-shadow: 0 0 0 3px rgba(9,105,218,.15); }
 
-  .striffs-toast-error    { border-color: var(--borderColor-danger, var(--color-danger-fg, #d1242f)); }
-  .striffs-toast-error .striffs-toast-dot { background: var(--borderColor-danger, var(--color-danger-fg, #d1242f)); }
+  .striffs-toast-success  { border-left: 3px solid var(--success-fg, var(--color-success-fg, #1a7f37)); }
+  .striffs-toast-success .striffs-toast-dot { background: var(--success-fg, var(--color-success-fg, #1a7f37)); box-shadow: 0 0 0 3px rgba(26,127,55,.15); }
 
-  .striffs-toast-neutral  { border-color: var(--borderColor-muted, var(--color-border-default, #8b949e)); }
-  .striffs-toast-neutral .striffs-toast-dot { background: var(--borderColor-muted, var(--color-border-default, #8b949e)); }
+  .striffs-toast-error    { border-left: 3px solid var(--borderColor-danger, var(--color-danger-fg, #d1242f)); }
+  .striffs-toast-error .striffs-toast-dot { background: var(--borderColor-danger, var(--color-danger-fg, #d1242f)); box-shadow: 0 0 0 3px rgba(209,34,46,.15); }
+
+  .striffs-toast-warning  { border-left: 3px solid #bf8700; }
+  .striffs-toast-warning .striffs-toast-dot { background: #bf8700; box-shadow: 0 0 0 3px rgba(191,135,0,.15); }
+
+  .striffs-toast-neutral  { border-left: 3px solid #656d76; }
+  .striffs-toast-neutral .striffs-toast-dot { background: #656d76; box-shadow: 0 0 0 3px rgba(101,109,118,.15); }
+
+  .striffs-toast-close {
+    margin-left: 4px;
+    cursor: pointer;
+    font-size: 16px;
+    font-weight: 300;
+    opacity: 0.45;
+    transition: opacity .15s;
+    line-height: 1;
+    user-select: none;
+  }
+  .striffs-toast-close:hover { opacity: 0.85; }
 
   .striffs-local-btn.is-active {
     color: var(--accent-fg, var(--color-accent-fg, #0969da));
@@ -2335,32 +2748,59 @@
     display: inline-flex;
     flex-direction: row;
     align-items: center;
-    gap: 4px;
+    justify-content: center;
+    gap: 8px;
+    min-width: 64px;
     pointer-events: auto;
   }
   #striff-diagram-view .striffs-note-feedback-btn{
     appearance: none;
     border: none;
     background: transparent;
-    color: #333;
+    color: #656d76;
     border-radius: 4px;
-    padding: 0;
-    width: auto;
-    height: auto;
+    padding: 2px;
+    width: 24px;
+    height: 24px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
     cursor: pointer;
-    transition: transform .15s ease;
-    font-size: inherit;
+    transition: all .15s ease;
+    font-size: 14px;
     line-height: 1;
   }
   #striff-diagram-view .striffs-note-feedback-btn:hover{
+    background: #d0d7de;
+    color: #24292f;
     transform: scale(1.1);
+    box-shadow: 0 1px 3px rgba(0,0,0,0.12);
+  }
+  #striff-diagram-view .striffs-note-feedback-btn:active{
+    transform: scale(0.95);
+  }
+  #striff-diagram-view .striffs-note-feedback-btn--up:hover{
+    background: #dafbe1;
+    color: #1a7f37;
+  }
+  #striff-diagram-view .striffs-note-feedback-btn--down:hover{
+    background: #ffebe9;
+    color: #cf222e;
+  }
+  #striff-diagram-view .striffs-note-feedback-thanks{
+    font-size: 11px;
+    color: #656d76;
+    white-space: nowrap;
+    padding: 4px 8px;
+    animation: striffsThanksFade 0.3s ease;
+  }
+  @keyframes striffsThanksFade{
+    from { opacity: 0; transform: translateY(4px); }
+    to { opacity: 1; transform: translateY(0); }
   }
   #striff-diagram-view .striffs-note-feedback-btn svg{
-    width: 1em;
-    height: 1em;
+    width: 14px;
+    height: 14px;
   }
   #striff-diagram-view .striffs-note-feedback-icon{
     display: block;
@@ -2384,9 +2824,15 @@
   }
   #striff-diagram-view svg g.entity[data-qualified-name]{
     transition: filter .18s ease, stroke-width .18s ease;
+    cursor: default;
+  }
+  #striff-diagram-view svg g.entity[data-qualified-name].striffs-clickable{
     cursor: pointer;
   }
-  #striff-diagram-view svg g.entity[data-qualified-name]:hover{
+  #striff-diagram-view svg g.entity[data-qualified-name].striffs-clickable text{
+    cursor: pointer;
+  }
+  #striff-diagram-view svg g.entity[data-qualified-name].striffs-clickable:hover{
     filter: drop-shadow(0 6px 16px rgba(0,0,0,0.38));
   }
   @keyframes striffsFocusGlowPulse{
@@ -2408,9 +2854,14 @@
     cursor: default;
     pointer-events: none;
   }
+  #striff-diagram-view svg g.entity[data-qualified-name*="AI_REVIEW"] text,
+  #striff-diagram-view svg g.entity[data-qualified-name*="AI_REVIEW"] foreignObject{
+    pointer-events: auto;
+    user-select: text;
+    -webkit-user-select: text;
+  }
   #striff-diagram-view svg g.entity[data-qualified-name*="AI_REVIEW"] *{
     cursor: default;
-    pointer-events: none;
   }
   #striff-diagram-view svg g.entity[data-qualified-name*="AI_REVIEW"]:hover{
     filter: none;
@@ -2427,19 +2878,15 @@
     align-items: center;
     gap: 0;
     min-height: 32px;
-    padding: 6px 8px 6px 12px;
+    padding: 4px 8px;
     box-sizing: border-box;
   }
   .striffs-view-striff-option.is-disabled{
     opacity: 0.5;
     cursor: not-allowed;
-    padding: 0;
   }
   .striffs-view-striff-option-spacer{
-    display: inline-flex;
-    flex: 0 0 4px;
-    width: 4px;
-    height: 1px;
+    display: none;
   }
   .striffs-view-striff-option-visual{
     display: inline-flex;
@@ -2531,7 +2978,7 @@
           <button id="striffs-download-btn" type="button" class="striffs-ctl-btn" title="Save">
             ${S.octicon('save')}
           </button>
-          <a id="striffs-guide-btn" class="striffs-ctl-btn" href="https://google.com" target="_blank" rel="noopener noreferrer" title="Guide">
+          <a id="striffs-guide-btn" class="striffs-ctl-btn" href="https://striff.io/#how" target="_blank" rel="noopener noreferrer" title="Guide">
             ${S.octicon('question')}
           </a>
         </div>
@@ -2844,6 +3291,7 @@
     S.showDiffView();
     S.saveActiveTab?.("diffs");
     S.updateStriffButton({ neutral: true, disabled: true, tooltip });
+    S.toast?.("No changes were found.", "neutral", { timeoutMs: 5000 });
     return false;
   };
 
@@ -2872,10 +3320,9 @@
       if (S.__striffsSvg) {
           S.__striffsSvg.style.pointerEvents = 'auto';
       }
-      // Center the striff view in the viewport (only on first show)
-      if (!S.__striffViewScrolled) {
-        striffView.scrollIntoView({ block: 'center', behavior: 'smooth' });
-        S.__striffViewScrolled = true;
+      // Scroll the striff view into the viewport when switching to it
+      if (!S.__pendingFocusHash) {
+        striffView.scrollIntoView({ block: 'start', behavior: 'smooth' });
       }
         }
         S.setCurrentView('striffs');
@@ -3233,8 +3680,29 @@
     )).filter((host) => {
       if (!isVisibleMenuHost(host)) return false;
       if (host.querySelector?.(FILE_MENU_OPTION_SELECTOR)) return true;
-      const text = String(host.textContent || '').toLowerCase();
-      return /view file|copy path|open file|view blame|raw|download/i.test(text);
+
+      const text = String(host.textContent || '');
+      const textLower = text.toLowerCase();
+
+      // Exclude non-file menus by checking for specific indicators
+      // Reaction/emoticon menus
+      if (/react|add reaction|remove reaction/i.test(textLower)) return false;
+      // Comment actions
+      if (/edit comment|hide comment|quote reply|copy link|report content/i.test(textLower)) return false;
+      // Check for common reaction emojis
+      if (/[👍👎😆😕❤️🎉🚀👀😄😢😡👏]/.test(text)) return false;
+      // User profile actions
+      if (/follow user|block user|unblock user|unfollow/i.test(textLower)) return false;
+
+      // File menu indicators - check for GitHub file menu items
+      // These are the typical items in GitHub's file three-dot menu
+      const hasFileMenuItems =
+        /edit file|delete file|view file|copy path|view blame|download file|\braw\b/i.test(textLower);
+      // Also check for file-related aria labels or data attributes
+      const hasFileDataAttr =
+        host.querySelector('[aria-label*="file" i], [data-menu-item*="file" i]');
+
+      return hasFileMenuItems || hasFileDataAttr;
     });
     if (!candidates.length) return null;
     if (candidates.length === 1) return candidates[0];
@@ -3300,6 +3768,9 @@
   };
 
   const ensureFileMenuOptionButton = (menuHost) => {
+    // Only add menu buttons on /files and /changes pages
+    const isPRFilesPage = /\/[^/]+\/[^/]+\/pull\/\d+\/(files|changes)/.test(window.location.pathname);
+    if (!isPRFilesPage) return null;
     if (!menuHost) return null;
     let btn = menuHost.querySelector(FILE_MENU_OPTION_SELECTOR);
     if (btn) {
@@ -3324,7 +3795,7 @@
     }
     btn.innerHTML = [
       `<span class="striffs-view-striff-option-spacer" aria-hidden="true"></span>`,
-      `<span class="striffs-view-striff-option-visual" aria-hidden="true"><span class="striffs-view-striff-option-icon">${S.octicon('graph')}</span></span>`,
+      `<span class="striffs-view-striff-option-visual" aria-hidden="true"><span class="striffs-view-striff-option-icon">${S.octicon('server')}</span></span>`,
       `<span class="striffs-view-striff-option-label">View Striff</span>`
     ].join('');
 
@@ -3346,6 +3817,10 @@
 
   S.updateFileMenuOptionForFile = (fileNode) => {
     try {
+      // Only update file menu options on /files and /changes pages
+      const isPRFilesPage = /\/[^/]+\/[^/]+\/pull\/\d+\/(files|changes)/.test(window.location.pathname);
+      if (!isPRFilesPage) return;
+
       if (!fileNode) {
         S.debugFileMenu?.('update:missing-file-node');
         return;
@@ -3410,6 +3885,10 @@
 
   S.updateAllFileMenuOptions = () => {
     try {
+      // Only update file menus on /files and /changes pages
+      const isPRFilesPage = /\/[^/]+\/[^/]+\/pull\/\d+\/(files|changes)/.test(window.location.pathname);
+      if (!isPRFilesPage) return;
+
       const seen = new Set();
       let count = 0;
       S.debugFileMenu?.('updateAll:start');
@@ -3441,9 +3920,22 @@
     getCachedUpdatedAtFor(owner, repo, pull_number) ||
     new Date().toISOString();
 
+  S.getPrIdentityFromPathname = (pathname = '') => {
+    try {
+      const m = String(pathname || '').match(/^\/([^/]+)\/([^/]+)\/pull\/(\d+)(?:[/?#]|$)/);
+      if (!m) return null;
+      return { owner: m[1], repo: m[2], pull_number: m[3] };
+    } catch {
+      return null;
+    }
+  };
+
   // ---------- PR metadata ----------
   S.extractPRMetadata = () => {
-    const [, owner, repo, , pull_number] = window.location.pathname.split("/");
+    const id = S.getPrIdentityFromPathname?.(window.location.pathname) || {};
+    const owner = id.owner || '';
+    const repo = id.repo || '';
+    const pull_number = id.pull_number || '';
     const updated_at = resolveUpdatedAt(owner, repo, pull_number);
     const commit_sha = resolveLatestCommitSha();
     const commit_count = resolveCommitCount();
@@ -3609,7 +4101,11 @@
 
   // ---------- Mapping ----------
   S.normalizePath = (p) => String(p || "").replace(/\\/g, "/").replace(/^\/+/, "").trim();
-  S.cssEscape = (id) => String(id).replace(/(["\\\]])/g, "\\$1");
+  S.cssEscape = (id) => {
+    const value = String(id || "");
+    if (typeof CSS !== "undefined" && typeof CSS.escape === "function") return CSS.escape(value);
+    return value.replace(/[^a-zA-Z0-9_-]/g, "\\$&");
+  };
   S.normalizeQualifiedName = (name) => {
     // Qualified names now match SVG data-qualified-name verbatim (including dots).
     return String(name || "").trim();
@@ -3762,7 +4258,7 @@
 
     // Debug: Check what's actually in the SVG
     if (S.isDebug?.()) {
-      console.log("[Striffs][debug] buildPathIdMapping: SVG has", S.__striffsSvg.querySelectorAll('[data-qualified-name]').length, "elements with data-qualified-name");
+      S.clog?.("[buildPathIdMapping] SVG qualified-name count", S.__striffsSvg.querySelectorAll('[data-qualified-name]').length);
     }
 
     // The SVG should already have data-qualified-name attributes on entity elements
@@ -3778,13 +4274,11 @@
 
     // Debug: Show what we found
     if (S.isDebug?.()) {
-      console.log("[Striffs][debug] SVG elements with data-qualified-name:",
-        Array.from(svgEntityMap.keys()).slice(0, 10)
-      );
+      S.clog?.("[buildPathIdMapping] SVG elements with data-qualified-name:", Array.from(svgEntityMap.keys()).slice(0, 10));
       // Also check entity elements
       const entityElements = S.__striffsSvg.querySelectorAll('g[class*="entity"], g.entity');
-      console.log("[Striffs][debug] Entity elements found:", entityElements.length,
-        "sample attributes:", Array.from(entityElements).slice(0, 3).map(el => ({
+      S.clog?.("[buildPathIdMapping] Entity elements found:", entityElements.length,
+        "sample attributes:", Array.from(entityElements).slice(0, 3).map((el) => ({
           id: el.id,
           class: el.className,
           hasDataQName: el.hasAttribute('data-qualified-name'),
@@ -3797,7 +4291,7 @@
 
     // Debug: Check API response structure
     if (S.isDebug?.()) {
-      console.log("[Striffs][debug] API response structure:", {
+      S.clog?.("[buildPathIdMapping] API response structure:", {
         hasStriffs: Array.isArray(apiData?.striffs),
         striffsCount: items.length,
         firstItemKeys: items[0] ? Object.keys(items[0]) : [],
@@ -3879,27 +4373,27 @@
 
     // Always log the path->component mapping for debugging file tree clicks (only in debug mode)
     if (S.isDebug?.()) {
-      console.log("[Striffs][buildPathIdMapping] Path to component map:", Array.from(S.__striffsPathToComponentId.entries()));
-      console.log("[Striffs][buildPathIdMapping] Components missing from SVG:", missingInSvg);
+      S.clog?.("[buildPathIdMapping] Path to component map:", Array.from(S.__striffsPathToComponentId.entries()));
+      S.clog?.("[buildPathIdMapping] Components missing from SVG:", missingInSvg);
     }
 
     if (debugEnabled) {
       S.dumpStriffsMaps = () => {
         try {
-          console.log("[Striffs][map] api components (component->file)", S.__debugApiComponents);
-          console.log("[Striffs][map] api files", S.__debugApiFiles);
-          console.log("[Striffs][map] componentsDump", S.__debugComponentsDump);
-          console.log("[Striffs][map] path->component", S.__debugPathToComponent);
-          console.log("[Striffs][map] component->file", S.__debugComponentToFile);
-          console.log("[Striffs][map] file->diff", S.__debugFilePathToDiffHash);
-          console.log("[Striffs][map] diff->file", S.__debugDiffHashToFilePath);
+          S.clog?.("[map] api components (component->file)", S.__debugApiComponents);
+          S.clog?.("[map] api files", S.__debugApiFiles);
+          S.clog?.("[map] componentsDump", S.__debugComponentsDump);
+          S.clog?.("[map] path->component", S.__debugPathToComponent);
+          S.clog?.("[map] component->file", S.__debugComponentToFile);
+          S.clog?.("[map] file->diff", S.__debugFilePathToDiffHash);
+          S.clog?.("[map] diff->file", S.__debugDiffHashToFilePath);
         } catch (e) {
           S.cwarn?.("dumpStriffsMaps failed", e);
         }
       };
       // Emit the live map for quick inspection in DevTools.
       try {
-        console.log("[Striffs][map] __striffsComponentIdToFile (Map)", S.__striffsComponentIdToFile);
+        S.clog?.("[map] __striffsComponentIdToFile (Map)", S.__striffsComponentIdToFile);
       } catch {}
       S.dumpStriffsMaps(); // log immediately after building the map
 
@@ -3990,6 +4484,16 @@
            null;
   };
 
+  S.hasDiffTargetForComponentId = (componentId) => {
+    try {
+      const diffId = S.resolveDiffIdForComponentId?.(componentId);
+      if (!diffId) return false;
+      return Boolean(document.getElementById(diffId));
+    } catch {
+      return false;
+    }
+  };
+
   S.routeDiagramComponentId = (componentId) => {
     S.restoreStableMappings?.();
     const qn = String(componentId || '').trim();
@@ -4036,12 +4540,26 @@
       return false;
     }
 
+    const diffEl = document.getElementById(diffId);
+    if (!diffEl) {
+      S.cwarn?.('Striffs component click: diff target missing in DOM', { id: qn, file, diffId });
+      S.syncDiagramClickDebugState?.("missing-diff-element", {
+        componentQualifiedName: dottedQn || null,
+        file,
+        diffId,
+        reason: "diff element missing in DOM",
+        targetFound: true,
+        diffElementFound: false
+      });
+      S.toast?.("No corresponding diff exists for this component.", "error", { timeoutMs: 3000 });
+      return false;
+    }
+
     S.showDiffView();
     S.setActiveButtons("diffs");
     S.saveActiveTab("diffs");
     if (location.hash !== `#${diffId}`) history.replaceState(null, "", `#${diffId}`);
-    const diffEl = document.getElementById(diffId);
-    if (diffEl) diffEl.scrollIntoView({ block: "start", behavior: "smooth" });
+    diffEl.scrollIntoView({ block: "start", behavior: "smooth" });
     S.syncDiagramClickDebugState?.("navigated", {
       componentQualifiedName: dottedQn || null,
       file,
@@ -4103,7 +4621,7 @@
     if (!S.__striffsReady) {
       S.updateStriffButton?.({
         loading: true,
-        tooltip: "Generating Striffs…",
+        tooltip: "Generating",
         phase: "Analyzing"
       });
       const ok = await S.autoFetchStriffs?.();
@@ -4142,6 +4660,17 @@
     const type = li.getAttribute('data-tree-entry-type');
     if (type && type.toLowerCase() === 'directory') return true;
     if (li.querySelector?.('svg[class*="file-directory"]')) return true;
+    if (li.getAttribute?.('aria-expanded') != null) return true;
+    if (li.querySelector?.(':scope > ul, :scope > [role="group"]')) return true;
+    if (li.querySelector?.('[role="treeitem"] [role="treeitem"]')) return true;
+    const label = String(
+      li.getAttribute?.('data-path') ||
+      li.getAttribute?.('title') ||
+      li.querySelector?.('[data-filterable-item-text]')?.textContent ||
+      li.querySelector?.('.ActionList-item-label')?.textContent ||
+      ''
+    ).trim();
+    if (label && !label.split('/').pop()?.includes('.')) return true;
     return false;
   };
 
@@ -4297,18 +4826,8 @@
         if (typeof result.error === "string" && result.error.trim()) return result.error.trim();
         if (result.message === "error") return "Invalid response.";
         if (!Array.isArray(result.striffs)) return "Invalid Striffs response: missing striffs array.";
-        const operationId = String(
-            result?.operationId || result?.operationID || result?.operation_id || ""
-        ).trim();
-        if (!operationId) {
-            return "Invalid Striffs response: missing operationId. Engagement telemetry cannot be enabled.";
-        }
-        const engagementWriteToken = String(
-            result?.engagementWriteToken || result?.engagementToken || result?.engagement_write_token || ""
-        ).trim();
-        if (!engagementWriteToken) {
-            return "Invalid Striffs response: missing engagement write token. Engagement telemetry cannot be enabled.";
-        }
+        // operationId and engagementWriteToken are optional — their absence
+        // only affects telemetry, not diagram rendering.
         return null;
     };
 
@@ -4317,7 +4836,7 @@
         const raw = String(
             result?.aiReviewStatus || result?.ai_review_status || result?.reviewStatus || ""
         ).trim().toUpperCase();
-        if (!raw || raw === "NOT_REQUESTED") {
+        if (!raw || raw === "NOT_REQUESTED" || raw === "SKIPPED") {
             return null;
         }
         return raw;
@@ -4338,55 +4857,86 @@
         return status;
     };
 
-    // Ensure we have cssEscape on S (used by previous logic)
-    S.cssEscape = S.cssEscape || function cssEscape(id) {
-        return String(id).replace(/(["\\\]])/g, "\\$1");
-    };
-
-    // Hover / click styling: color only text nodes that correspond to files
-    // so they look like links (blue) and feel clickable.
+    // Hover / click styling:
+    // Only components that map to a real diff target in the DOM are interactive.
     S.applyHoverability = function applyHoverability() {
-        if (!S.__striffsSvg || !S.__striffsComponentIdToFile) return;
+      if (!S.__striffsSvg) return;
+      try {
+        const nodes = S.__striffsSvg.querySelectorAll?.("g.entity[data-qualified-name]") || [];
+        for (const node of nodes) {
+          const qn = String(node.getAttribute?.("data-qualified-name") || "").trim();
+          if (!qn) continue;
+          if (S.isReviewNoteQualifiedName?.(qn)) continue;
 
-        try {
-            for (const qn of S.__striffsComponentIdToFile.keys()) {
-                if (S.isReviewNoteQualifiedName?.(qn)) continue;
-                const esc =
-                    (window.CSS && typeof CSS.escape === "function")
-                        ? CSS.escape(qn)
-                        : S.cssEscape(qn);
-
-                const target =
-                    S.__striffsSvg.querySelector(`[data-qualified-name="${esc}"]`) ||
-                    S.__striffsSvg.querySelector(`text[data-qualified-name="${esc}"]`);
-                if (!target) continue;
-
-                const existingStyle = target.getAttribute("style") || "";
-                const parts = existingStyle
-                    .split(";")
-                    .map(s => s.trim())
-                    .filter(s => s && !s.toLowerCase().startsWith("fill:") && !s.toLowerCase().startsWith("cursor:"));
-
-                // GitHub-ish link blue; use accent vars with a hex fallback.
-                parts.push(
-                    "fill: var(--fgColor-accent, var(--color-accent-fg, #0969da))",
-                    "cursor: pointer"
-                );
-
-                target.setAttribute("style", parts.join("; "));
-            }
-        } catch (e) {
-            cwarn("applyHoverability failed", e);
+          const clickable = Boolean(S.hasDiffTargetForComponentId?.(qn));
+          try { node.classList.toggle("striffs-clickable", clickable); } catch {}
+          try { node.style.pointerEvents = clickable ? "" : "none"; } catch {}
         }
+      } catch (e) {
+        cwarn("applyHoverability failed", e);
+      }
     };
 
     // ---------- Cache ----------
   S.cacheKey = () => {
-    const { owner, repo, pull_number } = S.extractPRMetadata();
-    return `striffs:${owner}/${repo}#${pull_number}`;
+    const id = S.getPrIdentityFromPathname?.(window.location.pathname) || null;
+    if (!id?.owner || !id?.repo || !id?.pull_number) return null;
+    return `striffs:${id.owner}/${id.repo}#${id.pull_number}`;
   };
 
   S.prScopeKey = S.cacheKey;
+
+  S.resetPrScopedState = (reason = 'unknown') => {
+    try { S.cancelEnrichmentPolling?.(`pr-scope-change:${reason}`); } catch {}
+
+    S.__striffsReady = false;
+    S.__striffsNoChanges = false;
+    S.__lastFetchedUpdatedAt = null;
+    S.__lastLoadSource = 'none';
+    S.__debugLastApiResponse = null;
+
+    S.__aiReviewStatus = null;
+    S.__aiReviewId = null;
+    S.__aiReviewOperationId = null;
+    S.__aiReviewPollInFlight = false;
+    if (S.__aiReviewPollTimer) {
+      try { clearTimeout(S.__aiReviewPollTimer); } catch {}
+      S.__aiReviewPollTimer = null;
+    }
+
+    // Reset engagement counters on PR navigation
+    S.__engagementSentCount = 0;
+    S.__engagementAckCount = 0;
+    S.__engagementFailedCount = 0;
+    S.__engagementSkippedCount = 0;
+
+    // Preserve the session id, but clear the per-operation ids/tokens.
+    try {
+      const sessionId = S.ensureEngagementSessionId?.() || S.__engagementCtx?.sessionId || null;
+      S.__engagementCtx = { sessionId, operationId: null, engagementWriteToken: null };
+    } catch {}
+
+    try { S.__striffsSvg = null; } catch {}
+    try { S.clearReviewNoteFeedback?.(); } catch {}
+    try { S.__striffsPathToComponentId?.clear?.(); } catch {}
+    try { S.__striffsComponentIdToFile?.clear?.(); } catch {}
+    try { S.__striffsComponentIdToDiffId?.clear?.(); } catch {}
+    try { S.__striffsComponentIdToSvgElement?.clear?.(); } catch {}
+    try { S.__stablePathToComponentId?.clear?.(); } catch {}
+    try { S.__stableComponentIdToFile?.clear?.(); } catch {}
+    try { S.__stableComponentIdToDiffId?.clear?.(); } catch {}
+    try { S.__stableFilePathToDiffId?.clear?.(); } catch {}
+    try { S.__filePathToDiffId?.clear?.(); } catch {}
+    try { S.__lastPanState = null; } catch {}
+
+    try { S.resetFileTreeAvailability?.(); } catch {}
+
+    // Clear the diagram view so stale SVG cannot "carry over" visually between PRs.
+    try {
+      const view = document.getElementById('striff-diagram-view');
+      if (view) view.innerHTML = S.getStriffsContainerMarkup?.('') || '';
+    } catch {}
+  };
 
   S.autoGenerateIntentKey = () => {
     const scope = S.cacheKey();
@@ -4475,12 +5025,12 @@
 	        S.__lastFetchedUpdatedAt = updated_at;
 	        S.setAutoGenerateIntent?.(true);
           if (S.__aiReviewStatus === "PENDING" || S.__aiReviewStatus === "RUNNING") {
-            S.updateStriffButton({ enriching: true, tooltip: "Base Striffs loaded from cache. AI enrichment is still running." });
+            S.updateStriffButton({ enriching: true, tooltip: "Enriching" });
             setTimeout(() => {
               S.startEnrichmentPolling?.({ immediate: false, reason: "cache-load" });
             }, 0);
           } else {
-            S.updateStriffButton({ success: true, tooltip: "Striffs loaded from cache. Click to view." });
+            S.updateStriffButton({ success: true, tooltip: "View" });
           }
 	        return true;
 	      };
@@ -4559,6 +5109,57 @@
         }
     };
 
+    // ---------- OOP Metric Badge Tooltips ----------
+    // Mapping of OOP metric acronyms to human-readable descriptions
+    S.METRIC_DESCRIPTIONS = {
+        'NOC': 'Number of Children - The number of immediate subclasses of this class',
+        'WMC': 'Weighted Methods per Class - The sum of complexities of all methods in the class',
+        'DIT': 'Depth of Inheritance Tree - The maximum length of a path from this class to a root class',
+        'CBO': 'Coupling Between Objects - The number of other classes this class is coupled to',
+        'RFC': 'Response For a Class - The number of methods that can be executed in response to a message',
+        'LCOM': 'Lack of Cohesion of Methods - Measures how closely related the methods of a class are'
+    };
+
+    // Add tooltips to OOP metric badges in the SVG diagram
+    // Finds badge elements by their text content and adds title attributes
+    S.addMetricBadgesTooltips = function addMetricBadgesTooltips(svg) {
+        if (!svg) return;
+
+        try {
+            // SVG structure typically uses <text> elements for labels
+            // We look for text elements that match metric acronyms
+            const textElements = svg.querySelectorAll('text');
+            const metricPattern = new RegExp(`^(${Object.keys(S.METRIC_DESCRIPTIONS).join('|')})$`);
+
+            textElements.forEach(el => {
+                const text = el.textContent?.trim();
+                if (text && metricPattern.test(text)) {
+                    const description = S.METRIC_DESCRIPTIONS[text];
+                    if (description) {
+                        // Check if parent is a group (g) that might be the badge container
+                        // Add title to the group if it exists, otherwise to the text element
+                        const group = el.closest('g');
+                        const target = group || el;
+
+                        // Check if title already exists
+                        let title = target.querySelector('title');
+                        if (!title) {
+                            title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+                            target.appendChild(title);
+                        }
+                        title.textContent = `${text}: ${description}`;
+
+                        if (S.isDebug?.()) {
+                            S.clog?.(`[debug] Added tooltip for metric ${text}`);
+                        }
+                    }
+                }
+            });
+        } catch (e) {
+            S.cwarn?.('addMetricBadgesTooltips failed', e);
+        }
+    };
+
     // ---------- Rendering ----------
     const b64ToBytes = (b64) => Uint8Array.from(atob(b64), c => c.charCodeAt(0));
 
@@ -4609,6 +5210,7 @@
                 }
                 if (svg) {
                     S.sanitizeSvgDimensions(svg);
+                    S.addMetricBadgesTooltips(svg);
                     const scrollEl = target.querySelector('#striffs-scroll') || target;
                     const didFit = S.fitStriffsToView?.(scrollEl, svg);
                     if (!didFit) {
@@ -4621,7 +5223,7 @@
                         const serializer = new XMLSerializer();
                         const svgText = serializer.serializeToString(svg);
                         S.__debugSvgText = svgText;
-                        console.log("[Striffs][debug] svg", svgText);
+                        S.clog?.("[debug] svg", svgText);
                       }
                     } catch (e) {
                       S.cwarn?.("debug svg dump failed", e);
@@ -4642,6 +5244,18 @@
                 const s = document.getElementById("striffs-status");
                 if (s) s.textContent = "Diagram ready.";
                 setTimeout(() => s?.remove(), 800);
+
+                // Complete the progress bar when diagram is ready
+                const btn = document.querySelector("#striffs-btn");
+                const progressBar = btn?.querySelector('.striffs-progress-bar');
+                if (progressBar && !progressBar.classList.contains('complete')) {
+                    progressBar.classList.add('complete');
+                    setTimeout(() => {
+                        const wrap = btn?.querySelector('.striffs-progress-wrap');
+                        if (wrap) wrap.remove();
+                    }, 500);
+                }
+
                 return true;
             } catch (e) {
                 cerr("Failed to decode/render SVG", e);
@@ -4653,7 +5267,7 @@
             content.innerHTML = `<div style="color:#d1242f;">❗ ${errorMsg}</div>`;
             S.__striffsReady = false;
             State?.setTooLarge?.(true);
-            S.updateStriffButton?.({ neutral: true, disabled: true, tooltip: "Diagram generation failed" });
+            S.updateStriffButton?.({ neutral: true, disabled: true, tooltip: "Could not generate diagram" });
             S.toast?.(errorMsg, "neutral", { timeoutMs: 5000 });
             return true; // handled gracefully
         }
@@ -4679,7 +5293,7 @@
 	      S.updateStriffButton({
 	        neutral: true,
 	        disabled: true,
-	        tooltip: "Diagram too large to render"
+	        tooltip: "Pull request is too large to display"
 	      });
 	      return;
 	    }
@@ -4687,7 +5301,7 @@
         if (S.__aiReviewStatus === "PENDING" || S.__aiReviewStatus === "RUNNING") {
           S.updateStriffButton({
             enriching: true,
-            tooltip: "Base Striffs are ready. AI enrichment is still running."
+            tooltip: "Enriching"
           });
           return;
         }
@@ -4705,7 +5319,7 @@
       return;
     }
     S.updateStriffButton({
-      tooltip: "Click to generate Striffs"
+      tooltip: "Generate"
     });
   };
 
@@ -4756,9 +5370,10 @@
         "[data-testid='file-tree'] a[href*='#diff-'], " +
         "li a[href^='#diff-'], li a[href*='#diff-'], " +
         "li[role='treeitem'] a, li[role='treeitem'] button, li[role='treeitem'] [role='button']"
-      );
-      if (!link) return;
-      if (S.getCurrentView && S.getCurrentView() !== 'striffs') return;
+	      );
+	      if (!link) return;
+	      if (S.getCurrentView && S.getCurrentView() !== 'striffs') return;
+        if (S.isDirectoryNode?.(e.target) || S.isDirectoryNode?.(link)) return;
 
 	      // Use more specific selectors to avoid matching directory treeitems.
 	      // The :not() ensures we don't match directories even with role='treeitem'.
@@ -4809,7 +5424,7 @@
 
       // Debug: log the click details (only in debug mode)
       if (S.isDebug?.()) {
-        console.log('[Striffs][FileTreeClick]', {
+        S.clog?.('[FileTreeClick]', {
           parsedPath,
           fullPath,
           normalizedPath,
@@ -4873,6 +5488,14 @@
           });
           return false;
         }
+        if (!S.hasDiffTargetForComponentId?.(qn)) {
+          S.syncDiagramClickDebugState?.("ignored-no-diff-target", {
+            componentQualifiedName: dottedQn || null,
+            reason: "component has no diff target",
+            targetFound: true
+          });
+          return false;
+        }
         S.syncDiagramClickDebugState?.("received", {
           componentQualifiedName: dottedQn || null,
           targetFound: true
@@ -4930,6 +5553,11 @@
         };
 
         S.__onFileMenuClick = (e) => {
+          // Only handle file menu clicks on /files and /changes pages
+          // GitHub uses Turbo for SPA navigation, so content script stays active across pages
+          const isPRFilesPage = /\/[^/]+\/[^/]+\/pull\/\d+\/(files|changes)/.test(window.location.pathname);
+          if (!isPRFilesPage) return;
+
           const option = e.target?.closest?.('[data-striffs-view-striff-option="1"]');
           if (option) {
             e.preventDefault();
@@ -4995,6 +5623,10 @@
         };
 
         S.__onFileMenuToggle = (e) => {
+          // Only handle file menu toggles on /files and /changes pages
+          const isPRFilesPage = /\/[^/]+\/[^/]+\/pull\/\d+\/(files|changes)/.test(window.location.pathname);
+          if (!isPRFilesPage) return;
+
           const details = e?.target;
           if (!(details instanceof HTMLDetailsElement)) return;
           if (!details.hasAttribute('open')) {
@@ -5021,11 +5653,7 @@
         S.__onStriffsTestMessage = async (event) => {
           const data = event.data || {};
           if (data?.source !== "striffs-test" || data?.type !== "routeDiagramComponent") return;
-        let isTestMode = false;
-        try {
-          isTestMode = localStorage.getItem("striffsTest") === "1";
-        } catch {}
-        if (!isTestMode) return;
+        if (!S.isTest?.()) return;
 
         const requestId = String(data.requestId || "");
         const componentId = String(data.componentId || "");
@@ -5060,11 +5688,7 @@
         };
 
         S.__onStriffsTestRouteEvent = async (event) => {
-          let isTestMode = false;
-          try {
-            isTestMode = localStorage.getItem("striffsTest") === "1";
-          } catch {}
-          if (!isTestMode) return;
+          if (!S.isTest?.()) return;
 
           const detail = event?.detail || {};
           const requestId = String(detail.requestId || "");
@@ -5094,11 +5718,7 @@
         };
 
         const handleDatasetRouteRequest = async () => {
-          let isTestMode = false;
-          try {
-            isTestMode = localStorage.getItem("striffsTest") === "1";
-          } catch {}
-          if (!isTestMode) return;
+          if (!S.isTest?.()) return;
 
           const root = document.documentElement;
           if (!root?.dataset) return;
@@ -5122,21 +5742,47 @@
             root.dataset.striffsTestRouteError = String(err?.message || err);
           }
         };
-        S.__striffsTestRouteObserver = new MutationObserver(() => {
-          void handleDatasetRouteRequest();
-        });
-        S.__striffsTestRouteObserver.observe(document.documentElement, {
-          attributes: true,
-          attributeFilter: ["data-striffs-test-route-request-id"]
-        });
+        S.syncTestHarnessState = () => {
+          const root = document.documentElement;
+          if (!S.isTest?.()) {
+            if (S.__striffsTestRouteObserver) {
+              S.__striffsTestRouteObserver.disconnect();
+              S.__striffsTestRouteObserver = null;
+            }
+            if (S.__testHooksRegistered) {
+              document.removeEventListener("striffs:routeDiagramComponent", S.__onStriffsTestRouteEvent);
+              window.removeEventListener("message", S.__onStriffsTestMessage);
+              S.__testHooksRegistered = false;
+            }
+            if (root?.dataset) {
+              delete root.dataset.striffsTestRouteRequestId;
+              delete root.dataset.striffsTestRouteOk;
+              delete root.dataset.striffsTestRouteError;
+            }
+            return;
+          }
+          if (!S.__testHooksRegistered) {
+            document.addEventListener("striffs:routeDiagramComponent", S.__onStriffsTestRouteEvent);
+            window.addEventListener("message", S.__onStriffsTestMessage);
+            S.__testHooksRegistered = true;
+          }
+          if (!S.__striffsTestRouteObserver && typeof MutationObserver === "function" && root) {
+            S.__striffsTestRouteObserver = new MutationObserver(() => {
+              void handleDatasetRouteRequest();
+            });
+            S.__striffsTestRouteObserver.observe(root, {
+              attributes: true,
+              attributeFilter: ["data-striffs-test-route-request-id"]
+            });
+          }
+        };
 
         document.addEventListener("click", S.__onFileTreeClick, true);
         document.addEventListener("click", S.__onDiagramClick);
         document.addEventListener("click", S.__onFileMenuClick);
         document.addEventListener("toggle", S.__onFileMenuToggle, true);
         window.addEventListener("hashchange", S.__onHashChange);
-        document.addEventListener("striffs:routeDiagramComponent", S.__onStriffsTestRouteEvent);
-        window.addEventListener("message", S.__onStriffsTestMessage);
+        S.syncTestHarnessState?.();
 
       S.__domListenersRegistered = true;
     }
@@ -5308,13 +5954,30 @@
       const key = S.cacheKey?.();
       if (!key) return false;
       let wrotePayload = false;
+      let quotaExceeded = false;
       try {
         localStorage.setItem(key, JSON.stringify(payload));
         wrotePayload = true;
-      } catch {}
+      } catch (e) {
+        // Check for QuotaExceededError
+        if (e?.name === 'QuotaExceededError' || (
+          e instanceof DOMException && (
+            e.code === 22 || // QuotaExceeded in most browsers
+            e.code === 1014 || // QuotaExceeded in Safari
+            e.name === 'NS_ERROR_DOM_QUOTA_REACHED' // Firefox
+          )
+        )) {
+          quotaExceeded = true;
+          S.cwarn?.('[Striffs] localStorage quota exceeded - cache not written to localStorage', e);
+        }
+      }
       try {
         localStorage.setItem(`striffsCacheMeta:${key}`, String(payload?.savedAt || ''));
       } catch {}
+      // If quota was exceeded, surface a debug warning
+      if (quotaExceeded) {
+        S.cwarn?.('[Striffs] localStorage quota exceeded - consider clearing cache or using IndexedDB');
+      }
       return wrotePayload;
     } catch {
       return false;
@@ -5352,7 +6015,23 @@
 
   async function readCachedDiagram(meta) {
     const clearAt = await S.getCacheClearAt?.();
-    const parsed = await readCacheFromChromeStorage() || readCacheFromLocalStorage() || await readCacheFromIndexedDb();
+    // Read from all three storage sources and pick the freshest by timestamp
+    const [chromeStorage, localStorage, indexedDb] = await Promise.all([
+      readCacheFromChromeStorage(),
+      Promise.resolve(readCacheFromLocalStorage()),
+      readCacheFromIndexedDb()
+    ]);
+
+    // Find the entry with the most recent savedAt timestamp
+    let parsed = null;
+    let latestTimestamp = -1;
+    for (const entry of [chromeStorage, localStorage, indexedDb]) {
+      if (entry?.savedAt && Number(entry.savedAt) > latestTimestamp) {
+        latestTimestamp = Number(entry.savedAt);
+        parsed = entry;
+      }
+    }
+
     if (!parsed) return null;
     if (clearAt && parsed?.savedAt && Number(parsed.savedAt) <= clearAt) {
       await removeCacheFromChromeStorage();
@@ -5363,6 +6042,16 @@
     const commitCount = meta?.commit_count;
     if (commitCount != null && parsed.commit_count != null && Number(parsed.commit_count) !== Number(commitCount)) return null;
     if ((Date.now() - parsed.savedAt) > (S.CACHE_TTL_MS || 0)) return null;
+    // Only return cached diagrams that are enriched (READY) or have no enrichment (null)
+    // Skip PENDING, RUNNING, and FAILED diagrams
+    const cachedStatus = String(parsed?.cachedAiReviewStatus || "").trim().toUpperCase() || null;
+    if (cachedStatus === "PENDING" || cachedStatus === "RUNNING" || cachedStatus === "FAILED") {
+      // Remove stale non-enriched cache entries
+      await removeCacheFromChromeStorage();
+      removeCacheFromLocalStorage();
+      await removeCacheFromIndexedDb();
+      return null;
+    }
     return parsed.result || null;
   }
 
@@ -5438,6 +6127,16 @@
     if (S.getCurrentView?.() === 'striffs') {
       S.toast?.("AI enrichment applied.", "info", { timeoutMs: 3000 });
     }
+    // Complete the progress bar when enrichment is done
+    const btn = document.querySelector("#striffs-btn");
+    const progressBar = btn?.querySelector('.striffs-progress-bar');
+    if (progressBar && !progressBar.classList.contains('complete')) {
+      progressBar.classList.add('complete');
+      setTimeout(() => {
+        const wrap = btn?.querySelector('.striffs-progress-wrap');
+        if (wrap) wrap.remove();
+      }, 500);
+    }
     return true;
   };
 
@@ -5454,8 +6153,22 @@
     const expectedOperationId = operationId;
     const pollDelayMs = immediate ? 0 : Math.max(1000, Number(S.__lastAiReviewPollAfterMs || 5000));
 
+    // Initialize poll start time if this is a new polling session
+    if (!S.__aiReviewPollStartedAt) {
+      S.__aiReviewPollStartedAt = Date.now();
+    }
+
     const poll = async () => {
       if (S.__aiReviewPollInFlight) return;
+
+      // Check if polling has exceeded the timeout
+      if (S.__aiReviewPollStartedAt && (Date.now() - S.__aiReviewPollStartedAt) > S.ENRICHMENT_POLL_TIMEOUT_MS) {
+        S.cancelEnrichmentPolling?.("timeout");
+        S.updateStriffButton?.({ success: true, tooltip: "AI review timed out. Base diagram is still available." });
+        S.toast?.("AI enrichment timed out after 2 minutes.", "neutral", { timeoutMs: 5000 });
+        return;
+      }
+
       if (String(S.__aiReviewOperationId || S.__engagementCtx?.operationId || "").trim() !== expectedOperationId) {
         S.cancelEnrichmentPolling?.("operation-mismatch");
         return;
@@ -5470,7 +6183,7 @@
         if (!resp?.ok) {
           if (Number(resp?.status || 0) === 403) {
             S.cancelEnrichmentPolling?.("poll-forbidden");
-            S.updateStriffButton?.({ success: true, tooltip: "AI enrichment polling stopped due to authorization." });
+            S.updateStriffButton?.({ success: true, tooltip: "AI review unavailable. Authorization required." });
             return;
           }
           const retryMs = Math.max(2000, Number(S.__lastAiReviewPollAfterMs || 5000));
@@ -5486,16 +6199,16 @@
             const meta = S.extractPRMetadata?.() || null;
             await S.refreshDiagramWithEnrichment?.(result, meta);
           }
-          S.updateStriffButton?.({ success: true, tooltip: "Striffs enriched. Click to view." });
+          S.updateStriffButton?.({ success: true, tooltip: "View" });
           return;
         }
         if (nextStatus === "FAILED") {
           S.cancelEnrichmentPolling?.("failed");
-          S.updateStriffButton?.({ success: true, tooltip: result?.aiReviewErrorMessage || "AI enrichment failed. Base Striffs remain available." });
+          S.updateStriffButton?.({ success: true, tooltip: result?.aiReviewErrorMessage || "AI review failed. Base diagram is still available." });
           return;
         }
         if (nextStatus === "PENDING" || nextStatus === "RUNNING") {
-          S.updateStriffButton?.({ enriching: true, tooltip: "Base Striffs are ready. AI enrichment is still running." });
+          S.updateStriffButton?.({ enriching: true, tooltip: "Enriching" });
           const retryMs = Math.max(1000, Number(result?.aiReviewPollAfterMs || result?.pollAfterMs || 5000));
           S.__aiReviewPollTimer = setTimeout(() => S.startEnrichmentPolling?.({ immediate: true, reason: "continue" }), retryMs);
           return;
@@ -5522,7 +6235,7 @@
     S.__lastRequestType = 'token';
     try { document.documentElement.dataset.striffsLastRequestType = 'token'; } catch {}
     if (!quiet) {
-      S.updateStriffButton({ loading: true, phase: "Loading", tooltip: "Generating Striffs…" });
+      S.updateStriffButton({ loading: true, phase: "Loading", tooltip: "Generating" });
     }
     S.cinfo?.("Striffs request (token)", { owner, repo, pull_number, updated_at });
 
@@ -5543,13 +6256,20 @@
       throw error;
     }
 
+    const payload = resp?.responseStorageKey
+      ? (await chrome.storage.local.get([resp.responseStorageKey]))?.[resp.responseStorageKey]
+      : resp?.json;
+    if (resp?.responseStorageKey) {
+      try { await chrome.storage.local.remove(resp.responseStorageKey); } catch {}
+    }
+
     const durationMs = Date.now() - reqStart;
     S.cinfo?.("Striffs timings", resp?.timings || { type: "token", durationMs, note: "no timings payload from background" });
-    S.__debugLastApiResponse = resp?.json || null;
-    const componentRecords = S.extractApiComponentRecords?.(resp?.json) || [];
-    const componentFilenames = S.extractApiComponentFilenames?.(resp?.json) || [];
+    S.__debugLastApiResponse = payload || null;
+    const componentRecords = S.extractApiComponentRecords?.(payload) || [];
+    const componentFilenames = S.extractApiComponentFilenames?.(payload) || [];
     const debugPayload = {
-      striffsCount: Array.isArray(resp?.json?.striffs) ? resp.json.striffs.length : 0,
+      striffsCount: Array.isArray(payload?.striffs) ? payload.striffs.length : 0,
       componentCount: componentRecords.length,
       componentFilenames,
       componentUniqueFilenames: Array.from(new Set(componentFilenames)),
@@ -5557,10 +6277,307 @@
     };
     // Only include full API response in debug mode to avoid constructing large objects unnecessarily
     if (S.isDebug?.()) {
-      debugPayload.fullApiResponse = resp?.json;
+      debugPayload.fullApiResponse = payload;
     }
     S.debugDump?.("api response (token request)", debugPayload);
-    return resp.json;
+    return payload;
+  }
+
+  function normalizeChangedFilePath(path) {
+    return String(path || '').replace(/\\/g, '/').replace(/^\/+/, '').trim();
+  }
+
+  async function storeTempChangedFiles(changedFiles) {
+    const key = `striffsTempChangedFiles:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+    await chrome.storage.local.set({ [key]: Array.isArray(changedFiles) ? changedFiles : [] });
+    return key;
+  }
+
+  function encodeGitHubPath(path) {
+    return normalizeChangedFilePath(path)
+      .split('/')
+      .filter(Boolean)
+      .map((part) => encodeURIComponent(part))
+      .join('/');
+  }
+
+  function decodeBase64Utf8(content) {
+    const cleaned = String(content || '').replace(/\s+/g, '');
+    const binary = atob(cleaned);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+    return new TextDecoder('utf-8').decode(bytes);
+  }
+
+  async function fetchJsonWithTimeout(url, { token = null, headers = {}, timeoutMs = 20000, credentials = 'omit' } = {}) {
+    const mergedHeaders = {
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      ...headers
+    };
+    if (token) mergedHeaders.Authorization = `token ${token}`;
+    if (credentials !== 'include') {
+      const resp = await S.bgRequest({
+        type: 'proxyFetch',
+        url,
+        method: 'GET',
+        headers: mergedHeaders,
+        bodyType: 'json',
+        timeoutMs,
+        returnHeaders: true
+      }, timeoutMs);
+      return {
+        ok: resp?.ok === true,
+        status: Number(resp?.status || 0),
+        body: resp?.json ?? null,
+        headers: resp?.headers || {}
+      };
+    }
+
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, {
+        method: 'GET',
+        headers: mergedHeaders,
+        credentials,
+        cache: 'no-cache',
+        signal: ctrl.signal
+      });
+      const contentType = String(res.headers.get('content-type') || '').toLowerCase();
+      const body = contentType.includes('application/json')
+        ? await res.json().catch(() => null)
+        : await res.text().catch(() => '');
+      return { ok: res.ok, status: res.status, body, headers: res.headers };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function fetchTextWithTimeout(url, { token = null, headers = {}, timeoutMs = 20000, credentials = 'omit' } = {}) {
+    const mergedHeaders = { ...headers };
+    if (token) mergedHeaders.Authorization = `token ${token}`;
+    if (credentials !== 'include') {
+      const resp = await S.bgRequest({
+        type: 'proxyFetch',
+        url,
+        method: 'GET',
+        headers: mergedHeaders,
+        bodyType: 'text',
+        timeoutMs,
+        returnHeaders: true
+      }, timeoutMs);
+      const headerKey = Object.keys(resp?.headers || {}).find((key) => key.toLowerCase() === 'content-type');
+      const contentType = headerKey ? String(resp.headers[headerKey] || '').toLowerCase() : '';
+      return {
+        ok: resp?.ok === true,
+        status: Number(resp?.status || 0),
+        text: String(resp?.text || ''),
+        headers: resp?.headers || {},
+        contentType
+      };
+    }
+
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, {
+        method: 'GET',
+        headers: mergedHeaders,
+        credentials,
+        cache: 'no-cache',
+        signal: ctrl.signal
+      });
+      const text = await res.text().catch(() => '');
+      return {
+        ok: res.ok,
+        status: res.status,
+        text,
+        headers: res.headers,
+        contentType: String(res.headers.get('content-type') || '').toLowerCase()
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  function parsePrFilesFromDom(filterFiles = []) {
+    const wanted = new Set((filterFiles || []).map((f) => normalizeChangedFilePath(f)).filter(Boolean));
+    const seen = new Map();
+    const nodes = S.$$all([
+      '.js-file[data-path]',
+      '[data-testid="file-diff-unified"][data-path]',
+      '[data-testid="file-diff-split"][data-path]',
+      '.file-header[data-path]',
+      '.js-file-header[data-path]',
+      '.file-header--expandable[data-path]'
+    ]);
+
+    for (const node of nodes) {
+      const rawPath = S.getFilePathFromDiffContainer?.(node) || node.getAttribute?.('data-path') || '';
+      const path = normalizeChangedFilePath(rawPath || S.stripRenamePath(rawPath));
+      if (!path) continue;
+      if (wanted.size && !wanted.has(path)) continue;
+
+      const headerLink = node.querySelector?.('a[title], a.Link--primary, a[data-testid="file-name"]');
+      const headerText = String(headerLink?.getAttribute?.('title') || headerLink?.textContent || node.textContent || '');
+      const lower = headerText.toLowerCase();
+      const renameParts = headerText.split(/→|->/).map((part) => normalizeChangedFilePath(part)).filter(Boolean);
+      let status = 'modified';
+      if (/deleted file mode|file deleted|deleted/.test(lower) && !/new file mode/.test(lower)) {
+        status = 'removed';
+      } else if (/new file mode/.test(lower)) {
+        status = 'added';
+      } else if (/rename from|renamed from|rename to|renamed to|→|->/.test(headerText)) {
+        status = 'renamed';
+      }
+      const previousPath = status === 'renamed' && renameParts.length >= 2 ? renameParts[0] : null;
+      if (!seen.has(path)) {
+        seen.set(path, {
+          filename: path,
+          status,
+          previous_filename: previousPath
+        });
+      }
+    }
+
+    return Array.from(seen.values());
+  }
+
+  async function fetchPrFilesMetadata(meta, filterFiles, token) {
+    const wanted = new Set((filterFiles || []).map((f) => normalizeChangedFilePath(f)).filter(Boolean));
+    const items = [];
+    let page = 1;
+
+    while (true) {
+      const url = `https://api.github.com/repos/${encodeURIComponent(meta.owner)}/${encodeURIComponent(meta.repo)}/pulls/${encodeURIComponent(meta.pull_number)}/files?per_page=100&page=${page}`;
+      const resp = await fetchJsonWithTimeout(url, {
+        token,
+        timeoutMs: timeoutFor("githubPrFiles", 20000)
+      });
+      if (!resp.ok) {
+        const errorText = typeof resp.body === 'string'
+          ? resp.body
+          : (resp.body?.message || `GitHub PR files request failed (${resp.status})`);
+        const err = new Error(errorText);
+        err.status = resp.status;
+        throw err;
+      }
+      const pageItems = Array.isArray(resp.body) ? resp.body : [];
+      for (const item of pageItems) {
+        const filename = normalizeChangedFilePath(item?.filename);
+        if (!filename) continue;
+        if (wanted.size && !wanted.has(filename)) continue;
+        items.push(item);
+      }
+      if (pageItems.length < 100) break;
+      page += 1;
+    }
+
+    return items;
+  }
+
+  async function fetchHeadFileContent(refs, path, token) {
+    const normalizedPath = normalizeChangedFilePath(path);
+    if (!normalizedPath) return null;
+
+    // When no token, use raw.githubusercontent.com directly to avoid API rate limits
+    if (!token) {
+      const rawUrl = `https://raw.githubusercontent.com/${encodeURIComponent(refs.headOwner)}/${encodeURIComponent(refs.headRepo)}/${encodeURIComponent(refs.headBranch)}/${encodeGitHubPath(normalizedPath)}`;
+      const rawResp = await fetchTextWithTimeout(rawUrl, {
+        token: null,
+        timeoutMs: timeoutFor("githubRawDirect", 20000),
+        credentials: 'omit'
+      });
+      if (rawResp.ok && !/text\/html/i.test(rawResp.contentType) && !/^<!doctype html/i.test(rawResp.text.trim())) {
+        return rawResp.text;
+      }
+    }
+
+    const apiUrl = `https://api.github.com/repos/${encodeURIComponent(refs.headOwner)}/${encodeURIComponent(refs.headRepo)}/contents/${encodeGitHubPath(normalizedPath)}?ref=${encodeURIComponent(refs.headBranch)}`;
+    try {
+      const apiResp = await fetchJsonWithTimeout(apiUrl, {
+        token,
+        timeoutMs: timeoutFor("githubContents", 20000)
+      });
+      if (apiResp.ok && apiResp.body && typeof apiResp.body === 'object' && !Array.isArray(apiResp.body)) {
+        if (typeof apiResp.body.content === 'string' && apiResp.body.encoding === 'base64') {
+          return decodeBase64Utf8(apiResp.body.content);
+        }
+        if (typeof apiResp.body.download_url === 'string' && apiResp.body.download_url) {
+          const rawResp = await fetchTextWithTimeout(apiResp.body.download_url, {
+            token,
+            timeoutMs: timeoutFor("githubRawDownload", 20000),
+            credentials: 'omit'
+          });
+          if (rawResp.ok && !/text\/html/i.test(rawResp.contentType) && !/^<!doctype html/i.test(rawResp.text.trim())) {
+            return rawResp.text;
+          }
+        }
+      }
+    } catch {}
+
+    const sessionBlobUrl = `https://github.com/${encodeURIComponent(refs.headOwner)}/${encodeURIComponent(refs.headRepo)}/blob/${encodeURIComponent(refs.headBranch)}/${encodeGitHubPath(normalizedPath)}?raw=1`;
+    const rawResp = await fetchTextWithTimeout(sessionBlobUrl, {
+      token,
+      timeoutMs: timeoutFor("githubRaw", 20000),
+      credentials: 'include'
+    });
+    if (!rawResp.ok) {
+      const err = new Error(rawResp.text || `Failed fetching file content: ${rawResp.status}`);
+      err.status = rawResp.status;
+      throw err;
+    }
+    if (/text\/html/i.test(rawResp.contentType) || /^<!doctype html/i.test(rawResp.text.trim())) {
+      const err = new Error('GitHub returned HTML instead of file content.');
+      err.status = rawResp.status || 401;
+      throw err;
+    }
+    return rawResp.text;
+  }
+
+  async function buildChangedFiles(refs, meta, filterFiles) {
+    const token = await S.getStoredToken();
+    let prFiles;
+    try {
+      prFiles = await fetchPrFilesMetadata(meta, filterFiles, token);
+    } catch (apiError) {
+      S.cwarn?.('Failed to fetch PR files metadata from GitHub API; falling back to DOM metadata.', apiError);
+      prFiles = parsePrFilesFromDom(filterFiles);
+      if (!Array.isArray(prFiles) || !prFiles.length) {
+        throw apiError;
+      }
+    }
+
+    const supportedExts = Array.isArray(S.__supportedExtensionsForUi) ? S.__supportedExtensionsForUi : [];
+    const hasSupportedExtFilter = supportedExts.length > 0;
+    const changedFiles = [];
+
+    for (const file of prFiles) {
+      const status = String(file?.status || 'modified').trim().toLowerCase();
+      const path = normalizeChangedFilePath(file?.filename || file?.path);
+      const previousPath = normalizeChangedFilePath(file?.previous_filename || file?.previousPath);
+      if (!path) continue;
+      if (hasSupportedExtFilter && !S.checkIfRelevantFilesExist?.([path], supportedExts) && !(status === 'renamed' && previousPath && S.checkIfRelevantFilesExist?.([previousPath], supportedExts))) {
+        continue;
+      }
+
+      if (status === 'removed') {
+        changedFiles.push({ path, status: 'removed' });
+        continue;
+      }
+
+      if (status === 'renamed' && previousPath && previousPath !== path) {
+        changedFiles.push({ path: previousPath, status: 'removed' });
+      }
+
+      const normalizedStatus = status === 'added' ? 'added' : 'modified';
+      const content = await fetchHeadFileContent(refs, path, token);
+      if (typeof content !== 'string' || !content.length) continue;
+      changedFiles.push({ path, status: normalizedStatus, content });
+    }
+
+    return changedFiles;
   }
 
   async function requestWithZips(meta, { quiet = false } = {}) {
@@ -5568,22 +6585,31 @@
     const reqStart = Date.now();
     S.__lastRequestType = 'zips';
     try { document.documentElement.dataset.striffsLastRequestType = 'zips'; } catch {}
-    if (!quiet) {
-      S.updateStriffButton({ loading: true, phase: "Generating", tooltip: "Generating Striffs…" });
-    }
     const filterFiles = S.getFilterFilesFromNav();
     const { baseOwner, baseRepo, baseBranch, headOwner, headRepo, headBranch } = S.extractHeadBaseRefs();
+
+    // Phase 1: Fetch files from GitHub
+    if (!quiet) {
+      S.updateStriffButton({ loading: true, phase: "Fetching", tooltip: "Fetching" });
+    }
+    const changedFiles = await buildChangedFiles({ baseOwner, baseRepo, baseBranch, headOwner, headRepo, headBranch }, meta, filterFiles);
     S.cinfo?.("Striffs request (zips)", {
       baseOwner, baseRepo, baseBranch, headOwner, headRepo, headBranch,
       filterFilesCount: filterFiles.length,
-      filterFilesPreview: filterFiles.slice(0, 20)
+      filterFilesPreview: filterFiles.slice(0, 20),
+      changedFilesCount: changedFiles.length,
+      changedFilesPreview: changedFiles.slice(0, 10).map((f) => ({ path: f.path, status: f.status }))
     });
 
+    // Phase 2: Generate via API
+    if (!quiet) {
+      S.updateStriffButton({ loading: true, phase: "Generating", tooltip: "Generating" });
+    }
+    const changedFilesStorageKey = await storeTempChangedFiles(changedFiles);
     const resp = await S.bgRequest({
       type: "generateStriffs",
       baseOwner, baseRepo, baseBranch,
-      headOwner, headRepo, headBranch,
-      filterFiles,
+      changedFilesStorageKey,
       updated_at,
     }, timeoutFor("bgGenerate", timeoutFor("message", 7000)));
 
@@ -5595,13 +6621,20 @@
       throw error;
     }
 
+    const payload = resp?.responseStorageKey
+      ? (await chrome.storage.local.get([resp.responseStorageKey]))?.[resp.responseStorageKey]
+      : resp?.json;
+    if (resp?.responseStorageKey) {
+      try { await chrome.storage.local.remove(resp.responseStorageKey); } catch {}
+    }
+
     const durationMs = Date.now() - reqStart;
     S.cinfo?.("Striffs timings", resp?.timings || { type: "generate", durationMs, note: "no timings payload from background" });
-    S.__debugLastApiResponse = resp?.json || null;
-    const componentRecords = S.extractApiComponentRecords?.(resp?.json) || [];
-    const componentFilenames = S.extractApiComponentFilenames?.(resp?.json) || [];
+    S.__debugLastApiResponse = payload || null;
+    const componentRecords = S.extractApiComponentRecords?.(payload) || [];
+    const componentFilenames = S.extractApiComponentFilenames?.(payload) || [];
     const debugPayload = {
-      striffsCount: Array.isArray(resp?.json?.striffs) ? resp.json.striffs.length : 0,
+      striffsCount: Array.isArray(payload?.striffs) ? payload.striffs.length : 0,
       componentCount: componentRecords.length,
       componentFilenames,
       componentUniqueFilenames: Array.from(new Set(componentFilenames)),
@@ -5609,10 +6642,11 @@
     };
     // Only include full API response in debug mode to avoid constructing large objects unnecessarily
     if (S.isDebug?.()) {
-      debugPayload.fullApiResponse = resp?.json;
+      debugPayload.fullApiResponse = payload;
     }
+    debugPayload.changedFilesCount = changedFiles.length;
     S.debugDump?.("api response (zip request)", debugPayload);
-    return resp.json;
+    return payload;
   }
 
   const ZIP_LIMIT_ERROR_CODES = new Set([
@@ -5650,10 +6684,10 @@
 
     if ((status === 404 && code === 'NOT_FOUND') || (status === 404 && !code)) {
       return {
-        tooltip: "PR/repo not found OR token lacks access. Verify token scopes/org access and PR exists.",
+        tooltip: "Pull request not found. Check the URL or verify access.",
         toast: token
-          ? "<strong>Token issue.</strong> Please verify your token has access to this repo and org."
-          : "PR/repo not found OR token lacks access. Verify token scopes/org access and PR exists.",
+          ? "<strong>Access denied.</strong> Check that your token has access to this repo."
+          : "Pull request not found. Check the URL or verify access.",
         tone: token ? 'error' : 'neutral',
         disabled: true,
         waitingForToken: Boolean(token && S.isPrivateRepo?.())
@@ -5672,8 +6706,8 @@
 
     if ((!token && TOKEN_GUIDANCE_ERROR_CODES.has(code)) || shouldPromptForTokenForZipLimit({ token, status, errorCode: code, message: text })) {
       return {
-        tooltip: "This repo or PR is too large for anonymous zip generation. Add a GitHub token and try again.",
-        toast: "<strong>Connect a GitHub token.</strong> This repo or PR is too large for anonymous zip generation.",
+        tooltip: "This pull request is too large. Add a GitHub token to continue.",
+        toast: "<strong>Pull request too large.</strong> Connect a GitHub token to generate Striffs.",
         tone: 'error',
         disabled: true,
         waitingForToken: false
@@ -5700,8 +6734,8 @@
 
     if (ZIP_REDUCE_SCOPE_ERROR_CODES.has(code) || status === 413) {
       return {
-        tooltip: text,
-        toast: text,
+        tooltip: "This pull request is too large to process.",
+        toast: "This pull request is too large to process.",
         tone: 'neutral',
         disabled: true
       };
@@ -5736,8 +6770,8 @@
 
     if (isTransportFailure) {
       return {
-        tooltip: text,
-        toast: text,
+        tooltip: "Could not reach the Striffs service. Check your connection and try again.",
+        toast: "<strong>Connection failed.</strong> Could not reach the Striffs service.",
         tone: 'error',
         disabled: false
       };
@@ -5777,7 +6811,7 @@
         if (validationError) throw new Error(validationError);
         const engagementReady = S.updateEngagementContextFromResult?.(result);
         if (!engagementReady) {
-          throw new Error("Invalid Striffs response: failed to refresh engagement telemetry.");
+          S.cwarn?.('Engagement telemetry not available after refresh');
         }
         writeCachedDiagram(result, meta);
         S.debugDump?.("engagement context refreshed after cache load", {
@@ -5814,7 +6848,7 @@
     }
 	    const engagementReady = S.updateEngagementContextFromResult?.(result);
 	    if (!engagementReady) {
-	      throw new Error("Invalid Striffs response: failed to initialize engagement telemetry.");
+	      S.cwarn?.('Engagement telemetry not available for this response');
 	    }
       const aiReviewStatus = S.syncAiReviewStateFromResult?.(result);
 	    S.debugDump?.("render result payload summary", {
@@ -5841,16 +6875,22 @@
       const rendered = S.renderStriffsInto(striffContainer, result);
       if (S.state?.isTooLarge?.()) {
         S.__striffsReady = false;
-        S.updateStriffButton({ neutral: true, disabled: true, tooltip: "Diagram too large to render" });
+        S.updateStriffButton({ neutral: true, disabled: true, tooltip: "Pull request is too large to display" });
         return;
       }
       if (!rendered) {
         cerr("Render returned false");
         throw new Error("Failed to render diagram.");
       }
-      if (!fromCache) {
+      // Only cache enriched diagrams (READY) or diagrams without enrichment (null)
+      // Do NOT cache PENDING, RUNNING, or FAILED diagrams
+      const shouldCache = !fromCache && (aiReviewStatus === null || aiReviewStatus === "READY");
+      if (shouldCache) {
         writeCachedDiagram(result, meta);
         S.__lastLoadSource = "fresh";
+      } else if (!fromCache) {
+        // Fresh result but not cached (waiting for enrichment)
+        S.__lastLoadSource = "fresh-uncached";
       } else {
         S.__lastLoadSource = "cache";
       }
@@ -5861,7 +6901,7 @@
 	    S.setAutoGenerateIntent?.(true);
       if (aiReviewStatus === "PENDING" || aiReviewStatus === "RUNNING") {
         S.__lastAiReviewPollAfterMs = Number(result?.aiReviewPollAfterMs || result?.pollAfterMs || 5000);
-        S.updateStriffButton({ enriching: true, tooltip: "Base Striffs are ready. AI enrichment is still running." });
+        S.updateStriffButton({ enriching: true, tooltip: "Enriching" });
         S.startEnrichmentPolling?.({ immediate: false, reason: "fresh-render" });
         return;
       }
@@ -5869,7 +6909,12 @@
         S.updateStriffButton({ success: true, tooltip: result?.aiReviewErrorMessage || "AI enrichment failed. Base Striffs are still available." });
         return;
       }
-	    S.updateStriffButton({ success: true, tooltip: "Striffs loaded. Click to view." });
+      // Check raw SKIPPED status for tooltip (getAiReviewStatusFromResult maps it to null)
+      const rawReviewStatus = String(result?.aiReviewStatus || result?.ai_review_status || "").trim().toUpperCase();
+      const skippedMessage = rawReviewStatus === "SKIPPED" && result?.aiReviewErrorMessage
+        ? result.aiReviewErrorMessage
+        : null;
+      S.updateStriffButton({ success: true, tooltip: skippedMessage || "Striffs loaded. Click to view." });
 	  }
 
   S.autoFetchStriffs = async () => {
@@ -5886,11 +6931,14 @@
       const meta = S.extractPRMetadata();
       const { updated_at } = meta;
 
-      if (!token && S.isPrivateRepo?.()) {
-        S.__waitingForToken = true;
-        S.updateStriffButton({ neutral: true, disabled: true, tooltip: "Private repo requires a token" });
-        S.toast?.("<strong>Private repo detected.</strong> Click the Striffs extension icon and paste a GitHub token with repo read access.", "error", { timeoutMs: 9000 });
-        return false;
+      // If no token, suggest adding one if generation takes too long
+      let tokenSuggestTimer = null;
+      if (!token) {
+        tokenSuggestTimer = setTimeout(() => {
+          if (S.__autoFetchPromise) {
+            S.toast?.("Generation is taking a while. Adding a GitHub token in the extension popup may speed things up.", "warning", { timeoutMs: 15000 });
+          }
+        }, 30000);
       }
 
       // Start building the file path to diff ID map early
@@ -5945,6 +6993,7 @@
         terminalErrorMessage = message;
         return false;
       } finally {
+        if (tokenSuggestTimer) clearTimeout(tokenSuggestTimer);
         if (!skipReconcile) {
           S.reconcileStriffButtonState?.({ errorMessage: terminalErrorMessage });
         }
@@ -6024,7 +7073,7 @@
   // File tree -> center the corresponding node in the diagram when Striffs view is visible
   registerDomListeners();
 
-  // Test message hook (opt-in via localStorage striffsTest=1)
+  // Test message hook (opt-in via chrome.storage.local striffsTest=true)
   window.addEventListener('message', (e) => {
     try {
       if (!S.isTest?.()) return;
@@ -6120,11 +7169,14 @@
             S.__lastFetchedUpdatedAt = Date.now();
             S.setAutoGenerateIntent?.(true);
             if (aiReviewStatus === 'PENDING' || aiReviewStatus === 'RUNNING') {
-              S.updateStriffButton?.({ enriching: true, tooltip: 'Base Striffs are ready. AI enrichment is still running.' });
+              S.updateStriffButton?.({ enriching: true, tooltip: 'Enriching' });
             } else if (aiReviewStatus === 'FAILED') {
-              S.updateStriffButton?.({ success: true, tooltip: resultPayload.aiReviewErrorMessage || 'AI enrichment failed. Base Striffs remain available.' });
+              S.updateStriffButton?.({ success: true, tooltip: resultPayload.aiReviewErrorMessage || 'AI review failed. Base diagram is still available.' });
             } else {
-              S.updateStriffButton?.({ success: true, tooltip: 'Striffs loaded. Click to view.' });
+              const rawPollStatus = String(resultPayload?.aiReviewStatus || '').trim().toUpperCase();
+              const skipMsg = rawPollStatus === 'SKIPPED' && resultPayload.aiReviewErrorMessage
+                ? resultPayload.aiReviewErrorMessage : 'View';
+              S.updateStriffButton?.({ success: true, tooltip: skipMsg });
             }
             const cachePayload = {
               result: resultPayload,
@@ -6327,6 +7379,18 @@
               const liveSvgNode = document.querySelector('#striff-diagram-view svg') || S.__striffsSvg || null;
               const finalSvg = liveSvgNode ? serializer.serializeToString(liveSvgNode) : '';
               const hasNote = finalSvg.includes(S.REVIEW_NOTE_PREFIX);
+              if (!hasNote) {
+                return {
+                  ok: false,
+                  reason: 'ready-no-notes',
+                  status,
+                  reviewId,
+                  changed: Boolean(finalSvg && finalSvg !== baseSvg),
+                  hasNote,
+                  baseLength: baseSvg.length,
+                  finalLength: finalSvg.length
+                };
+              }
               return {
                 ok: Boolean(hasNote && finalSvg && finalSvg !== baseSvg),
                 status,
@@ -6341,6 +7405,16 @@
               return {
                 ok: false,
                 reason: 'review-failed',
+                status,
+                reviewId,
+                errorCode: String(result?.aiReviewErrorCode || ''),
+                errorMessage: String(result?.aiReviewErrorMessage || '')
+              };
+            }
+            if (status === 'NOT_REQUESTED' || status === 'SKIPPED') {
+              return {
+                ok: false,
+                reason: 'not-requested',
                 status,
                 reviewId,
                 errorCode: String(result?.aiReviewErrorCode || ''),
@@ -6670,6 +7744,7 @@
   if (!relevantPage) return;
 
   S.clog?.('content script boot', location.href);
+  try { S.__activePrScopeKey = S.cacheKey?.() || null; } catch {}
 
   S.__remoteConfigPostMountApplied = false;
   const remoteCfgPromise = S.fetchRemoteConfig?.();
@@ -6728,12 +7803,31 @@
   const S = (window.Striffs = window.Striffs || {});
   let lastPath = location.pathname;
   let navIntervalId = null;
+  let navMutationObserver = null;
+  let booting = false; // Prevent race condition from concurrent calls
+  let bootTimeoutId = null;
 
   const isPR = S.isPRPath || ((p) => /\/[^/]+\/[^/]+\/pull\/\d+/.test(p));
   const isPRFiles = S.isPRFilesPath || ((p) => /\/[^/]+\/[^/]+\/pull\/\d+\/(files|changes)/.test(p));
 
   async function bootIfNeeded() {
+    // Immediately nuke any stale diagram from a previous PR (Turbo cache or otherwise)
+    try {
+      const stale = document.getElementById('striff-diagram-view');
+      if (stale && !S.__striffsReady) stale.innerHTML = S.getStriffsContainerMarkup?.('') || '';
+    } catch {}
+
     if (!isPR(location.pathname)) return;
+
+    // Debounce: if a boot is already in progress, schedule a check after it completes
+    if (booting) {
+      if (bootTimeoutId) clearTimeout(bootTimeoutId);
+      bootTimeoutId = setTimeout(() => {
+        bootTimeoutId = null;
+        bootIfNeeded();
+      }, 100);
+      return;
+    }
 
     if (location.pathname === lastPath) return;
     lastPath = location.pathname;
@@ -6741,6 +7835,18 @@
     try {
       S.cancelEnrichmentPolling?.("navigation");
       if (!isPRFiles(location.pathname)) return;
+
+      try {
+        const nextScope = S.cacheKey?.() || null;
+        if (nextScope && nextScope !== S.__activePrScopeKey) {
+          S.resetPrScopedState?.('navigation');
+          S.__activePrScopeKey = nextScope;
+        } else if (!nextScope) {
+          // If we can't compute a scope, don't risk showing prior PR state.
+          S.resetPrScopedState?.('navigation-no-scope');
+          S.__activePrScopeKey = null;
+        }
+      } catch {}
 
       S.__remoteConfigPostMountApplied = false;
       const cfgPromise = S.fetchRemoteConfig?.();
@@ -6753,7 +7859,22 @@
       let cfg = await cfgPromise;
       let disabled = S.applyRemoteDisableIfNeeded?.(cfg);
 
-      await toolbarPromise;
+      const toolbar = await toolbarPromise;
+      if (!toolbar) {
+        // GitHub DOM may have changed - show a one-time message to the user
+        const domWarningKey = 'striffsDomWarningShown';
+        chrome.storage.local.get([domWarningKey], (result) => {
+          if (!result[domWarningKey]) {
+            S.toast?.(
+              'Striffs couldn\'t detect the GitHub toolbar. GitHub may have updated their layout. Please check for an extension update.',
+              'warning',
+              { timeoutMs: 25000 }
+            );
+            chrome.storage.local.set({ [domWarningKey]: Date.now() });
+          }
+        });
+        return;
+      }
       S.mountMainBarButtons?.();
       // Re-apply after mount to ensure the button reflects the remote state.
       if (!cfg) {
@@ -6783,6 +7904,9 @@
       await S.completeFilesPageBoot?.(filesRoot);
     } catch (e) {
       console.warn('[Striffs] nav boot skipped', e);
+    } finally {
+      // Clear booting flag to allow subsequent boots
+      booting = false;
     }
   }
 
@@ -6793,12 +7917,17 @@
     document.removeEventListener('turbo:render', bootIfNeeded);
     document.removeEventListener('pjax:end', bootIfNeeded);
     window.removeEventListener('popstate', bootIfNeeded);
-    window.removeEventListener('striffs:navigate', bootIfNeeded);
-    if (S.__origPushState) history.pushState = S.__origPushState;
-    if (S.__origReplaceState) history.replaceState = S.__origReplaceState;
     if (navIntervalId) {
       clearInterval(navIntervalId);
       navIntervalId = null;
+    }
+    if (navMutationObserver) {
+      navMutationObserver.disconnect();
+      navMutationObserver = null;
+    }
+    if (bootTimeoutId) {
+      clearTimeout(bootTimeoutId);
+      bootTimeoutId = null;
     }
     S.__navListenersRegistered = false;
   };
@@ -6806,23 +7935,42 @@
   function registerNavListeners() {
     if (S.__navListenersRegistered) return;
 
+    // Before Turbo caches the current page, strip extension-injected content
+    // to prevent stale diagrams from appearing when navigating back.
+    document.addEventListener('turbo:before-cache', () => {
+      try {
+        const view = document.getElementById('striff-diagram-view');
+        if (view) view.remove();
+        const toolbarSlot = document.getElementById('striffs-toolbar-slot');
+        if (toolbarSlot) toolbarSlot.remove();
+        const style = document.getElementById('striffs-style');
+        if (style) style.remove();
+      } catch {}
+    });
+
     document.addEventListener('turbo:load', bootIfNeeded);
     document.addEventListener('turbo:render', bootIfNeeded);
     document.addEventListener('pjax:end', bootIfNeeded);
 
-    if (!S.__origPushState) S.__origPushState = history.pushState;
-    if (!S.__origReplaceState) S.__origReplaceState = history.replaceState;
-
-    const fireNav = () => window.dispatchEvent(new Event('striffs:navigate'));
-    history.pushState = function () { const r = S.__origPushState.apply(this, arguments); fireNav(); return r; };
-    history.replaceState = function () { const r = S.__origReplaceState.apply(this, arguments); fireNav(); return r; };
-
     window.addEventListener('popstate', bootIfNeeded);
-    window.addEventListener('striffs:navigate', bootIfNeeded);
 
-    navIntervalId = setInterval(() => {
+    // Replace setInterval with MutationObserver for efficient SPA navigation detection
+    // We observe document.title and <head> changes which happen on navigation
+    navMutationObserver = new MutationObserver(() => {
       if (location.pathname !== lastPath) bootIfNeeded();
-    }, 800);
+    });
+
+    // Observe title changes (most reliable navigation indicator)
+    const titleElement = document.querySelector('title');
+    if (titleElement) {
+      navMutationObserver.observe(titleElement, { subtree: true, characterData: true, childList: true });
+    }
+
+    // Also observe head for meta/link changes as fallback
+    const headElement = document.querySelector('head');
+    if (headElement) {
+      navMutationObserver.observe(headElement, { childList: true });
+    }
 
     S.__navListenersRegistered = true;
   }
@@ -6838,25 +7986,17 @@
   // Initialize flag
   S.__waitingForToken = false;
 
-  // Listen for storage changes
-  if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.onChanged) {
-    chrome.storage.onChanged.addListener(async (changes, areaName) => {
-      if (areaName !== 'local' && areaName !== 'sync') return;
-      if (!changes.ghToken) return;
-
-      const hadToken = Boolean(changes.ghToken.oldValue && changes.ghToken.oldValue.trim());
-      const hasToken = Boolean(changes.ghToken.newValue && changes.ghToken.newValue.trim());
-
-      // If token was just added, clear all waiting state and re-enable the button
-      if (!hadToken && hasToken) {
+  if (typeof chrome !== 'undefined' && chrome.runtime?.onMessage) {
+    chrome.runtime.onMessage.addListener((msg) => {
+      if (msg?.type !== 'tokenStateChanged') return;
+      const hasToken = msg?.hasToken === true;
+      if (hasToken) {
         S.__waitingForToken = false;
         S.cinfo?.('Token saved, clearing any cached state and re-enabling Striffs button');
-        // Clear any cached state that might prevent token usage
         S.__striffsReady = false;
         S.__striffsSvg = null;
         S.updateStriffButton?.({ disabled: false, neutral: false, tooltip: 'Generate Striffs' });
-      } else if (hadToken && !hasToken) {
-        // Token was removed - update UI to show no token
+      } else {
         S.setTokenBadge?.(false);
       }
     });

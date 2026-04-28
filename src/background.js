@@ -1,5 +1,6 @@
 // Ensure chrome-style callbacks exist when only browser.* is available (Firefox/Safari).
 try { importScripts('./webext-shim.js'); } catch (_) {}
+try { importScripts('./background-utils.js'); } catch (_) {}
 
 // background.js (MV3 service worker) — robust onMessage router + timeouts
 
@@ -16,6 +17,8 @@ chrome.runtime.onInstalled.addListener(() => {
 const log  = (...a) => { try { console.log('[bg-striffs]', ...a); } catch {} };
 const warn = (...a) => { try { console.warn('[bg-striffs]', ...a); } catch {} };
 const err  = (...a) => { try { console.error('[bg-striffs]', ...a); } catch {} };
+const BgUtils = globalThis.StriffsBackgroundUtils || {};
+const SESSION_TOKEN_KEY = 'ghTokenSession';
 let debugEnabled = false;
 
 async function loadDebugFlag() {
@@ -33,6 +36,9 @@ const debugLog = (...a) => {
 };
 
 loadDebugFlag();
+migrateLegacyTokenFromLocal().then(() => broadcastTokenState()).catch(() => {});
+
+const normalizeApiBase = BgUtils.normalizeApiBase || ((base) => String(base || '').trim().replace(/\/+$/, ''));
 
 function abortableTimeout(ms) {
   const ctrl = new AbortController();
@@ -46,12 +52,18 @@ async function getApiBase(defaultBase = 'http://localhost:8080') {
     const stored = await chrome.storage.local.get(['striffsApiBase']);
     const val = stored?.striffsApiBase;
     if (typeof val === 'string' && val.trim()) {
-      return val.replace(/\/+$/, '');
+      const normalized = normalizeApiBase(val);
+      if (normalized && normalized !== val.replace(/\/+$/, '')) {
+        try {
+          await chrome.storage.local.set({ striffsApiBase: normalized });
+        } catch {}
+      }
+      return normalized;
     }
   } catch (e) {
     warn('getApiBase failed', e);
   }
-  return defaultBase;
+  return normalizeApiBase(defaultBase);
 }
 
 async function fetchArrayBuffer(url, { timeoutMs = 45000, init = {} } = {}) {
@@ -62,9 +74,41 @@ async function fetchArrayBuffer(url, { timeoutMs = 45000, init = {} } = {}) {
     const ab = await res.arrayBuffer();
     return { ok: true, status: res.status, arrayBuffer: ab };
   } catch (e) {
+    // AbortError.name === 'AbortError' means timeout, not user abort
+    if (e?.name === 'AbortError') {
+      return { ok: false, error: `Timeout (${timeoutMs / 1000}s)` };
+    }
     return { ok: false, error: String(e?.message || e) };
   } finally {
     t.cancel();
+  }
+}
+
+const STATIC_PROXY_HOSTS = BgUtils.STATIC_PROXY_HOSTS || new Set([
+  'api.github.com',
+  'codeload.github.com',
+  'raw.githubusercontent.com',
+  'striffs-config.tor1.cdn.digitaloceanspaces.com'
+]);
+const isLoopbackHostname = BgUtils.isLoopbackHostname || ((hostname) => {
+  const host = String(hostname || '').toLowerCase();
+  return host === 'localhost' || host === '127.0.0.1';
+});
+
+async function isAllowedProxyUrl(rawUrl) {
+  const apiBase = await getApiBase();
+  if (typeof BgUtils.shouldAllowProxyUrl === 'function') {
+    return BgUtils.shouldAllowProxyUrl(rawUrl, apiBase);
+  }
+  try {
+    const url = new URL(String(rawUrl || ''));
+    if (!/^https?:$/i.test(url.protocol)) return false;
+    if (STATIC_PROXY_HOSTS.has(url.hostname) || isLoopbackHostname(url.hostname)) return true;
+    const normalizedApiBase = normalizeApiBase(apiBase);
+    if (!normalizedApiBase) return false;
+    return url.origin === new URL(normalizedApiBase).origin;
+  } catch (_) {
+    return false;
   }
 }
 
@@ -75,18 +119,32 @@ async function downloadRepoZipAsArrayBuffer(owner, repo, ref) {
   return { ok: true, arrayBuffer: r.arrayBuffer };
 }
 
-async function postZipsToLocal(apiUrl, beforeAB, afterAB, filterFiles = [], { timeoutMs = 120000 } = {}) {
+const readApiErrorResponse = BgUtils.readApiErrorResponse || (async (res) => {
+  const text = await res.text().catch(() => '');
+  return {
+    detail: text,
+    error: text || `API request failed: ${res.status}`,
+    errorCode: null
+  };
+});
+
+async function postIncrementalToLocal(apiUrl, beforeAB, changedFiles = [], { timeoutMs = 120000 } = {}) {
   const fd = new FormData();
   fd.append('before', new Blob([beforeAB], { type: 'application/zip' }), 'before.zip');
-  fd.append('after',  new Blob([afterAB],  { type: 'application/zip' }), 'after.zip');
-  for (const f of (filterFiles || [])) fd.append('filter_files', f);
+  fd.append('changed_files', new Blob([JSON.stringify(Array.isArray(changedFiles) ? changedFiles : [])], { type: 'application/json' }));
 
   const t = abortableTimeout(timeoutMs);
   try {
     const res = await fetch(apiUrl, { method: 'POST', body: fd, signal: t.signal });
     if (!res.ok) {
-      const txt = await res.text().catch(() => '');
-      return { ok: false, error: `API request failed: ${res.status}`, detail: txt };
+      const parsed = await readApiErrorResponse(res);
+      return {
+        ok: false,
+        status: res.status,
+        error: parsed.error,
+        errorCode: parsed.errorCode,
+        detail: parsed.detail
+      };
     }
     const json = await res.json();
     return { ok: true, json };
@@ -97,10 +155,11 @@ async function postZipsToLocal(apiUrl, beforeAB, afterAB, filterFiles = [], { ti
   }
 }
 
-const CACHE_PREFIXES = ["striffs:", "striffscache:", "striffscachemeta:"];
-const CLEAR_FLAG_KEY = "striffsCacheClearAt";
-const DEBUG_FLAG_KEY = "striffsDebug";
-const CACHE_KEYS = [
+const CACHE_PREFIXES = BgUtils.CACHE_PREFIXES || ["striffs:", "striffscache:", "striffscachemeta:"];
+const CLEAR_FLAG_KEY = BgUtils.CLEAR_FLAG_KEY || "striffsCacheClearAt";
+const DEBUG_FLAG_KEY = BgUtils.DEBUG_FLAG_KEY || "striffsDebug";
+const TEMP_RESPONSE_PREFIX = BgUtils.TEMP_RESPONSE_PREFIX || "striffsTempResponse:";
+const CACHE_KEYS = BgUtils.CACHE_KEYS || [
   "striffsActiveTab",
   "striffsRemoteConfig",
   "striffsRemoteConfigFetchedAt",
@@ -112,17 +171,16 @@ const CACHE_KEYS = [
   "striffsApiBase"
 ];
 
+async function storeTempResponsePayload(json) {
+  const key = `${TEMP_RESPONSE_PREFIX}${Date.now()}:${Math.random().toString(36).slice(2)}`;
+  await chrome.storage.local.set({ [key]: json });
+  return key;
+}
+
 async function clearChromeStorageCaches() {
   try {
     const items = await chrome.storage.local.get(null);
-    const keys = Object.keys(items || {}).filter((k) => {
-      if (!k) return false;
-      if (k === "ghToken") return false;
-      if (k === CLEAR_FLAG_KEY) return false;
-      if (k === DEBUG_FLAG_KEY) return false;
-      const lower = k.toLowerCase();
-      return CACHE_KEYS.includes(k) || CACHE_PREFIXES.some((p) => lower.startsWith(p)) || lower.startsWith("striffs");
-    });
+    const keys = (BgUtils.selectChromeStorageCacheKeys || (() => []))(items);
     if (keys.length) {
       await chrome.storage.local.remove(keys);
     }
@@ -131,9 +189,32 @@ async function clearChromeStorageCaches() {
   }
 }
 
-function isGithubPullRequestUrl(url) {
-  return /^https?:\/\/(?:[^/]+\.)?github\.com\/[^/]+\/[^/]+\/pull\/\d+(?:\/.*)?$/i.test(String(url || ""));
+// Cleanup orphaned temp storage keys (older than 5 minutes)
+const TEMP_CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const TEMP_KEY_MAX_AGE_MS = 5 * 60 * 1000; // 5 minutes
+let lastTempCleanup = 0;
+
+async function cleanupOrphanedTempKeys() {
+  const now = Date.now();
+  // Only run cleanup periodically (at most once per interval)
+  if (now - lastTempCleanup < TEMP_CLEANUP_INTERVAL_MS) return;
+
+  try {
+    const items = await chrome.storage.local.get(null);
+    const toRemove = (BgUtils.collectExpiredTempResponseKeys || (() => []))(items, now, TEMP_KEY_MAX_AGE_MS);
+    if (toRemove.length > 0) {
+      await chrome.storage.local.remove(toRemove);
+      log(`Cleaned up ${toRemove.length} orphaned temp storage keys`);
+    }
+    lastTempCleanup = now;
+  } catch (e) {
+    warn('cleanupOrphanedTempKeys failed', e);
+  }
 }
+
+const isGithubPullRequestUrl = BgUtils.isGithubPullRequestUrl || ((url) =>
+  /^https?:\/\/(?:[^/]+\.)?github\.com\/[^/]+\/[^/]+\/pull\/\d+(?:\/.*)?$/i.test(String(url || ""))
+);
 
 async function clearGithubLocalStorages({ senderTabId = null, senderUrl = "" } = {}) {
   try {
@@ -149,65 +230,13 @@ async function clearGithubLocalStorages({ senderTabId = null, senderUrl = "" } =
     }
     if (!tabIds.size) return;
     const promises = Array.from(tabIds).map(async (tabId) => {
-      const tryMessage = async () => {
-        if (!chrome.tabs?.sendMessage) return false;
-        try {
-          const resp = await chrome.tabs.sendMessage(tabId, { type: "clearStriffsCaches" });
-          return !!resp?.ok;
-        } catch (_) {
-          return false;
-        }
-      };
-
-      const tryScript = async () => {
-        if (!chrome.scripting?.executeScript) return false;
-        try {
-          await chrome.scripting.executeScript({
-            target: { tabId },
-            world: "MAIN",
-            func: () => {
-              const prefixes = ["striffs:", "striffscache:", "striffscachemeta:"];
-              const removeKeys = (store) => {
-                if (!store) return;
-                const toRemove = [];
-                for (let i = 0; i < store.length; i += 1) {
-                  const key = store.key(i);
-                  if (!key) continue;
-                  const lower = key.toLowerCase();
-                  if (lower === "striffsdebug") continue;
-                  if (prefixes.some((p) => lower.startsWith(p)) || lower.startsWith("striffs")) {
-                    toRemove.push(key);
-                  }
-                }
-                toRemove.forEach((k) => store.removeItem(k));
-              };
-              try {
-                removeKeys(window.localStorage);
-              } catch (e) {
-                console.error('clearGithubLocalStorages localStorage failed', e);
-              }
-              try {
-                removeKeys(window.sessionStorage);
-              } catch (e) {
-                console.error('clearGithubLocalStorages sessionStorage failed', e);
-              }
-              try {
-                window.Striffs?.clearLocalDiagramCaches?.();
-              } catch (e) {
-                console.error('clearGithubLocalStorages Striffs clear failed', e);
-              }
-              return true;
-            },
-          });
-          return true;
-        } catch (_) {
-          return false;
-        }
-      };
-
-      const messageOk = await tryMessage();
-      const scriptOk = await tryScript();
-      return messageOk || scriptOk;
+      if (!chrome.tabs?.sendMessage) return false;
+      try {
+        const resp = await chrome.tabs.sendMessage(tabId, { type: "clearStriffsCaches" });
+        return !!resp?.ok;
+      } catch (_) {
+        return false;
+      }
     });
     await Promise.allSettled(promises);
   } catch (e) {
@@ -215,37 +244,59 @@ async function clearGithubLocalStorages({ senderTabId = null, senderUrl = "" } =
   }
 }
 
-// ------------------------------------------------------------
-// Token cache + helpers (ADDED)
-// ------------------------------------------------------------
-let tokenCache = null;
-
-async function readTokenFromStorage() {
-  try {
-    const l = await chrome.storage.local.get(['ghToken']);
-    if (l && l.ghToken) return l.ghToken;
-  } catch {}
-  try {
-    const s = await chrome.storage.sync.get(['ghToken']);
-    if (s && s.ghToken) return s.ghToken;
-  } catch {}
-  return null;
+async function clearTokenFromStorage() {
+  try { await chrome.storage.session?.remove?.(SESSION_TOKEN_KEY); } catch {}
+  try { await chrome.storage.local.remove('ghToken'); } catch {}
 }
 
-async function clearTokenFromStorage() {
-  await Promise.allSettled([
-    chrome.storage.local.remove('ghToken'),
-    chrome.storage.sync.remove('ghToken'),
-  ]);
+async function getStoredTokenFromSession() {
+  try {
+    const stored = await chrome.storage.session?.get?.([SESSION_TOKEN_KEY]);
+    const token = stored?.[SESSION_TOKEN_KEY];
+    if (typeof token === 'string' && token.trim()) return token.trim();
+  } catch {}
+  return '';
+}
+
+async function storeTokenInSession(token) {
+  const normalized = String(token || '').trim();
+  if (!normalized) throw new Error('missing token');
+  if (!chrome.storage.session?.set) throw new Error('session storage unavailable');
+  await chrome.storage.session.set({ [SESSION_TOKEN_KEY]: normalized });
+  try { await chrome.storage.local.remove('ghToken'); } catch {}
+}
+
+async function migrateLegacyTokenFromLocal() {
+  const current = await getStoredTokenFromSession();
+  if (current) return current;
+  try {
+    const stored = await chrome.storage.local.get(['ghToken']);
+    const legacy = typeof stored?.ghToken === 'string' ? stored.ghToken.trim() : '';
+    if (!legacy) return '';
+    await storeTokenInSession(legacy);
+    return legacy;
+  } catch {
+    return '';
+  }
+}
+
+async function broadcastTokenState() {
+  const hasToken = Boolean(await getStoredTokenFromSession());
+  try { await chrome.runtime.sendMessage({ type: 'tokenStateChanged', hasToken }); } catch {}
+  try {
+    const tabs = await chrome.tabs?.query?.({ url: ["*://github.com/*", "*://*.github.com/*"] }) || [];
+    await Promise.allSettled((tabs || []).map((tab) => (
+      Number.isInteger(tab?.id)
+        ? chrome.tabs.sendMessage(tab.id, { type: 'tokenStateChanged', hasToken }).catch(() => {})
+        : Promise.resolve()
+    )));
+  } catch {}
+  return hasToken;
 }
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local' && Object.prototype.hasOwnProperty.call(changes, 'striffsDebug')) {
     debugEnabled = changes?.striffsDebug?.newValue === true;
-  }
-  if ((area === 'local' || area === 'sync') && changes.ghToken) {
-    tokenCache = null; // invalidate cache on any change to ghToken
-    debugLog('Token cache invalidated due to storage change.');
   }
 });
 
@@ -273,35 +324,44 @@ const handlers = {
   ping: (msg, { safeReply }) => {
     safeReply({ ok: true, pong: true, ts: Date.now() });
   },
-  keepAlive: (msg, { safeReply }) => {
-    setTimeout(() => safeReply({ ok: true, msg: 'kept alive' }), 2500);
-  },
-  getToken: async (msg, { safeReply }) => {
+  forgetToken: async (msg, { safeReply }) => {
     try {
-      if (tokenCache !== null) {
-        safeReply({ ok: true, token: tokenCache });
-        return;
-      }
-      const t = await readTokenFromStorage();
-      tokenCache = t;
-      safeReply({ ok: true, token: t });
+      await clearTokenFromStorage();
+      const hasToken = await broadcastTokenState();
+      safeReply({ ok: true, hasToken });
     } catch (e) {
       safeReply({ ok: false, error: String(e?.message || e) });
     }
   },
-  forgetToken: async (msg, { safeReply }) => {
+  storeToken: async (msg, { safeReply }) => {
     try {
-      tokenCache = null;
-      await clearTokenFromStorage();
-      safeReply({ ok: true });
+      await storeTokenInSession(msg?.token);
+      const hasToken = await broadcastTokenState();
+      safeReply({ ok: true, hasToken });
+    } catch (e) {
+      safeReply({ ok: false, error: String(e?.message || e) });
+    }
+  },
+  getTokenStatus: async (msg, { safeReply }) => {
+    try {
+      const token = await migrateLegacyTokenFromLocal();
+      safeReply({ ok: true, hasToken: Boolean(token) });
+    } catch (e) {
+      safeReply({ ok: false, error: String(e?.message || e) });
+    }
+  },
+  getToken: async (msg, { safeReply }) => {
+    try {
+      const token = await migrateLegacyTokenFromLocal();
+      safeReply({ ok: true, token: token || '' });
     } catch (e) {
       safeReply({ ok: false, error: String(e?.message || e) });
     }
   },
   fetchStriffsWithToken: async (msg, { safeReply }) => {
     const { owner, repo, pull_number, updated_at, token } = msg;
-    if (!owner || !repo || !pull_number || !token) {
-      safeReply({ ok: false, error: 'missing args (owner/repo/pull_number/token)' });
+    if (!owner || !repo || !pull_number) {
+      safeReply({ ok: false, error: 'missing args (owner/repo/pull_number)' });
       return;
     }
     const apiBase = await getApiBase();
@@ -312,27 +372,42 @@ const handlers = {
     const started = Date.now();
     let lastStatus = null;
     try {
-      const res = await fetch(url, { headers: { Authorization: `token ${token}` }, signal: t.signal, cache: 'no-cache' });
+      const headers = {};
+      if (token) {
+        headers['Authorization'] = `token ${token}`;
+      }
+      const res = await fetch(url, { headers, signal: t.signal, cache: 'no-cache' });
       lastStatus = res.status;
       if (!res.ok) {
-        const text = await res.text().catch(() => '');
+        const parsed = await readApiErrorResponse(res);
         debugLog('fetchStriffsWithToken timings', {
           owner, repo, pull_number,
           durationMs: Date.now() - started,
           status: res.status,
           ok: false
         });
-        safeReply({ ok: false, error: `API request failed: ${res.status}`, detail: text });
+        safeReply({
+          ok: false,
+          status: res.status,
+          error: parsed.error,
+          errorCode: parsed.errorCode,
+          detail: parsed.detail
+        });
         return;
       }
       const json = await res.json();
+      const responseStorageKey = await storeTempResponsePayload(json);
       debugLog('fetchStriffsWithToken timings', {
         owner, repo, pull_number,
         durationMs: Date.now() - started,
         status: res.status,
         ok: true
       });
-      safeReply({ ok: true, json, timings: { type: 'token', durationMs: Date.now() - started, status: res.status } });
+      safeReply({
+        ok: true,
+        responseStorageKey,
+        timings: { type: 'token', durationMs: Date.now() - started, status: res.status }
+      });
     } catch (e) {
       debugLog('fetchStriffsWithToken error', { durationMs: Date.now() - started, status: lastStatus, error: String(e?.message || e) });
       safeReply({ ok: false, error: String(e?.message || e) });
@@ -360,74 +435,69 @@ const handlers = {
       safeReply({ ok: false, error: String(e?.message || e) });
     }
   },
-  getSupportedLanguagesCache: async (msg, { safeReply }) => {
-    try {
-      const cached = await chrome.storage.local.get(['striffsSupportedLangs', 'striffsSupportedLangsFetchedAt']);
-      safeReply({ ok: true, cached });
-    } catch (e) {
-      safeReply({ ok: false, error: String(e?.message || e) });
-    }
-  },
   generateStriffs: async (msg, { safeReply }) => {
     const {
       baseOwner, baseRepo, baseBranch,
-      headOwner, headRepo, headBranch,
-      filterFiles = []
+      changedFiles = [],
+      changedFilesStorageKey = ''
     } = msg;
 
-    if (!baseOwner || !baseRepo || !baseBranch || !headOwner || !headRepo || !headBranch) {
+    if (!baseOwner || !baseRepo || !baseBranch) {
       safeReply({ ok: false, error: 'missing repo/ref args' });
       return;
     }
 
+    let effectiveChangedFiles = Array.isArray(changedFiles) ? changedFiles : [];
+    if ((!effectiveChangedFiles || !effectiveChangedFiles.length) && changedFilesStorageKey) {
+      try {
+        const stored = await chrome.storage.local.get([changedFilesStorageKey]);
+        effectiveChangedFiles = Array.isArray(stored?.[changedFilesStorageKey]) ? stored[changedFilesStorageKey] : [];
+      } finally {
+        try { await chrome.storage.local.remove(changedFilesStorageKey); } catch {}
+      }
+    }
+
     debugLog('generateStriffs start', {
-      baseOwner, baseRepo, baseBranch, headOwner, headRepo, headBranch,
-      filterFilesCount: filterFiles.length,
-      filterFilesPreview: Array.isArray(filterFiles) ? filterFiles.slice(0, 30) : []
+      baseOwner, baseRepo, baseBranch,
+      changedFilesCount: Array.isArray(effectiveChangedFiles) ? effectiveChangedFiles.length : 0,
+      changedFilesPreview: Array.isArray(effectiveChangedFiles) ? effectiveChangedFiles.slice(0, 10).map((f) => ({
+        path: f?.path || '',
+        status: f?.status || '',
+        contentLength: typeof f?.content === 'string' ? f.content.length : 0
+      })) : []
     });
 
     const overallStart = Date.now();
     const downloadStart = Date.now();
-    const beforePromise = (async () => {
-      const s = Date.now();
-      const r = await downloadRepoZipAsArrayBuffer(baseOwner, baseRepo, baseBranch);
-      return { ...r, durationMs: Date.now() - s };
-    })();
-    const afterPromise = (async () => {
-      const s = Date.now();
-      const r = await downloadRepoZipAsArrayBuffer(headOwner, headRepo, headBranch);
-      return { ...r, durationMs: Date.now() - s };
-    })();
-
-    const [before, after] = await Promise.all([beforePromise, afterPromise]);
+    const beforeStarted = Date.now();
+    const before = await downloadRepoZipAsArrayBuffer(baseOwner, baseRepo, baseBranch);
+    before.durationMs = Date.now() - beforeStarted;
     const downloadDurationMs = Date.now() - downloadStart;
 
-    if (!before.ok || !after.ok) {
+    if (!before.ok) {
       debugLog('generateStriffs download error', {
-        baseOk: before.ok, headOk: after.ok,
-        baseDurationMs: before.durationMs, headDurationMs: after.durationMs,
+        baseOk: before.ok,
+        baseDurationMs: before.durationMs,
         totalDownloadMs: downloadDurationMs,
-        baseError: before.error, headError: after.error
+        baseError: before.error
       });
-      if (!before.ok) { safeReply({ ok: false, error: `Failed downloading base zip: ${before.error}` }); return; }
-      if (!after.ok)  { safeReply({ ok: false, error: `Failed downloading head zip: ${after.error}` }); return; }
+      safeReply({ ok: false, error: `Failed downloading base zip: ${before.error}` });
+      return;
     }
 
     debugLog('generateStriffs download timings', {
       baseDownloadMs: before.durationMs,
-      headDownloadMs: after.durationMs,
       totalDownloadMs: downloadDurationMs,
-      filterFilesCount: filterFiles.length
+      changedFilesCount: Array.isArray(effectiveChangedFiles) ? effectiveChangedFiles.length : 0
     });
 
     const postStart = Date.now();
     const apiBase = await getApiBase();
     debugLog('generateStriffs using base', apiBase);
-    const posted = await postZipsToLocal(
+    const posted = await postIncrementalToLocal(
       `${apiBase}/api/v1/github/striffs`,
       before.arrayBuffer,
-      after.arrayBuffer,
-      filterFiles,
+      effectiveChangedFiles,
       { timeoutMs: 180000 }
     );
     const postDurationMs = Date.now() - postStart;
@@ -435,45 +505,50 @@ const handlers = {
 
     debugLog('generateStriffs timings', {
       baseDownloadMs: before.durationMs,
-      headDownloadMs: after.durationMs,
       totalDownloadMs: downloadDurationMs,
       postDurationMs,
       totalMs: totalDurationMs,
-      filterFilesCount: filterFiles.length,
+      changedFilesCount: Array.isArray(effectiveChangedFiles) ? effectiveChangedFiles.length : 0,
       ok: posted.ok === true
     });
 
-    if (!posted.ok) { safeReply({ ok: false, error: posted.error, timings: { baseDownloadMs: before.durationMs, headDownloadMs: after.durationMs, totalDownloadMs: downloadDurationMs, postDurationMs, totalMs: totalDurationMs, filterFilesCount: filterFiles.length } }); return; }
+    if (!posted.ok) {
+      safeReply({
+        ok: false,
+        status: posted.status ?? null,
+        error: posted.error,
+        errorCode: posted.errorCode ?? null,
+        detail: posted.detail ?? null,
+        timings: {
+          baseDownloadMs: before.durationMs,
+          totalDownloadMs: downloadDurationMs,
+          postDurationMs,
+          totalMs: totalDurationMs,
+          changedFilesCount: Array.isArray(effectiveChangedFiles) ? effectiveChangedFiles.length : 0
+        }
+      });
+      return;
+    }
     safeReply({
       ok: true,
-      json: posted.json,
+      responseStorageKey: await storeTempResponsePayload(posted.json),
       timings: {
         type: 'generate',
         baseDownloadMs: before.durationMs,
-        headDownloadMs: after.durationMs,
         totalDownloadMs: downloadDurationMs,
         postDurationMs,
         totalMs: totalDurationMs,
-        filterFilesCount: filterFiles.length
+        changedFilesCount: Array.isArray(effectiveChangedFiles) ? effectiveChangedFiles.length : 0
       }
     });
   },
-  downloadZip: async (msg, { safeReply }) => {
-    const { url } = msg || {};
-    if (!url) { safeReply({ success: false, error: 'missing url' }); return; }
-    try {
-      const r = await fetch(url, { cache: 'no-cache' });
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const ab = await r.arrayBuffer();
-      safeReply({ success: true, buffer: Array.from(new Uint8Array(ab)) });
-    } catch (e) {
-      safeReply({ success: false, error: String(e?.message || e) });
-    }
-  },
   proxyFetch: async (msg, { safeReply }) => {
-    // ADDED: returnHeaders support to surface OAuth scopes from GitHub responses
     const { url, method = 'GET', headers = {}, bodyType = 'text', body, timeoutMs = 20000, returnHeaders = false } = msg;
     if (!url) { safeReply({ ok: false, error: 'missing url' }); return; }
+    if (!(await isAllowedProxyUrl(url))) {
+      safeReply({ ok: false, error: 'proxyFetch blocked for disallowed URL' });
+      return;
+    }
 
     const t = abortableTimeout(timeoutMs);
     try {
@@ -484,11 +559,7 @@ const handlers = {
 
       let hdrs = undefined;
       if (returnHeaders) {
-        const wanted = ['x-oauth-scopes','x-accepted-oauth-scopes','x-ratelimit-remaining','x-ratelimit-reset'];
-        hdrs = {};
-        for (const [k, v] of res.headers.entries()) {
-          if (wanted.includes(k.toLowerCase())) hdrs[k] = v;
-        }
+        hdrs = (BgUtils.pickReturnHeaders || (() => ({})))(res.headers);
       }
 
       if (bodyType === 'json') {
@@ -552,6 +623,47 @@ const handlers = {
       t.cancel();
     }
   },
+  fetchAiReviewStatus: async (msg, { safeReply }) => {
+    const {
+      operationId,
+      engagementToken,
+      timeoutMs = 15000
+    } = msg || {};
+    const op = String(operationId || "").trim();
+    const token = String(engagementToken || "").trim();
+    if (!op) { safeReply({ ok: false, error: "missing operationId" }); return; }
+    if (!token) { safeReply({ ok: false, error: "missing engagementToken" }); return; }
+    const apiBase = await getApiBase();
+    const url = `${apiBase}/api/v1/striffs/${encodeURIComponent(op)}/ai-review`;
+    const t = abortableTimeout(timeoutMs);
+    try {
+      const res = await fetch(url, {
+        method: "GET",
+        headers: {
+          "X-Striff-Engagement-Token": token
+        },
+        signal: t.signal,
+        cache: "no-cache"
+      });
+      const status = res.status;
+      const json = await res.json().catch(() => null);
+      if (!res.ok) {
+        safeReply({
+          ok: false,
+          status,
+          error: `HTTP ${status}`,
+          json,
+          body: json?.errorMessage || null
+        });
+        return;
+      }
+      safeReply({ ok: true, status, json });
+    } catch (e) {
+      safeReply({ ok: false, error: String(e?.message || e) });
+    } finally {
+      t.cancel();
+    }
+  },
   fetchRemoteConfig: async (msg, { safeReply }) => {
     const { url, timeoutMs = 7000 } = msg || {};
     if (!url) { safeReply({ ok: false, error: 'missing url' }); return; }
@@ -579,6 +691,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     try { sendResponse(payload); }
     catch (e) { err('sendResponse failed:', e); }
   };
+
+  // Passive cleanup of orphaned temp storage (fire-and-forget, throttled internally)
+  cleanupOrphanedTempKeys().catch(() => {});
 
   try {
     const type = msg?.type;
