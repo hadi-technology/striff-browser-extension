@@ -47,8 +47,8 @@ function stripStriffsRuntimeOverrides(source) {
 
 function stripBackgroundRuntimeOverrides(source) {
   return source.replace(
-    /async function getApiBase\(defaultBase = 'http:\/\/localhost:8080'\) \{[\s\S]*?return normalizeApiBase\(defaultBase\);\n\}/,
-    "async function getApiBase(defaultBase = 'http://localhost:8080') {\n  return normalizeApiBase(defaultBase);\n}"
+    /async function getApiBase\(defaultBase = 'https:\/\/api\.striff\.io'\) \{[\s\S]*?return normalizeApiBase\(defaultBase\);\n\}/,
+    "async function getApiBase(defaultBase = 'https://api.striff.io') {\n  return normalizeApiBase(defaultBase);\n}"
   );
 }
 

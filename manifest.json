@@ -11,12 +11,8 @@
     "*://github.com/*",
     "*://*.github.com/*",
     "https://codeload.github.com/*",
-    "https://striff.io/*",
-    "https://striffs-config.tor1.cdn.digitaloceanspaces.com/*",
-    "http://localhost:*/*",
-    "http://127.0.0.1:*/*",
-    "http://localhost:8080/*",
-    "http://127.0.0.1:8080/*"
+    "*://*.striff.io/*",
+    "https://striffs-config.tor1.cdn.digitaloceanspaces.com/*"
   ],
   "background": {
     "service_worker": "src/background.js"

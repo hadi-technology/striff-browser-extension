@@ -8,13 +8,13 @@ try { importScripts('./background-utils.js'); } catch (_) {}
 // Lifecycle
 // ------------------------------------------------------------
 chrome.runtime.onInstalled.addListener(() => {
-  console.log('[bg-striffs] Installed.');
+  // Installed or updated
 });
 
 // ------------------------------------------------------------
 // Small helpers
 // ------------------------------------------------------------
-const log  = (...a) => { try { console.log('[bg-striffs]', ...a); } catch {} };
+const log  = () => {};
 const warn = (...a) => { try { console.warn('[bg-striffs]', ...a); } catch {} };
 const err  = (...a) => { try { console.error('[bg-striffs]', ...a); } catch {} };
 const BgUtils = globalThis.StriffsBackgroundUtils || {};
@@ -47,7 +47,7 @@ function abortableTimeout(ms) {
 }
 
 // API base override via chrome.storage.local key "striffsApiBase"
-async function getApiBase(defaultBase = 'http://localhost:8080') {
+async function getApiBase(defaultBase = 'https://api.striff.io') {
   try {
     const stored = await chrome.storage.local.get(['striffsApiBase']);
     const val = stored?.striffsApiBase;

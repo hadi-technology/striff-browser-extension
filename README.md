@@ -1,5 +1,7 @@
 # Striffs for GitHub
 
+> **Install from the Chrome Web Store**: [Striffs for GitHub](https://chromewebstore.google.com/detail/striffs-for-github/gcbcjajnjbplgkhnbemlkadgnjnfjoen)
+
 Browser extension that adds a `Striffs` view to GitHub pull request pages and renders architecture-aware SVG diffs from the Striff API.
 
 ## Features

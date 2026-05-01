@@ -615,12 +615,13 @@
         const shell = document.createElement("div");
         shell.className = "striffs-note-feedback";
         shell.setAttribute("data-note-qualified-name", qn);
-        // Position below the note box, aligned to its right edge.
+        // Position below the note box, spanning its width.
         const verticalOffset = 8;
-        shell.style.left = `${(bbox.x + bbox.width) * zoom}px`;
+        shell.style.left = `${bbox.x * zoom}px`;
         shell.style.top = `${(bbox.y + bbox.height + verticalOffset) * zoom}px`;
-        shell.style.transform = `translate(-100%, 0) scale(${Math.max(0.8, Math.min(zoom, 2.0))})`;
-        shell.style.transformOrigin = 'top right';
+        shell.style.width = `${bbox.width * zoom}px`;
+        shell.style.transform = `scale(${Math.max(0.8, Math.min(zoom, 2.0))})`;
+        shell.style.transformOrigin = 'top left';
         shell.setAttribute("data-note-id", noteId);
 
         const currentVote = S.__reviewNoteVotes?.get?.(noteId) || null;
@@ -628,6 +629,10 @@
         if (currentVote) continue;
 
         const noteText = S.extractReviewNoteText?.(note) || "";
+
+        // --- Left group: vote buttons ---
+        const leftGroup = document.createElement("span");
+        leftGroup.className = "striffs-note-feedback-left";
 
         const createVoteButton = (vote, icon, label) => {
           const btn = document.createElement("button");
@@ -672,8 +677,34 @@
           return btn;
         };
 
-        shell.appendChild(createVoteButton("up", "thumbsup", "Helpful AI note"));
-        shell.appendChild(createVoteButton("down", "thumbsdown", "Unhelpful AI note"));
+        leftGroup.appendChild(createVoteButton("up", "thumbsup", "Helpful AI note"));
+        leftGroup.appendChild(createVoteButton("down", "thumbsdown", "Unhelpful AI note"));
+        shell.appendChild(leftGroup);
+
+        // --- Right group: copy button ---
+        const rightGroup = document.createElement("span");
+        rightGroup.className = "striffs-note-feedback-right";
+
+        const copyBtn = document.createElement("button");
+        copyBtn.type = "button";
+        copyBtn.className = "striffs-note-feedback-btn striffs-note-feedback-btn--copy";
+        copyBtn.setAttribute("aria-label", "Copy note to clipboard");
+        copyBtn.title = "Copy note to clipboard";
+        const copyIconHtml = `<span style="background-color: #ddf4ff; padding: 0.25em 0.4em; border-radius: 4px; display: inline-block; border: 1px solid #0969da; font-size: 1em;">📋</span>`;
+        copyBtn.innerHTML = copyIconHtml;
+        copyBtn.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          if (!noteText) return;
+          navigator.clipboard.writeText(noteText).then(() => {
+            copyBtn.innerHTML = `<span style="background-color: #dafbe1; padding: 0.25em 0.4em; border-radius: 4px; display: inline-block; border: 1px solid #1a7f37; font-size: 1em;">✓</span>`;
+            setTimeout(() => {
+              copyBtn.innerHTML = copyIconHtml;
+            }, 1500);
+          }).catch(() => {});
+        });
+        rightGroup.appendChild(copyBtn);
+        shell.appendChild(rightGroup);
         layer.appendChild(shell);
       } catch (e) {
         // Skip notes that can't be positioned
@@ -2347,7 +2378,7 @@
         return t;
     };
 
-    S.toast = function toast(message, type = 'info', { timeoutMs } = {}) {
+    S.toast = function toast(message, type = 'info', { timeoutMs, html } = {}) {
         S.ensureGlobalToast();
 
         // Error/warning toasts should persist longer (15-20s) as they may require user action
@@ -2361,7 +2392,11 @@
         dot.setAttribute('aria-hidden', 'true');
         const msgEl = document.createElement('div');
         msgEl.className = 'striffs-toast-msg';
-        msgEl.textContent = String(message || '');
+        if (html) {
+          msgEl.innerHTML = String(message || '');
+        } else {
+          msgEl.textContent = String(message || '');
+        }
         el.appendChild(dot);
         el.appendChild(msgEl);
 
@@ -2654,6 +2689,7 @@
     position: relative;
     width: 100%;
     border: 1px solid #444;
+    background-color: #f8f8f8;
   }
   #striffs-surface{
     display:flex;
@@ -2745,13 +2781,17 @@
   }
   #striff-diagram-view .striffs-note-feedback{
     position: absolute;
-    display: inline-flex;
+    display: flex;
     flex-direction: row;
     align-items: center;
-    justify-content: center;
-    gap: 8px;
-    min-width: 64px;
+    justify-content: space-between;
     pointer-events: auto;
+  }
+  #striff-diagram-view .striffs-note-feedback-left,
+  #striff-diagram-view .striffs-note-feedback-right{
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
   }
   #striff-diagram-view .striffs-note-feedback-btn{
     appearance: none;
@@ -2760,8 +2800,6 @@
     color: #656d76;
     border-radius: 4px;
     padding: 2px;
-    width: 24px;
-    height: 24px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -2786,6 +2824,10 @@
   #striff-diagram-view .striffs-note-feedback-btn--down:hover{
     background: #ffebe9;
     color: #cf222e;
+  }
+  #striff-diagram-view .striffs-note-feedback-btn--copy:hover{
+    background: #ddf4ff;
+    color: #0969da;
   }
   #striff-diagram-view .striffs-note-feedback-thanks{
     font-size: 11px;
@@ -2878,12 +2920,15 @@
     align-items: center;
     gap: 0;
     min-height: 32px;
-    padding: 4px 8px;
+    padding: 4px 8px 4px 16px;
     box-sizing: border-box;
   }
   .striffs-view-striff-option.is-disabled{
     opacity: 0.5;
     cursor: not-allowed;
+  }
+  .striffs-view-striff-option--legacy{
+    padding: 4px 8px;
   }
   .striffs-view-striff-option-spacer{
     display: none;
@@ -3060,7 +3105,7 @@
               S.toast?.("Unable to download SVG right now.", "neutral", { timeoutMs: 3000 });
             }
         };
-        if (!striffView.__striffsZoomBound) {
+        if (!striffView.__striffsZoomBound || !striffView.__striffsZoomBoundScrollEl || !striffView.contains(striffView.__striffsZoomBoundScrollEl)) {
             striffView.__striffsZoomBound = true;
             striffView.addEventListener('click', (event) => {
                 const target = event?.target;
@@ -3086,6 +3131,7 @@
             let zoomOp = null;
             let zoomFinalizeTimer = 0;
             const scrollEl = striffView.querySelector('#striffs-scroll') || striffView;
+            striffView.__striffsZoomBoundScrollEl = scrollEl;
             const normalizePanZoomSnapshot = (snap) => {
                 const safe = snap || {};
                 return {
@@ -3464,6 +3510,7 @@
   S.updateFileTreeAvailability = () => {
     try {
       if (!S.__striffsPathToComponentId || !S.__striffsPathToComponentId.size) return;
+      if (S.getCurrentView?.() !== 'striffs') return;
       // Include new UI selectors, but exclude directories explicitly
       const items = S.$$all?.([
         "li[id^='file-tree-item-diff-']",
@@ -3787,17 +3834,20 @@
     btn.setAttribute('role', 'menuitem');
     const hostTag = String(menuHost.tagName || '').toUpperCase();
     if (hostTag === 'DETAILS-MENU') {
-      btn.className = 'tmp-pl-5 dropdown-item btn-link striffs-view-striff-option';
+      btn.className = 'tmp-pl-5 dropdown-item btn-link striffs-view-striff-option striffs-view-striff-option--legacy';
     } else if (menuHost.getAttribute?.('role') === 'menu') {
       btn.className = 'ActionListContent ActionListItem striffs-view-striff-option';
     } else {
       btn.className = 'ActionListContent striffs-view-striff-option';
     }
-    btn.innerHTML = [
-      `<span class="striffs-view-striff-option-spacer" aria-hidden="true"></span>`,
-      `<span class="striffs-view-striff-option-visual" aria-hidden="true"><span class="striffs-view-striff-option-icon">${S.octicon('server')}</span></span>`,
-      `<span class="striffs-view-striff-option-label">View Striff</span>`
-    ].join('');
+    const isLegacy = hostTag === 'DETAILS-MENU';
+    btn.innerHTML = isLegacy
+      ? `<span class="striffs-view-striff-option-label">View Striff</span>`
+      : [
+          `<span class="striffs-view-striff-option-spacer" aria-hidden="true"></span>`,
+          `<span class="striffs-view-striff-option-visual" aria-hidden="true"><span class="striffs-view-striff-option-icon">${S.octicon('server')}</span></span>`,
+          `<span class="striffs-view-striff-option-label">View Striff</span>`
+        ].join('');
 
     if (hostTag === 'UL' || hostTag === 'OL') {
       const li = document.createElement('li');
@@ -6690,7 +6740,8 @@
           : "Pull request not found. Check the URL or verify access.",
         tone: token ? 'error' : 'neutral',
         disabled: true,
-        waitingForToken: Boolean(token && S.isPrivateRepo?.())
+        waitingForToken: Boolean(token && S.isPrivateRepo?.()),
+        htmlToast: Boolean(token)
       };
     }
 
@@ -6710,7 +6761,8 @@
         toast: "<strong>Pull request too large.</strong> Connect a GitHub token to generate Striffs.",
         tone: 'error',
         disabled: true,
-        waitingForToken: false
+        waitingForToken: false,
+        htmlToast: true
       };
     }
 
@@ -6773,7 +6825,8 @@
         tooltip: "Could not reach the Striffs service. Check your connection and try again.",
         toast: "<strong>Connection failed.</strong> Could not reach the Striffs service.",
         tone: 'error',
-        disabled: false
+        disabled: false,
+        htmlToast: true
       };
     }
 
@@ -6984,7 +7037,7 @@
           disabled: handled.disabled === true,
           tooltip: handled.tooltip
         });
-        S.toast?.(handled.toast, handled.tone, { timeoutMs: 10000 });
+        S.toast?.(handled.toast, handled.tone, { timeoutMs: 10000, html: Boolean(handled.htmlToast) });
         if (handled.disabled === true || handled.waitingForToken) {
           skipReconcile = true;
           return false;
@@ -7814,7 +7867,7 @@
     // Immediately nuke any stale diagram from a previous PR (Turbo cache or otherwise)
     try {
       const stale = document.getElementById('striff-diagram-view');
-      if (stale && !S.__striffsReady) stale.innerHTML = S.getStriffsContainerMarkup?.('') || '';
+      if (stale) stale.innerHTML = S.getStriffsContainerMarkup?.('') || '';
     } catch {}
 
     if (!isPR(location.pathname)) return;
