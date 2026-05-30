@@ -4,10 +4,11 @@
 (() => {
   const S = (window.Striffs = window.Striffs || {});
   const ConfigUtils = globalThis.StriffsConfigUtils || {};
+  const BgUtils = globalThis.StriffsBackgroundUtils || {};
 
   // ---------- Constants / State ----------
   S.MAX_UNAUTH_ZIP_SIZE_MB = 50;
-  S.CACHE_TTL_MS = 60 * 60 * 1000; // 1h
+  S.CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
   S.ENRICHMENT_POLL_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
   S.TIMEOUTS = Object.freeze({
     message: 7000,
@@ -15,7 +16,11 @@
     waitForToolbar: 8000,
     bgGenerate: 180000,
     bgToken: 180000,
+    bgPrefetch: 30000,
+    bgArtifactPrefetch: 180000,
   });
+  S.PREFETCH_ARTIFACT_MAX_CHANGED_FILES = 50;
+  S.PREFETCH_ARTIFACT_MAX_CHANGED_FILES_BYTES = 15 * 1024 * 1024;
 
   S.DEFAULT_SUPPORTED_EXTS = ['java', 'ts', 'py'];
 
@@ -31,6 +36,8 @@
   S.__striffsReady = false;
   S.__striffsNoChanges = false;
   S.__lastFetchedUpdatedAt = null;
+  S.__lastPrefetchRequestKey = null;
+  S.__prefetchPromise = null;
   S.__styleInjected = false;
   S.__waitingForToken = false;
   S.__striffsZoom = 1;
@@ -47,6 +54,7 @@
   S.PAN_CLICK_DEBOUNCE_MS = 250;
   S.ZOOM_MIN = 0.1;
   S.ZOOM_MAX = 50;
+  S.REVIEW_NOTE_FEEDBACK_ZOOM_THRESHOLD = 0.9;
   S.ZOOM_IN = 1.2;
   S.ZOOM_OUT = 0.85;
   S.FOCUS_MIN_ZOOM = 0.8;
@@ -57,8 +65,9 @@
   S.REMOTE_CONFIG_URL = 'https://striffs-config.tor1.cdn.digitaloceanspaces.com/config.json';
   S.REMOTE_CONFIG_TTL_MS = 2 * 60 * 1000;
   S.SUPPORTED_LANGS_TTL_MS = 24 * 60 * 60 * 1000;
-  S.CACHE_CLEAR_FLAG_KEY = 'striffsCacheClearAt';
-  S.CACHE_CLEAR_SEEN_KEY = 'striffsCacheClearSeenAt';
+  S.CACHE_CLEAR_FLAG_KEY = BgUtils.CLEAR_FLAG_KEY || 'striffsCacheClearAt';
+  S.CACHE_CLEAR_SEEN_KEY = BgUtils.CACHE_CLEAR_SEEN_KEY || 'striffsCacheClearSeenAt';
+  S.STRIFFS_CACHE_DB = BgUtils.INDEXEDDB_NAME || 'striffs-cache-db';
   S.ENGAGEMENT_SCHEMA_VERSION = 2;
   S.ENGAGEMENT_COMPONENT_IDS_LIMIT = 80;
   S.ENGAGEMENT_ZOOM_IDLE_MS = 220;
@@ -80,6 +89,33 @@
   S.__engagementSkippedCount = Number(S.__engagementSkippedCount || 0);
   S.__reviewNoteVotes = S.__reviewNoteVotes || new Map();
   S.__reviewNoteFeedbackFrame = Number(S.__reviewNoteFeedbackFrame || 0);
+
+  // ---------- Comment component selection state ----------
+  S.COMMENT_MAX_SELECTION = 10;
+  S.__commentState = {
+    active: false,
+    operationId: null,
+    diagramIndex: 0,
+    selectedIds: [],
+    draftText: "",
+    previewSvg: null,
+    previewError: null,
+    requestSeq: 0,
+    completedSeq: 0
+  };
+  S.__commentDebounceTimer = null;
+  S.resetCommentState = function resetCommentState() {
+    S.__commentState.active = false;
+    S.__commentState.operationId = null;
+    S.__commentState.diagramIndex = 0;
+    S.__commentState.selectedIds = [];
+    S.__commentState.draftText = "";
+    S.__commentState.previewSvg = null;
+    S.__commentState.previewError = null;
+    S.__commentState.requestSeq = 0;
+    S.__commentState.completedSeq = 0;
+    delete S.__commentState._savedOnExit;
+  };
   S.loadDebugFlag = S.loadDebugFlag || (async () => {
     try {
       const store = chrome?.storage?.local;
@@ -136,6 +172,7 @@
     }
   });
   S.isTest = S.isTest || (() => S.__testModeEnabled === true);
+
   // ---------- GitHub DOM selectors (centralized for drift resilience) ----------
   const SELECTORS = S.SELECTORS = S.SELECTORS || Object.freeze({
     toolbar: [
@@ -524,13 +561,16 @@
 
   S.REVIEW_NOTE_TOKEN = "AI_REVIEW";
   S.REVIEW_NOTE_PREFIX = "AI_REVIEW_NOTE_";
-  S.isReviewNoteQualifiedName = (value) =>
-    String(value || "").trim().includes(S.REVIEW_NOTE_TOKEN);
+  S.REVIEW_NOTE_ALIASES = /^(?:AI_REVIEW_NOTE_|surfaced_note_)\d/i;
+  S.isReviewNoteQualifiedName = (value) => {
+    const qn = String(value || "").trim();
+    return qn.includes(S.REVIEW_NOTE_TOKEN) || S.REVIEW_NOTE_ALIASES.test(qn);
+  };
 
   S.extractReviewNoteId = (value) => {
     const qn = String(value || "").trim();
     if (!qn) return null;
-    const match = qn.match(/AI_REVIEW_NOTE_([A-Z0-9_-]+)/i);
+    const match = qn.match(/(?:AI_REVIEW_NOTE_|surfaced_note_)([A-Z0-9_-]+)/i);
     return match?.[1] ? String(match[1]).toLowerCase() : null;
   };
 
@@ -600,11 +640,14 @@
       }
     });
     const zoom = Number(S.__striffsZoom) || 1;
+    const feedbackThreshold = Number(S.REVIEW_NOTE_FEEDBACK_ZOOM_THRESHOLD) || 1.5;
     const notes = S.getReviewNoteEntities?.(svg) || [];
     for (const note of notes) {
       const qn = String(note.getAttribute?.("data-qualified-name") || "").trim();
       const noteId = S.extractReviewNoteId?.(qn);
       if (!noteId) continue;
+      // Hide feedback buttons when zoomed out — only show when user is reading notes
+      if (zoom < feedbackThreshold) continue;
       // Skip if we already have a shell for this note (including thank you messages)
       if (layer.querySelector(`[data-note-qualified-name="${qn}"]`)) {
         continue;
@@ -615,13 +658,13 @@
         const shell = document.createElement("div");
         shell.className = "striffs-note-feedback";
         shell.setAttribute("data-note-qualified-name", qn);
-        // Position below the note box, spanning its width.
-        const verticalOffset = 8;
+        // Position below the note box. The shell's right edge aligns with the note's
+        // right edge so the copy button sits just inside the note boundary.
+        const verticalOffset = 4;
+        const paddingRight = 4;
         shell.style.left = `${bbox.x * zoom}px`;
         shell.style.top = `${(bbox.y + bbox.height + verticalOffset) * zoom}px`;
-        shell.style.width = `${bbox.width * zoom}px`;
-        shell.style.transform = `scale(${Math.max(0.8, Math.min(zoom, 2.0))})`;
-        shell.style.transformOrigin = 'top left';
+        shell.style.width = `${(bbox.width - paddingRight) * zoom}px`;
         shell.setAttribute("data-note-id", noteId);
 
         const currentVote = S.__reviewNoteVotes?.get?.(noteId) || null;
@@ -655,24 +698,16 @@
               noteQualifiedName: qn
             });
 
-            // Hide all buttons and show thank you
-            const buttons = shell.querySelectorAll(".striffs-note-feedback-btn");
-            buttons.forEach(b => b.style.display = "none");
+            // Show toast instead of inline text
+            S.toast?.("Thanks for the feedback!", "success", { timeoutMs: 2000 });
 
-            const thanks = document.createElement("span");
-            thanks.className = "striffs-note-feedback-thanks";
-            thanks.textContent = "Thanks for the feedback!";
-            shell.appendChild(thanks);
+            // Hide only the vote buttons, keep the copy button visible
+            const voteButtons = leftGroup.querySelectorAll(".striffs-note-feedback-btn");
+            voteButtons.forEach(b => b.style.display = "none");
+            leftGroup.style.display = "none";
 
-            // Mark this shell as voted so it won't be removed on reposition
+            // Mark as voted
             shell.setAttribute("data-voted", "true");
-
-            // Fade out and remove after a short delay
-            setTimeout(() => {
-              shell.style.transition = "opacity 0.3s ease";
-              shell.style.opacity = "0";
-              setTimeout(() => shell.remove(), 300);
-            }, 1500);
           });
           return btn;
         };
@@ -739,15 +774,49 @@
     } catch {}
   };
 
+  S.extractEngagementContextFromPayload = (payload) => {
+    const candidates = [
+      payload,
+      payload?.result,
+      payload?.data,
+      payload?.payload,
+      payload?.response,
+      payload?.body,
+      payload?.meta,
+      payload?.metadata,
+      payload?.engagement,
+      payload?.engagementContext,
+      payload?.context,
+      payload?.review,
+      payload?.aiReview,
+      payload?.striffs?.[0]
+    ].filter((value, index, arr) => value && typeof value === "object" && arr.indexOf(value) === index);
+    const readFirst = (keys) => {
+      for (const candidate of candidates) {
+        for (const key of keys) {
+          const value = String(candidate?.[key] || "").trim();
+          if (value) return value;
+        }
+      }
+      return "";
+    };
+    return {
+      operationId: readFirst(["operationId", "operationID", "operation_id"]),
+      engagementWriteToken: readFirst([
+        "engagementWriteToken",
+        "engagementToken",
+        "engagement_write_token",
+        "engagement_token"
+      ])
+    };
+  };
+
   S.updateEngagementContextFromResult = (result) => {
     const prev = S.__engagementCtx || {};
     const sessionId = S.ensureEngagementSessionId?.() || prev.sessionId || null;
-    const opId = String(
-      result?.operationId || result?.operationID || result?.operation_id || ""
-    ).trim();
-    const providedToken = String(
-      result?.engagementWriteToken || result?.engagementToken || result?.engagement_write_token || ""
-    ).trim();
+    const extracted = S.extractEngagementContextFromPayload?.(result) || {};
+    const opId = String(extracted.operationId || "").trim();
+    const providedToken = String(extracted.engagementWriteToken || "").trim();
     if (!opId) {
       S.__engagementCtx = {
         sessionId,
@@ -755,6 +824,10 @@
         engagementWriteToken: null
       };
       S.__lastEngagementContextError = "missing operationId";
+      S.cwarn?.("[Striffs] Engagement context missing operationId", {
+        hasToken: Boolean(providedToken),
+        resultKeys: result && typeof result === "object" ? Object.keys(result).slice(0, 30) : []
+      });
       S.syncEngagementDebugState?.();
       S.logEngagementCollectionBlocked?.("missing operationId", {
         hasOperationId: false,
@@ -765,10 +838,14 @@
     S.__engagementCtx = {
       sessionId,
       operationId: opId,
-      engagementWriteToken: providedToken || null
+      engagementWriteToken: providedToken || prev.engagementWriteToken || null
     };
     if (!S.__engagementCtx.engagementWriteToken) {
       S.__lastEngagementContextError = "missing engagementWriteToken";
+      S.cwarn?.("[Striffs] Engagement context missing engagementWriteToken", {
+        operationId: opId,
+        resultKeys: result && typeof result === "object" ? Object.keys(result).slice(0, 30) : []
+      });
       S.syncEngagementDebugState?.();
       S.logEngagementCollectionBlocked?.("missing engagementWriteToken", {
         hasOperationId: true,
@@ -778,7 +855,14 @@
       return false;
     }
     S.__lastEngagementContextError = null;
+    S.persistEngagementContextForCurrentPr?.();
     S.syncEngagementDebugState?.();
+    // Re-apply comment affordances now that operationId is available
+    // (fixes race when engagement context arrives after SVG render)
+    if (!prev.operationId && S.__striffsSvg && !S.__commentState?.active) {
+      try { S.applyCommentAffordances?.(); } catch {}
+      S.updateCommentButtonVisibility?.();
+    }
     return true;
   };
 
@@ -852,44 +936,60 @@
     return String(name).replace(/-/g, '.');
   };
 
+  const sanitizeSvgTree = (svg) => {
+    if (!svg) return '';
+    const unsafeUrlPattern = /^\s*(?:javascript|vbscript|data)\s*:/i;
+
+    for (const node of svg.querySelectorAll('script,style,foreignObject')) {
+      node.remove();
+    }
+
+    const allElements = [svg, ...svg.querySelectorAll('*')];
+    for (const el of allElements) {
+      const attrs = el.attributes;
+      for (let i = attrs.length - 1; i >= 0; i--) {
+        const attr = attrs[i];
+        const attrName = String(attr.name || '');
+        const attrValue = String(attr.value || '');
+        if (/^on/i.test(attrName)) {
+          el.removeAttribute(attr.name);
+          continue;
+        }
+        const normalizedValue = attrValue.replace(/\s+/g, '');
+        if (unsafeUrlPattern.test(normalizedValue)) {
+          el.removeAttribute(attr.name);
+        }
+      }
+    }
+
+    return svg.outerHTML;
+  };
+
   // Sanitize SVG content before DOM injection to prevent XSS
   // Uses DOMParser to parse SVG, then removes potentially dangerous elements
   S.sanitizeSvg = (svgString) => {
     if (!svgString || typeof svgString !== 'string') return '';
     try {
       const parser = new DOMParser();
-      const doc = parser.parseFromString(svgString, 'image/svg+xml');
-      const svg = doc.documentElement;
+      let doc = parser.parseFromString(svgString, 'image/svg+xml');
 
-      // Remove script elements and their content
-      const scripts = svg.querySelectorAll('script');
-      for (const script of scripts) {
-        script.remove();
-      }
-
-      // Remove event handler attributes (onclick, onerror, etc.)
-      const allElements = svg.querySelectorAll('*');
-      for (const el of allElements) {
-        const attrs = el.attributes;
-        for (let i = attrs.length - 1; i >= 0; i--) {
-          const attr = attrs[i];
-          if (attr.name.startsWith('on')) {
-            el.removeAttribute(attr.name);
-          }
-          // Remove javascript: URLs
-          if (attr.value && attr.value.trim().toLowerCase().startsWith('javascript:')) {
-            el.removeAttribute(attr.name);
-          }
+      // If XML parser produced an error, fall back to lenient HTML parsing
+      if (doc.querySelector('parsererror')) {
+        const container = document.createElement('div');
+        container.innerHTML = svgString;
+        const svg = container.querySelector('svg');
+        if (!svg) return '';
+        const sanitizedHtmlSvg = sanitizeSvgTree(svg);
+        // Re-serialize through XML parser for consistent output
+        doc = parser.parseFromString(sanitizedHtmlSvg, 'image/svg+xml');
+        if (doc.querySelector('parsererror')) {
+          // Still broken after re-serialization, return the HTML-sanitized version
+          return sanitizedHtmlSvg;
         }
       }
 
-      // Remove foreignObject elements (can contain arbitrary HTML)
-      const foreignObjects = svg.querySelectorAll('foreignObject');
-      for (const fo of foreignObjects) {
-        fo.remove();
-      }
-
-      return svg.outerHTML;
+      const svg = doc.documentElement;
+      return sanitizeSvgTree(svg);
     } catch (e) {
       S.cwarn?.('SVG sanitization failed', e);
       return '';
@@ -921,7 +1021,6 @@
       const operationId = String(ctx.operationId || "").trim();
       const engagementWriteToken = String(ctx.engagementWriteToken || "").trim();
       if (!operationId || !engagementWriteToken) {
-        S.__engagementSkippedCount = Number(S.__engagementSkippedCount || 0) + 1;
         S.logEngagementCollectionBlocked?.("missing operation/token", {
           type,
           hasOperationId: Boolean(operationId),
@@ -983,6 +1082,13 @@
     skipped: Number(S.__engagementSkippedCount || 0),
     lastEventType: S.__engagementLastEventType || null
   });
+
+  S.getPrimaryDiagramSvg = () =>
+    S.__striffsSvg ||
+    document.querySelector('#striffs-content .striff-svg-wrap > svg') ||
+    document.querySelector('#striffs-content > svg') ||
+    document.querySelector('#striff-diagram-view #striffs-content svg') ||
+    null;
 
   // ---------- Remote config / kill-switch ----------
   S.storageGet = S.storageGet || ((area, keys) => new Promise((resolve) => {
@@ -1165,6 +1271,16 @@
     return '';
   };
 
+  S.getStriffsDebugContext = async function getStriffsDebugContext() {
+    try {
+      const resp = await S.bgRequest?.({ type: 'getStriffsDebugContext' }, (S.TIMEOUTS?.message) || 7000);
+      if (resp?.ok && resp?.apiBase) {
+        return { apiBase: String(resp.apiBase) };
+      }
+    } catch {}
+    return { apiBase: null };
+  };
+
   S.disableStriffsButton = function disableStriffsButton(message) {
     S.__disabledByRemote = true;
     S.__remoteDisableMessage = message || S.__remoteDisableMessage;
@@ -1247,8 +1363,11 @@
     const preserveClearFlag = !!opts.preserveClearFlag;
     const resetLiveDiagram = !!opts.resetLiveDiagram;
     const DEBUG_KEY_LOWER = "striffsdebug";
-    const prefixes = ["striffs:", "striffscache:", "striffscachemeta:"];
-    const chromeCacheKeys = [
+    const prefixes = [
+      ...(BgUtils.CACHE_PREFIXES || ["striffs:", "striffscache:", "striffscachemeta:"]),
+      ...((BgUtils.LEGACY_CACHE_PREFIXES || []).map((value) => String(value || '').toLowerCase()))
+    ];
+    const chromeCacheKeys = BgUtils.CACHE_KEYS || [
       "striffsActiveTab",
       "striffsRemoteConfig",
       "striffsRemoteConfigFetchedAt",
@@ -1296,7 +1415,8 @@
           if (!k) return false;
           if (k === "ghToken") return false;
           if (String(k).toLowerCase() === DEBUG_KEY_LOWER) return false;
-          if (preserveClearFlag && k === "striffsCacheClearAt") return false;
+          if (preserveClearFlag && k === S.CACHE_CLEAR_FLAG_KEY) return false;
+          if (k === S.CACHE_CLEAR_SEEN_KEY) return false;
           const lower = k.toLowerCase();
           return chromeCacheKeys.includes(k) || prefixes.some((p) => lower.startsWith(p)) || lower.startsWith("striffs");
         });
@@ -1345,10 +1465,15 @@
     S.__supportedExtensionsFetchedAt = 0;
     S.__supportedExtensionsPromise = null;
     S.__suppressCacheWritesUntil = Date.now() + 2000;
+    S.__lastPrefetchRequestKey = null;
+    S.__prefetchPromise = null;
+    S.__engagementRefreshPromise = null;
+    S.__lastEngagementContextError = null;
+    S.__engagementCtx = { sessionId: null, operationId: null, engagementWriteToken: null };
 
     // Clear IndexedDB cache
     try {
-      const deleteReq = indexedDB.deleteDatabase('striffs-cache-db');
+      const deleteReq = indexedDB.deleteDatabase(S.STRIFFS_CACHE_DB);
       await new Promise((resolve) => {
         deleteReq.onsuccess = () => resolve(true);
         deleteReq.onerror = () => resolve(true);
@@ -1417,19 +1542,12 @@
     S.__didPromptExtensionRefresh = true;
     const promptText = "Striffs was reloaded or updated. Refresh this page to reconnect the extension.";
     try {
-      S.toast?.(promptText, "error", { timeoutMs: 12000 });
+      S.toast?.(promptText, "error", {
+        timeoutMs: 12000,
+        actionLabel: "Refresh page",
+        onAction: () => window.location.reload()
+      });
     } catch {}
-    setTimeout(() => {
-      try {
-        const shouldReload =
-          typeof window.confirm === "function"
-            ? window.confirm("Striffs was reloaded or updated. Refresh this page now?")
-            : false;
-        if (shouldReload) {
-          window.location.reload();
-        }
-      } catch {}
-    }, 0);
   };
 
   S.sendMessageWithTimeout = function sendMessageWithTimeout(msg, timeoutMs = 7000) {
@@ -1514,6 +1632,16 @@
       type: "fetchAiReviewStatus",
       operationId,
       engagementToken,
+      timeoutMs
+    }, timeoutMs ?? 15000);
+  };
+
+  S.fetchSubdiagramRender = async ({ operationId, diagramIndex, components, timeoutMs } = {}) => {
+    return await S.bgRequest({
+      type: "fetchSubdiagramRender",
+      operationId,
+      diagramIndex,
+      components,
       timeoutMs
     }, timeoutMs ?? 15000);
   };
@@ -1916,6 +2044,8 @@
             diff: 'M10.5 6.5a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0zm.936 2.052a3.998 3.998 0 0 0 1.148-3.07 4.002 4.002 0 0 0-7.768-1.557.75.75 0 0 1-1.38-.585A5.502 5.502 0 0 1 13.25 5.6a5.5 5.5 0 0 1-1.584 4.228l-.38.352-.76.703-.702.649a3.001 3.001 0 0 0-.913 1.87.75.75 0 0 1-1.498-.112 4.502 4.502 0 0 1 1.366-2.794l.76-.703.368-.34a2.5 2.5 0 0 0-3.37-3.656.75.75 0 0 1-.898-1.203 4.001 4.001 0 0 1 5.593 5.746l.252.231z',
             // Striffs icon - represents structural changes/architecture
             striffs: 'M1.75 1h12.5c.966 0 1.75.784 1.75 1.75v10.5A1.75 1.75 0 0 1 14.25 15H1.75A1.75 1.75 0 0 1 0 13.25V2.75C0 1.784.784 1 1.75 1ZM1.5 2.75v10.5c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25V2.75a.25.25 0 0 0-.25-.25H1.75a.25.25 0 0 0-.25.25Zm3.5 2.75a.75.75 0 0 1 .75.75v1.5h1.5a.75.75 0 0 1 0 1.5H5.5v1.5a.75.75 0 0 1-1.5 0v-1.5H2.5a.75.75 0 0 1 0-1.5h1.5v-1.5A.75.75 0 0 1 5 5.5Zm5.5 0a.75.75 0 0 1 .75-.75h2a.75.75 0 0 1 0 1.5h-2a.75.75 0 0 1-.75-.75Zm0 3a.75.75 0 0 1 .75-.75h2a.75.75 0 0 1 0 1.5h-2a.75.75 0 0 1-.75-.75Z',
+            // Comment bubble icon
+            comment: 'M1 2.75C1 1.784 1.784 1 2.75 1h10.5c.966 0 1.75.784 1.75 1.75v7.5A1.75 1.75 0 0 1 13.25 12H7.5l-3.146 3.146a.5.5 0 0 1-.854-.353V12H2.75A1.75 1.75 0 0 1 1 10.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h2a.75.75 0 0 1 .75.75v2.19l2.354-2.353A.75.75 0 0 1 8.58 10.5h4.67a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z',
 
             // status icons
             'check-circle': 'M8 15A7 7 0 1 0 8 1a7 7 0 0 0 0 14Zm3.78-8.72a.75.75 0 0 1 0 1.06l-4 4a.75.75 0 0 1-1.06 0l-2-2a.75.75 0 1 1 1.06-1.06L7 9.94l3.22-3.22a.75.75 0 0 1 1.06 0Z',
@@ -1932,7 +2062,7 @@
         // Custom SVG markup for special icons (returns full SVG instead of path data)
         const customSvgMap = {
             // GitHub logo mark for diff button (filled version)
-            github: `<svg aria-hidden="true" height="16" viewBox="0 0 16 16" width="16" style="vertical-align: text-bottom; fill: #24292f; margin-right: 6px;"><path d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"></path></svg>`,
+            github: `<svg aria-hidden="true" height="16" viewBox="0 0 16 16" width="16" style="vertical-align: text-bottom; fill: currentColor; margin-right: 6px;"><path d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"></path></svg>`,
             // Striff.io icon - node graph with colored orbs (green, red, blue) from striff-io repo
             striffs: `<svg aria-hidden="true" height="16" viewBox="0 0 16 16" width="16" style="vertical-align: text-bottom;"><circle cx="8" cy="4" r="2.5" fill="#3cb85e"/><circle cx="4.8" cy="11.2" r="2.5" fill="#d44a5c"/><circle cx="11.2" cy="11.2" r="2.5" fill="#3874c4"/><path d="M4.8 11.2L8 4M11.2 11.2L8 4" stroke="#c9a830" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>`
         };
@@ -2226,31 +2356,30 @@
         };
 
         if (loading) {
-            // Phase messages - only "Generating" uses rotating Claude-style words
+            // Phase messages - only "Generating" uses rotating Striffs-specific words
             const phaseMessages = {
                 "Analyzing": "Analyzing",
                 "Fetching": "Fetching",
-                "Generating": "Cooking",
+                "Generating": "Parsing AST",
                 "Enriching": "Enriching",
                 "Loading": "Loading",
                 "default": "Loading"
             };
 
-            // Claude-style thinking words for Generating phase
+            // Striffs-specific progress words for the generating phase
             const generatingWords = [
-                "Cooking",
-                "Thinking",
-                "Pondering",
-                "Reasoning",
-                "Crafting",
-                "Building",
-                "Preparing",
-                "Considering",
-                "Deliberating"
+                "Parsing AST",
+                "Resolving Imports",
+                "Linking Components",
+                "Tracing Changes",
+                "Scoping Symbols",
+                "Building Diagram",
+                "Checking Context",
+                "Preparing Review"
             ];
 
             // Initialize word rotation state
-            if (!S.__generatingWordIndex) S.__generatingWordIndex = 0;
+            if (S.__generatingWordIndex === undefined) S.__generatingWordIndex = 0;
             if (!S.__generatingWordStartTime) S.__generatingWordStartTime = Date.now();
 
             let phaseText = phase ? (phaseMessages[phase] || phaseMessages.default) : phaseMessages.default;
@@ -2365,63 +2494,85 @@
         btn.innerHTML = `${S.octicon('striffs')} <span class="striffs-local-btn-label">Striffs</span>`;
     };
 
-    // --- Global toast helpers (theme-aware) ---
+    // --- Flash notification helpers (GitHub-native styling) ---
     S.ensureGlobalToast = function ensureGlobalToast() {
-        let t = document.getElementById('striffs-global-toast');
-        if (t) return t;
-        t = document.createElement('div');
-        t.id = 'striffs-global-toast';
-        t.setAttribute('aria-live', 'polite');
-        t.setAttribute('role', 'status');
-        t.style.pointerEvents = 'none';
-        document.body.appendChild(t);
-        return t;
+        const existing = document.getElementById('striffs-toast-container');
+        if (existing) return existing;
+
+        const host = document.createElement('div');
+        host.id = 'striffs-toast-container';
+        host.setAttribute('aria-live', 'polite');
+        host.setAttribute('role', 'status');
+        document.body.appendChild(host);
+        return host;
     };
 
-    S.toast = function toast(message, type = 'info', { timeoutMs, html } = {}) {
-        S.ensureGlobalToast();
+    // SVG icons for each toast type (inline, no dependencies)
+    const TOAST_ICONS = {
+        info: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>',
+        success: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>',
+        error: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>',
+        warning: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
+        neutral: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>',
+    };
 
-        // Error/warning toasts should persist longer (15-20s) as they may require user action
+    S.toast = function toast(message, type = 'info', { timeoutMs, html, actionLabel, onAction } = {}) {
+        const host = S.ensureGlobalToast();
+
         const defaultTimeout = (type === 'error' || type === 'warning') ? 18000 : 7500;
         const actualTimeout = timeoutMs != null ? timeoutMs : defaultTimeout;
 
         const el = document.createElement('div');
-        el.className = `striffs-toast-item striffs-toast-${type}`;
-        const dot = document.createElement('span');
-        dot.className = 'striffs-toast-dot';
-        dot.setAttribute('aria-hidden', 'true');
-        const msgEl = document.createElement('div');
-        msgEl.className = 'striffs-toast-msg';
+        el.className = `striffs-toast striffs-toast--${type || 'info'}`;
+
+        // Icon
+        const iconEl = document.createElement('span');
+        iconEl.className = 'striffs-toast__icon';
+        iconEl.innerHTML = TOAST_ICONS[type] || TOAST_ICONS.info;
+        el.appendChild(iconEl);
+
+        // Message
+        const msgEl = document.createElement('span');
+        msgEl.className = 'striffs-toast__msg';
         if (html) {
-          msgEl.innerHTML = String(message || '');
+            msgEl.innerHTML = String(message || '');
         } else {
-          msgEl.textContent = String(message || '');
+            msgEl.textContent = String(message || '');
         }
-        el.appendChild(dot);
         el.appendChild(msgEl);
 
-        // For error messages, add a close button since they persist longer
-        if (type === 'error' || type === 'warning') {
-          const closeBtn = document.createElement('span');
-          closeBtn.className = 'striffs-toast-close';
-          closeBtn.innerHTML = '×';
-          closeBtn.title = 'Dismiss';
-          closeBtn.addEventListener('click', (e) => {
-              e.stopPropagation();
-              clearTimeout(removeTimeout);
-              remove();
-          });
-          el.appendChild(closeBtn);
+        if (actionLabel && typeof onAction === 'function') {
+            const actionBtn = document.createElement('button');
+            actionBtn.className = 'striffs-toast__action';
+            actionBtn.type = 'button';
+            actionBtn.textContent = String(actionLabel);
+            actionBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                clearTimeout(removeTimeout);
+                try { onAction(); } catch {}
+                remove();
+            });
+            el.appendChild(actionBtn);
         }
 
-        const host = document.getElementById('striffs-global-toast');
+        // Close button
+        const closeBtn = document.createElement('button');
+        closeBtn.className = 'striffs-toast__close';
+        closeBtn.type = 'button';
+        closeBtn.setAttribute('aria-label', 'Dismiss');
+        closeBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+        closeBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            clearTimeout(removeTimeout);
+            remove();
+        });
+        el.appendChild(closeBtn);
+
         host.appendChild(el);
 
-        requestAnimationFrame(() => el.classList.add('show'));
-
         const remove = () => {
-            el.classList.remove('show');
-            setTimeout(() => el.remove(), 240);
+            el.classList.add('striffs-toast--out');
+            setTimeout(() => el.remove(), 250);
         };
         const removeTimeout = setTimeout(remove, actualTimeout);
         el.addEventListener('click', () => { clearTimeout(removeTimeout); remove(); }, { passive: true });
@@ -2597,79 +2748,85 @@
     background: linear-gradient(90deg, var(--color-success-fg, #1a7f37), var(--color-accent-fg, #0969da));
   }
 
-  #striffs-global-toast {
-    position: fixed;
-    top: 14px;
-    right: 14px;
-    z-index: 999999;
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
+  /* ---- Custom material toast notifications ---- */
+  #striffs-toast-container{
+    position:fixed;top:16px;right:16px;z-index:999999;
+    display:flex;flex-direction:column;gap:8px;
+    pointer-events:none;max-width:420px;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
   }
-
-  .striffs-toast-item {
-    pointer-events: auto;
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    max-width: min(480px, 92vw);
-    padding: 14px 18px;
-    border-radius: 12px;
-    box-shadow: 0 8px 32px rgba(0,0,0,.12), 0 2px 8px rgba(0,0,0,.06);
-    border: 1px solid transparent;
-    background: var(--bgColor-default, var(--color-canvas-default, #fff));
-    color: var(--fgColor-default, var(--color-fg-default, #24292f));
-    font-size: 13px;
-    font-weight: 450;
-    letter-spacing: 0.01em;
-    line-height: 1.45;
-    transform: translateX(20px);
-    opacity: 0;
-    transition: opacity .25s cubic-bezier(.4,0,.2,1), transform .25s cubic-bezier(.4,0,.2,1);
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
+  .striffs-toast{
+    pointer-events:auto;
+    display:flex;align-items:flex-start;gap:10px;
+    padding:12px 14px 12px 12px;
+    border-radius:10px;
+    box-shadow:0 6px 20px rgba(0,0,0,.15), 0 2px 6px rgba(0,0,0,.08);
+    font-size:13px;line-height:1.45;color:#1f2328;
+    animation:striffs-toast-in .3s cubic-bezier(.21,1.02,.73,1) forwards;
+    backdrop-filter:blur(8px);
+    position:relative;
+    overflow:hidden;
   }
-  .striffs-toast-item.show {
-    transform: translateX(0);
-    opacity: 1;
+  .striffs-toast::before{
+    content:'';position:absolute;left:0;top:0;bottom:0;width:4px;
+    border-radius:10px 0 0 10px;
   }
-  .striffs-toast-msg {
-    flex: 1;
-    min-width: 0;
+  .striffs-toast__icon{
+    flex-shrink:0;display:flex;align-items:center;justify-content:center;
+    width:28px;height:28px;border-radius:50%;
+    margin:-1px 0;
   }
-
-  .striffs-toast-dot {
-    width: 8px; height: 8px; border-radius: 50%;
-    flex: 0 0 8px;
-    box-shadow: 0 0 0 3px rgba(9,105,218,.15);
+  .striffs-toast__msg{flex:1 1 auto;min-width:0;word-break:break-word;}
+  .striffs-toast__action{
+    flex-shrink:0;
+    border:1px solid rgba(0,0,0,.12);
+    background:rgba(255,255,255,.8);
+    color:inherit;
+    border-radius:999px;
+    padding:6px 10px;
+    font-size:12px;
+    font-weight:600;
+    cursor:pointer;
   }
-
-  .striffs-toast-info     { border-left: 3px solid var(--accent-fg, var(--color-accent-fg, #0969da)); }
-  .striffs-toast-info .striffs-toast-dot { background: var(--accent-fg, var(--color-accent-fg, #0969da)); box-shadow: 0 0 0 3px rgba(9,105,218,.15); }
-
-  .striffs-toast-success  { border-left: 3px solid var(--success-fg, var(--color-success-fg, #1a7f37)); }
-  .striffs-toast-success .striffs-toast-dot { background: var(--success-fg, var(--color-success-fg, #1a7f37)); box-shadow: 0 0 0 3px rgba(26,127,55,.15); }
-
-  .striffs-toast-error    { border-left: 3px solid var(--borderColor-danger, var(--color-danger-fg, #d1242f)); }
-  .striffs-toast-error .striffs-toast-dot { background: var(--borderColor-danger, var(--color-danger-fg, #d1242f)); box-shadow: 0 0 0 3px rgba(209,34,46,.15); }
-
-  .striffs-toast-warning  { border-left: 3px solid #bf8700; }
-  .striffs-toast-warning .striffs-toast-dot { background: #bf8700; box-shadow: 0 0 0 3px rgba(191,135,0,.15); }
-
-  .striffs-toast-neutral  { border-left: 3px solid #656d76; }
-  .striffs-toast-neutral .striffs-toast-dot { background: #656d76; box-shadow: 0 0 0 3px rgba(101,109,118,.15); }
-
-  .striffs-toast-close {
-    margin-left: 4px;
-    cursor: pointer;
-    font-size: 16px;
-    font-weight: 300;
-    opacity: 0.45;
-    transition: opacity .15s;
-    line-height: 1;
-    user-select: none;
+  .striffs-toast__action:hover{background:rgba(255,255,255,.95);}
+  .striffs-toast__close{
+    flex-shrink:0;background:none;border:none;cursor:pointer;
+    color:rgba(0,0,0,.35);padding:2px;border-radius:4px;
+    display:flex;align-items:center;justify-content:center;
+    transition:color .15s,background .15s;
   }
-  .striffs-toast-close:hover { opacity: 0.85; }
+  .striffs-toast__close:hover{color:rgba(0,0,0,.7);background:rgba(0,0,0,.06);}
+
+  /* Type: info */
+  .striffs-toast--info{background:rgba(238,244,255,.95);}
+  .striffs-toast--info::before{background:#3b82f6;}
+  .striffs-toast--info .striffs-toast__icon{color:#3b82f6;background:rgba(59,130,246,.12);}
+  /* Type: success */
+  .striffs-toast--success{background:rgba(240,253,244,.95);}
+  .striffs-toast--success::before{background:#22c55e;}
+  .striffs-toast--success .striffs-toast__icon{color:#16a34a;background:rgba(34,197,94,.12);}
+  /* Type: error */
+  .striffs-toast--error{background:rgba(255,241,242,.95);}
+  .striffs-toast--error::before{background:#ef4444;}
+  .striffs-toast--error .striffs-toast__icon{color:#dc2626;background:rgba(239,68,68,.12);}
+  /* Type: warning */
+  .striffs-toast--warning{background:rgba(255,251,235,.95);}
+  .striffs-toast--warning::before{background:#f59e0b;}
+  .striffs-toast--warning .striffs-toast__icon{color:#d97706;background:rgba(245,158,11,.12);}
+  /* Type: neutral */
+  .striffs-toast--neutral{background:rgba(245,245,245,.95);}
+  .striffs-toast--neutral::before{background:#6b7280;}
+  .striffs-toast--neutral .striffs-toast__icon{color:#6b7280;background:rgba(107,114,128,.1);}
+
+  .striffs-toast--out{animation:striffs-toast-out .25s ease forwards;}
+  @keyframes striffs-toast-in{
+    from{opacity:0;transform:translateX(40px) scale(.96);}
+    to{opacity:1;transform:translateX(0) scale(1);}
+  }
+  @keyframes striffs-toast-out{
+    from{opacity:1;transform:translateX(0) scale(1);}
+    to{opacity:0;transform:translateX(40px) scale(.96);}
+  }
 
   .striffs-local-btn.is-active {
     color: var(--accent-fg, var(--color-accent-fg, #0969da));
@@ -2697,6 +2854,25 @@
     align-items:stretch;
     width:100%;
     height:100%;
+    position: relative;
+  }
+  #striffs-arch-review-btn{
+    padding: 8px 14px;
+    font-size: 12px;
+    font-weight: 600;
+    color: #fff;
+    background: #0969da;
+    border-color: #0969da;
+    white-space: nowrap;
+  }
+  #striffs-arch-review-btn:hover:not(:disabled){
+    background: #0550ae;
+    border-color: #0550ae;
+    color: #fff;
+  }
+  #striffs-arch-review-btn:disabled{
+    opacity: 0.5;
+    cursor: not-allowed;
   }
   #striffs-scroll{
     position: relative;
@@ -2747,6 +2923,22 @@
     transform: translateY(0);
     box-shadow: 0 2px 6px rgba(0,0,0,0.16);
   }
+  #striffs-comment-btn{
+    background: #0969da;
+    border-color: #0969da;
+    color: #fff;
+  }
+  #striffs-comment-btn:hover{
+    background: #0550ae;
+    border-color: #0550ae;
+    color: #fff;
+  }
+  #striffs-comment-btn.is-active{
+    background: #0550ae;
+    border-color: #0550ae;
+    color: #fff;
+    box-shadow: 0 0 0 2px rgba(9,105,218,.4);
+  }
   .striffs-ctl-btn svg{
     width: 18px;
     height: 18px;
@@ -2786,12 +2978,21 @@
     align-items: center;
     justify-content: space-between;
     pointer-events: auto;
+    box-sizing: border-box;
+    overflow: hidden;
   }
-  #striff-diagram-view .striffs-note-feedback-left,
+  #striff-diagram-view .striffs-note-feedback-left{
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+  }
   #striff-diagram-view .striffs-note-feedback-right{
     display: inline-flex;
     align-items: center;
     gap: 4px;
+    flex-shrink: 0;
+    margin-left: auto;
   }
   #striff-diagram-view .striffs-note-feedback-btn{
     appearance: none;
@@ -2962,8 +3163,49 @@
     flex: 1 1 auto;
     line-height: 20px;
   }
-  #striffs-toast{position:absolute;top:6px;left:8px;background:var(--bgColor-default, #fff);border:1px solid #f0a3a3;color:#b00020;padding:6px 10px;border-radius:6px;font-size:12px;box-shadow:0 1px 4px rgba(0,0,0,.08);opacity:0;transition:opacity .2s}
-  #striffs-toast.show{opacity:1}
+
+  /* ---- Comment mode: + affordance on diagram entities ---- */
+  .striffs-comment-mode g.entity[data-qualified-name]{
+    cursor: pointer;
+    pointer-events: auto !important;
+  }
+  .striffs-comment-affordance{
+    position: absolute;
+    width: 44px;
+    height: 44px;
+    border-radius: 6px;
+    background-color: #0969da;
+    background-image: linear-gradient(#0372ef, #0969da);
+    color: #fff;
+    font-size: 26px;
+    font-weight: 700;
+    line-height: 44px;
+    text-align: center;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity .15s;
+    z-index: 10;
+    box-shadow: 0 1px 4px rgba(27,31,35,.15);
+    user-select: none;
+  }
+  .striffs-comment-mode g.entity[data-qualified-name]:hover .striffs-comment-affordance,
+  .striffs-comment-mode g.entity[data-qualified-name].striffs-comment-hover .striffs-comment-affordance{
+    opacity: 1;
+    pointer-events: auto;
+  }
+  .striffs-comment-selected{
+    /* subtle gray fill highlight */
+  }
+  .striffs-comment-selected rect{
+    fill: rgba(110,118,129,.10) !important;
+    stroke: rgba(110,118,129,.30) !important;
+  }
+  .striffs-comment-selected .striffs-comment-affordance{
+    background: #cf222e;
+    background-image: linear-gradient(#e5534b, #cf222e);
+    opacity: 1;
+    pointer-events: auto;
+  }
   `;
         document.head.appendChild(style);
         S.__styleInjected = true;
@@ -3017,6 +3259,9 @@
     S.getStriffsContainerMarkup = (contentHtml = '<p>Loading Striffs...</p>') => `
       <div id="striffs-controls-wrap">
         <div id="striffs-controls">
+          <button id="striffs-comment-btn" type="button" class="striffs-ctl-btn" title="Comment on diagram" style="display:none;">
+            ${S.octicon('comment')}
+          </button>
           <button id="striffs-zoom-reset" type="button" class="striffs-ctl-btn" title="Reset">
             ${S.octicon('reset')}
           </button>
@@ -3026,6 +3271,7 @@
           <a id="striffs-guide-btn" class="striffs-ctl-btn" href="https://striff.io/#how" target="_blank" rel="noopener noreferrer" title="Guide">
             ${S.octicon('question')}
           </a>
+          <button id="striffs-arch-review-btn" type="button" class="striffs-ctl-btn" title="Run AI architecture review on this diagram" style="display:none;">Review Architecture</button>
         </div>
       </div>
       ${S.getStriffsScrollMarkup(contentHtml)}`;
@@ -3116,6 +3362,9 @@
                 }
                 if (target.closest?.('#striffs-download-btn')) {
                     runDownloadAction();
+                }
+                if (target.closest?.('#striffs-arch-review-btn')) {
+                    S.triggerArchitectureReview?.();
                 }
             });
             let isPanning = false;
@@ -3311,11 +3560,12 @@
     };
 
   S.showDiffView = () => {
+    S.setCurrentView('diffs');
+    S.cancelFileTreeAvailabilityRefresh?.();
     S.resetFileTreeAvailability?.();
     S.showAllDiffs();
     const striffView = document.getElementById("striff-diagram-view");
     if (striffView) striffView.style.display = "none";
-    S.setCurrentView('diffs');
   };
 
   S.applyNoChangesUiState = (tooltip = "No changes were found") => {
@@ -3342,6 +3592,7 @@
   };
 
   S.showStriffView = () => {
+    S.restoreEngagementContextFromCachedPayload?.();
     if (S.__striffsNoChanges) {
       return S.applyNoChangesUiState?.("No changes were found");
     }
@@ -3366,12 +3617,20 @@
       if (S.__striffsSvg) {
           S.__striffsSvg.style.pointerEvents = 'auto';
       }
+      // Re-apply hoverability + comment affordances after view switch
+      // applyHoverability already calls applyCommentAffordances when not
+      // in comment mode, so the extra call is only needed for active mode.
+      S.applyHoverability?.();
+      if (S.__commentState?.active) {
+        S.applyCommentAffordances?.();
+      }
       // Scroll the striff view into the viewport when switching to it
       if (!S.__pendingFocusHash) {
         striffView.scrollIntoView({ block: 'start', behavior: 'smooth' });
       }
         }
         S.setCurrentView('striffs');
+        S.updateArchReviewButton?.();
         if ((S.__aiReviewStatus === "PENDING" || S.__aiReviewStatus === "RUNNING") && !S.__aiReviewPollTimer) {
           S.startEnrichmentPolling?.({ immediate: true, reason: "show-view" });
         }
@@ -3465,46 +3724,52 @@
 
   // ---------- File tree availability (disable unmapped files in Striff view) ----------
   S.resetFileTreeAvailability = () => {
-    document.querySelectorAll('.striffs-file-disabled').forEach(li => {
-      li.classList.remove('striffs-file-disabled');
-      li.removeAttribute('aria-disabled');
-      li.removeAttribute('data-striffs-mapped');
-      // Clear inline styles that were set when disabling
-      if (li.style) {
-        li.style.pointerEvents = '';
-        li.style.opacity = '';
-      }
-    });
-    // Also clear styles from elements that may have been styled but didn't get the class
-    // (e.g., elements that were disabled after initial rendering)
-    const fileTreeItems = document.querySelectorAll([
+    const touched = document.querySelectorAll([
+      '.striffs-file-disabled',
+      '[data-striffs-mapped]',
+      '[data-striffs-file-path]',
+      '[data-striffs-component-id]',
+      "[data-testid='file-tree'] li",
       "li[id^='file-tree-item-diff-']",
       "li[data-tree-entry-type='file']",
-      "[data-testid='file-tree'] li[role='treeitem']",
-      "li[role='treeitem']"
+      "li[role='treeitem']",
+      "a[href^='#diff-']",
+      "a[href*='#diff-']"
     ].join(','));
-    fileTreeItems.forEach(li => {
-      // Skip if already handled
-      if (li.classList.contains('striffs-file-disabled')) return;
-      // Check if it has disabled inline styles but not the class
-      if (li.style.pointerEvents === 'none' || li.style.opacity === '0.35' || li.getAttribute('aria-disabled') === 'true') {
-        li.style.pointerEvents = '';
-        li.style.opacity = '';
-        li.removeAttribute('aria-disabled');
-        li.removeAttribute('data-striffs-mapped');
-      }
+    touched.forEach((el) => {
+      try {
+        el.classList.remove('striffs-file-disabled');
+        el.removeAttribute('aria-disabled');
+        el.removeAttribute('data-striffs-mapped');
+        el.removeAttribute('data-striffs-file-path');
+        el.removeAttribute('data-striffs-component-id');
+        if (el.style) {
+          el.style.pointerEvents = '';
+          el.style.opacity = '';
+        }
+      } catch {}
     });
   };
 
+  S.cancelFileTreeAvailabilityRefresh = () => {
+    const timers = Array.isArray(S.__fileTreeAvailabilityTimers) ? S.__fileTreeAvailabilityTimers : [];
+    timers.forEach((timerId) => {
+      try {
+        clearTimeout(timerId);
+      } catch {}
+    });
+    S.__fileTreeAvailabilityTimers = [];
+  };
+
   S.scheduleFileTreeAvailabilityRefresh = () => {
+    S.cancelFileTreeAvailabilityRefresh?.();
     const delays = [0, 50, 200, 500, 1000];
-    delays.forEach((delay) => {
-      setTimeout(() => {
+    S.__fileTreeAvailabilityTimers = delays.map((delay) => setTimeout(() => {
+      if (S.getCurrentView?.() !== 'striffs') return;
         try {
           S.updateFileTreeAvailability?.();
         } catch {}
-      }, delay);
-    });
+      }, delay));
   };
 
   S.updateFileTreeAvailability = () => {
@@ -3686,11 +3951,7 @@
     } catch {}
   };
 
-  S.debugFileMenu = (label, payload = {}) => {
-    try {
-      S.debugDump?.(`file menu: ${label}`, payload);
-    } catch {}
-  };
+  S.debugFileMenu = () => {};
 
   S.getFileNodeFromElement = (node) => {
     try {
@@ -4490,7 +4751,7 @@
     if (!mappedId) {
       // Debug: log why the lookup failed (only in debug mode)
       if (S.isDebug?.()) {
-        console.warn('[Striffs][findSvgTextForFile] Not found in path->component map', {
+        S.cwarn?.('[Striffs][findSvgTextForFile] Not found in path->component map', {
           fullPath,
           norm,
           lookupKey,
@@ -4732,8 +4993,8 @@
         const treeItems = S.$$all(SELECTORS.fileTreeItems);
     treeItems.forEach(span => {
       if (S.isDirectoryNode?.(span)) return;
-      const norm = S.getFilePathFromTreeItem?.(span) || S.normalizePath(strip(span?.textContent)?.trim());
-      if (isPathLike(norm)) paths.add(ensureLeadingSlash(norm));
+        const norm = S.getFilePathFromTreeItem?.(span) || S.normalizePath(strip(span?.textContent)?.trim());
+      if (isPathLike(norm)) paths.add(S.normalizePath(norm));
     });
 
     // Diff headers (works even if the tree isn't rendered yet)
@@ -4742,14 +5003,14 @@
       const txt = strip(el.getAttribute("title") || el.textContent || "").trim();
       if (!txt) return;
       const norm = S.normalizePath(txt);
-      if (isPathLike(norm)) paths.add(ensureLeadingSlash(norm));
+      if (isPathLike(norm)) paths.add(norm);
     });
 
     // Already-built map of file->diff ids (if present)
     if (S.__filePathToDiffId && typeof S.__filePathToDiffId.keys === 'function') {
       for (const key of S.__filePathToDiffId.keys()) {
         const norm = S.normalizePath(key);
-        if (isPathLike(norm)) paths.add(ensureLeadingSlash(norm));
+        if (isPathLike(norm)) paths.add(norm);
       }
     }
 
@@ -4893,13 +5154,14 @@
     };
 
     S.syncAiReviewStateFromResult = (result, { cachedStatus = null } = {}) => {
+        const engagement = S.extractEngagementContextFromPayload?.(result) || {};
         const status = cachedStatus || S.getAiReviewStatusFromResult?.(result) || null;
         S.__aiReviewStatus = status;
         S.__aiReviewId = String(
             result?.aiReviewId || result?.ai_review_id || ""
         ).trim() || null;
         S.__aiReviewOperationId = String(
-            result?.operationId || result?.operationID || result?.operation_id || ""
+            engagement.operationId || ""
         ).trim() || null;
         if (status === "READY" && S.__aiReviewId) {
             S.__aiReviewLastCompletedReviewId = S.__aiReviewId;
@@ -4925,6 +5187,15 @@
       } catch (e) {
         cwarn("applyHoverability failed", e);
       }
+      // Show + affordances whenever SVG is visible (do NOT gate on engagement
+      // context — the affordances are purely visual; the panel open is gated).
+      if (!S.__commentState?.active) {
+        S.applyCommentAffordances?.();
+        const svgWrap = document.querySelector("#striffs-content .striff-svg-wrap") ||
+                        document.querySelector("#striffs-content");
+        if (svgWrap) svgWrap.classList.add("striffs-comment-mode");
+      }
+      S.updateCommentButtonVisibility?.();
     };
 
     // ---------- Cache ----------
@@ -4934,14 +5205,78 @@
     return `striffs:${id.owner}/${id.repo}#${id.pull_number}`;
   };
 
+  S.engagementCacheKey = () => {
+    const key = S.cacheKey?.();
+    return key ? `${key}:engagement` : null;
+  };
+
+  S.persistEngagementContextForCurrentPr = () => {
+    try {
+      const key = S.engagementCacheKey?.();
+      if (!key) return false;
+      const operationId = String(S.__engagementCtx?.operationId || '').trim();
+      const engagementWriteToken = String(S.__engagementCtx?.engagementWriteToken || '').trim();
+      if (!operationId || !engagementWriteToken) return false;
+      localStorage.setItem(key, JSON.stringify({
+        operationId,
+        engagementWriteToken,
+        savedAt: Date.now()
+      }));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  S.restoreEngagementContextFromCachedPayload = () => {
+    try {
+      const existingCtx = S.__engagementCtx || {};
+      if (String(existingCtx.operationId || '').trim() && String(existingCtx.engagementWriteToken || '').trim()) {
+        return true;
+      }
+      const key = S.cacheKey?.();
+      if (!key) return false;
+      const raw = localStorage.getItem(key);
+      const parsed = raw ? JSON.parse(raw) : null;
+      let cachedOperationId = String(parsed?.cachedOperationId || '').trim();
+      let cachedEngagementWriteToken = String(parsed?.cachedEngagementWriteToken || '').trim();
+      if (!cachedOperationId || !cachedEngagementWriteToken) {
+        const engagementKey = S.engagementCacheKey?.();
+        const engagementRaw = engagementKey ? localStorage.getItem(engagementKey) : null;
+        if (engagementRaw) {
+          try {
+            const engagementParsed = JSON.parse(engagementRaw);
+            cachedOperationId = cachedOperationId || String(engagementParsed?.operationId || '').trim();
+            cachedEngagementWriteToken = cachedEngagementWriteToken || String(engagementParsed?.engagementWriteToken || '').trim();
+          } catch {}
+        }
+      }
+      if (!cachedOperationId || !cachedEngagementWriteToken) return false;
+      S.__engagementCtx = {
+        sessionId: S.ensureEngagementSessionId?.() || existingCtx.sessionId || null,
+        operationId: cachedOperationId,
+        engagementWriteToken: cachedEngagementWriteToken
+      };
+      S.__lastEngagementContextError = null;
+      S.persistEngagementContextForCurrentPr?.();
+      S.syncEngagementDebugState?.();
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
   S.prScopeKey = S.cacheKey;
 
   S.resetPrScopedState = (reason = 'unknown') => {
     try { S.cancelEnrichmentPolling?.(`pr-scope-change:${reason}`); } catch {}
+    try { S.exitCommentMode?.(); } catch {}
 
     S.__striffsReady = false;
     S.__striffsNoChanges = false;
     S.__lastFetchedUpdatedAt = null;
+    S.__lastPrefetchRequestKey = null;
+    S.__prefetchPromise = null;
     S.__lastLoadSource = 'none';
     S.__debugLastApiResponse = null;
 
@@ -5029,12 +5364,32 @@
 
   S.primeDiagramFromCache = async () => {
     try {
-      S.__lastLoadSource = 'none';
+      S.__lastLoadSource = 'none'; try { document.documentElement.dataset.striffsLoadSource = 'none'; } catch {}
       const meta = S.extractPRMetadata();
       const { updated_at, commit_count } = meta;
       const key = S.cacheKey();
       const clearAt = await S.getCacheClearAt?.();
-      const parsed = await S.readCacheFromChromeStorage?.() || S.readCacheFromLocalStorage?.();
+      // Read from all three storage sources and pick the freshest
+      const [chromeParsed, localParsed, idbParsed] = await Promise.all([
+        S.readCacheFromChromeStorage?.(),
+        Promise.resolve(S.readCacheFromLocalStorage?.()),
+        S.readCacheFromIndexedDb?.()
+      ]);
+      let parsed = null;
+      let latestTs = -1;
+      for (const entry of [chromeParsed, localParsed, idbParsed]) {
+        if (entry?.savedAt && Number(entry.savedAt) > latestTs) {
+          latestTs = Number(entry.savedAt);
+          parsed = entry;
+        }
+      }
+      S.cinfo?.('[Striffs] primeDiagramFromCache read result', {
+        cacheKey: key,
+        hasParsed: !!parsed,
+        parsedSavedAt: parsed?.savedAt || null,
+        clearAt,
+        hasResult: !!parsed?.result
+      });
       if (!parsed) return 'empty';
 
       const renderCached = async (parsed) => {
@@ -5043,6 +5398,15 @@
         const ageMs = Date.now() - (parsed.savedAt || 0);
         const freshCount = (currentCount != null && storedCount != null) ? (currentCount === storedCount) : true;
         const freshTime = ageMs < S.CACHE_TTL_MS;
+        try {
+          const d = document.documentElement?.dataset;
+          if (d) {
+            d.striffsCacheKey = key || '';
+            d.striffsCacheSavedAt = String(parsed?.savedAt || '');
+          }
+          window.__striffsCacheKey = key || null;
+          window.__striffsCacheMeta = parsed?.savedAt || null;
+        } catch {}
         S.cinfo?.('[Striffs] Cache validation', {
           cacheKey: key,
           expectedCommitCount: currentCount,
@@ -5062,7 +5426,26 @@
           S.cwarn?.('[Striffs] Cache rejected', { cacheKey: key, reason });
           return false;
 	        }
+          const cachedOperationId = String(parsed?.cachedOperationId || '').trim();
+          const cachedEngagementWriteToken = String(parsed?.cachedEngagementWriteToken || '').trim();
 	        S.updateEngagementContextFromResult?.(parsed.result);
+          if ((cachedOperationId || cachedEngagementWriteToken) && !String(S.__engagementCtx?.engagementWriteToken || '').trim()) {
+            const prevCtx = S.__engagementCtx || {};
+            S.__engagementCtx = {
+              sessionId: S.ensureEngagementSessionId?.() || prevCtx.sessionId || null,
+              operationId: String(prevCtx.operationId || cachedOperationId || '').trim() || null,
+              engagementWriteToken: String(prevCtx.engagementWriteToken || cachedEngagementWriteToken || '').trim() || null
+            };
+            if (S.__engagementCtx.operationId && S.__engagementCtx.engagementWriteToken) {
+              S.__lastEngagementContextError = null;
+            }
+            S.syncEngagementDebugState?.();
+          }
+          if (!String(S.__engagementCtx?.engagementWriteToken || '').trim()) {
+            S.restoreEngagementContextFromCachedPayload?.();
+          } else {
+            S.persistEngagementContextForCurrentPr?.();
+          }
           S.syncAiReviewStateFromResult?.(parsed.result, {
             cachedStatus: String(parsed?.cachedAiReviewStatus || "").trim().toUpperCase() || null
           });
@@ -5070,18 +5453,13 @@
 	        if (!container) return false;
 	        const rendered = S.renderStriffsInto(container, parsed.result);
         if (!rendered) return false;
-	        S.__lastLoadSource = 'cache';
+	        S.__lastLoadSource = 'cache'; try { document.documentElement.dataset.striffsLoadSource = 'cache'; } catch {}
 	        S.__striffsReady = true;
 	        S.__lastFetchedUpdatedAt = updated_at;
 	        S.setAutoGenerateIntent?.(true);
-          if (S.__aiReviewStatus === "PENDING" || S.__aiReviewStatus === "RUNNING") {
-            S.updateStriffButton({ enriching: true, tooltip: "Enriching" });
-            setTimeout(() => {
-              S.startEnrichmentPolling?.({ immediate: false, reason: "cache-load" });
-            }, 0);
-          } else {
-            S.updateStriffButton({ success: true, tooltip: "View" });
-          }
+          // No auto-enrichment on cache load
+          S.updateStriffButton({ success: true, tooltip: "View" });
+          S.updateArchReviewButton?.();
 	        return true;
 	      };
 
@@ -5220,9 +5598,6 @@
         S.__striffsSvg = null;
         S.clearReviewNoteFeedback?.();
         const content = target.querySelector("#striffs-content") || target;
-        if (!target.querySelector("#striffs-toast")) {
-          target.insertAdjacentHTML("afterbegin", `<div id="striffs-toast" role="status" aria-live="polite"></div>`);
-        }
         content.innerHTML = `<div id="striffs-status">Rendering diagram…</div>`;
 
         const items = Array.isArray(data?.striffs) ? data.striffs : [];
@@ -5247,6 +5622,20 @@
                     continue; // no renderable payload in this item
                 }
                 renderableFound = true;
+                if (S.isDebug?.()) {
+                  try {
+                    const pmlUtils = globalThis.StriffsPlantUmlUtils;
+                    if (pmlUtils) {
+                      pmlUtils.extractPuml(svgText).then(puml => {
+                        if (puml) {
+                          S.clog?.("PlantUML source:\n" + puml);
+                        }
+                      }).catch(e => S.cwarn?.("PUML decode failed", e));
+                    }
+                  } catch (e) {
+                    S.cwarn?.("PUML extraction failed", e);
+                  }
+                }
                 content.innerHTML = `<div id="striffs-status">Rendering diagram…</div>`;
                 const wrap = document.createElement("div");
                 wrap.className = "striff-svg-wrap";
@@ -5256,7 +5645,7 @@
 
                 const svg = wrap.querySelector("svg");
                 if (S.isDebug?.() && !svg) {
-                    console.warn("[Striffs][debug] svg not found after render");
+                    S.cwarn?.("[Striffs][debug] svg not found after render");
                 }
                 if (svg) {
                     S.sanitizeSvgDimensions(svg);
@@ -5270,10 +5659,14 @@
                     setTimeout(() => S.queueReviewNoteFeedbackLayout?.(), 50);
                     try {
                       if (S.isDebug?.()) {
-                        const serializer = new XMLSerializer();
-                        const svgText = serializer.serializeToString(svg);
-                        S.__debugSvgText = svgText;
-                        S.clog?.("[debug] svg", svgText);
+                        S.__debugSvgText = null;
+                        S.debugDump?.("rendered svg summary", {
+                          qualifiedNameCount: svg.querySelectorAll('[data-qualified-name]').length,
+                          entityCount: svg.querySelectorAll('g.entity[data-qualified-name]').length,
+                          width: String(svg.getAttribute('width') || ''),
+                          height: String(svg.getAttribute('height') || ''),
+                          viewBox: String(svg.getAttribute('viewBox') || '')
+                        });
                       }
                     } catch (e) {
                       S.cwarn?.("debug svg dump failed", e);
@@ -5285,6 +5678,8 @@
                     S.buildPathIdMapping(data);
                     S.scheduleFileTreeAvailabilityRefresh?.();
                     S.applyHoverability(); // now colors clickable text
+                    S.applyCommentAffordances?.();
+                    S.reapplySelectionHighlights?.();
                     S.applyPendingFocus?.();
                     S.queueReviewNoteFeedbackLayout?.();
                     // Also trigger after a short delay to ensure proper positioning
@@ -5376,6 +5771,1186 @@
 })();
 
 
+// ---- src/striffs-comment-mode.js ----
+// Striffs — comment component selection mode
+(() => {
+  const S = (window.Striffs = window.Striffs || {});
+  const { cwarn } = S;
+
+  S.isCommentModeAvailable = function isCommentModeAvailable() {
+    if (!S.__striffsSvg) return false;
+    const opId = String(S.__engagementCtx?.operationId || "").trim();
+    return Boolean(opId);
+  };
+
+  S.updateCommentButtonVisibility = function updateCommentButtonVisibility() {
+    const btn = document.getElementById('striffs-comment-btn');
+    if (!btn) return;
+    const available = S.isCommentModeAvailable?.();
+    btn.style.display = available ? '' : 'none';
+    btn.classList.toggle('is-active', Boolean(S.__commentState?.active));
+    if (!btn.__striffsCommentHandler) {
+      btn.__striffsCommentHandler = true;
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        S.toggleCommentMode?.();
+      });
+    }
+  };
+
+  S.toggleCommentMode = function toggleCommentMode() {
+    S.clog?.('[comment] toggleCommentMode', { active: S.__commentState?.active });
+    if (S.__commentState?.active) {
+      S.exitCommentMode?.();
+      return;
+    }
+    S.enterCommentMode?.();
+  };
+
+  S.enterCommentMode = async function enterCommentMode() {
+    if (S.__commentState.active) { S.clog?.('[comment] already active'); return; }
+
+    let opId = String(S.__engagementCtx?.operationId || "").trim();
+    S.clog?.('[comment] enterCommentMode', { opId, hasOpId: !!opId });
+
+    // Lazily fetch engagement context if missing
+    if (!opId) {
+      S.toast?.("Loading operation context...", "info", { timeoutMs: 4000 });
+      try {
+        await S.refreshEngagementContextFromFreshResult?.(S.extractPRMetadata?.());
+        opId = String(S.__engagementCtx?.operationId || "").trim();
+      } catch {}
+      if (!opId) {
+        S.toast?.("Cannot enter comment mode: unable to obtain operation context.", "warning", { timeoutMs: 5000 });
+        return;
+      }
+    }
+
+    S.__commentState.active = true;
+    S.__commentState.operationId = opId;
+    S.__commentState.diagramIndex = 0;
+    S.__commentState.selectedIds = [];
+    S.__commentState.draftText = "";
+    S.__commentState.previewSvg = null;
+    S.__commentState.previewError = null;
+    S.updateArchReviewButton?.();
+    S.__commentState.requestSeq = 0;
+    S.__commentState.completedSeq = 0;
+
+    const svgWrap = document.querySelector("#striffs-content .striff-svg-wrap") ||
+                    document.querySelector("#striffs-content");
+    if (svgWrap) svgWrap.classList.add("striffs-comment-mode");
+
+    S.applyCommentAffordances?.();
+    S.openCommentPanel?.();
+    const commentBtn = document.getElementById('striffs-comment-btn');
+    if (commentBtn) commentBtn.classList.add('is-active');
+    S.emitEngagementEvent?.("comment_mode_entered", {});
+  };
+
+  S.exitCommentMode = function exitCommentMode() {
+    const wasActive = S.__commentState.active;
+    S.resetCommentState?.();
+
+    if (S.__commentDebounceTimer) {
+      clearTimeout(S.__commentDebounceTimer);
+      S.__commentDebounceTimer = null;
+    }
+
+    try {
+      if (wasActive) {
+        S.clearAllSelectionHighlights?.();
+        S.removeCommentAffordances?.();
+        S.emitEngagementEvent?.("comment_mode_exited", {});
+      }
+    } catch (err) {
+      S.cwarn?.("[exitCommentMode] cleanup error", err);
+    }
+
+    S.closeCommentPanel?.();
+    S.updateArchReviewButton?.();
+    const commentBtn = document.getElementById('striffs-comment-btn');
+    if (commentBtn) commentBtn.classList.remove('is-active');
+
+    // Re-apply hoverability (which re-adds striffs-comment-mode + affordances)
+    // Do NOT remove striffs-comment-mode here — applyHoverability manages it.
+    S.applyHoverability?.();
+
+    // Verify cleanup completed in next frame (catches stale DOM state)
+    requestAnimationFrame(() => {
+      try {
+        const stale = S.__striffsSvg?.querySelectorAll("g.entity.striffs-comment-selected");
+        if (stale?.length) {
+          S.cwarn?.('[exitCommentMode] stale selection highlights found, forcing cleanup');
+          for (const n of stale) n.classList.remove("striffs-comment-selected");
+        }
+      } catch {}
+    });
+  };
+
+  S.toggleComponentSelection = function toggleComponentSelection(componentId) {
+    if (!S.__commentState.active) return;
+    const id = String(componentId || "").trim();
+    if (!id) return;
+    const idx = S.__commentState.selectedIds.indexOf(id);
+    if (idx >= 0) {
+      S.__commentState.selectedIds.splice(idx, 1);
+      S.setEntitySelectionHighlight?.(id, false);
+    } else {
+      if (S.__commentState.selectedIds.length >= S.COMMENT_MAX_SELECTION) {
+        S.toast?.(`You can select up to ${S.COMMENT_MAX_SELECTION} components.`, "warning", { timeoutMs: 2500 });
+        return;
+      }
+      S.__commentState.selectedIds.push(id);
+      S.setEntitySelectionHighlight?.(id, true);
+    }
+    S.updateCommentPanelSelection?.();
+    S.reapplySelectionHighlights?.();
+    S.schedulePreviewRequest?.();
+  };
+
+  S.setEntitySelectionHighlight = function setEntitySelectionHighlight(componentId, selected) {
+    if (!S.__striffsSvg) return;
+    const node = S.__striffsSvg.querySelector(`g.entity[data-qualified-name="${CSS.escape(componentId)}"]`);
+    if (!node) return;
+    try {
+      node.classList.toggle("striffs-comment-selected", selected);
+      const affs = node.querySelectorAll(".striffs-comment-affordance span, foreignObject.striffs-comment-affordance span");
+      for (const aff of affs) {
+        if (aff.textContent === "+" || aff.textContent === "\u2212") {
+          aff.textContent = selected ? "\u2212" : "+";
+        }
+      }
+    } catch {}
+  };
+
+  S.clearAllSelectionHighlights = function clearAllSelectionHighlights() {
+    if (!S.__striffsSvg) return;
+    try {
+      const nodes = S.__striffsSvg.querySelectorAll("g.entity.striffs-comment-selected");
+      for (const n of nodes) n.classList.remove("striffs-comment-selected");
+    } catch {}
+  };
+
+  S.reapplySelectionHighlights = function reapplySelectionHighlights() {
+    if (!S.__striffsSvg || !S.__commentState.active) return;
+    S.clearAllSelectionHighlights();
+    S.removeCommentAffordances?.();
+    S.applyCommentAffordances?.();
+    for (const id of S.__commentState.selectedIds) {
+      S.setEntitySelectionHighlight?.(id, true);
+    }
+  };
+
+  S.getSelectableCommentComponentIds = function getSelectableCommentComponentIds() {
+    if (!S.__striffsSvg) return [];
+    return Array.from(S.__striffsSvg.querySelectorAll("g.entity[data-qualified-name]"))
+      .map((node) => String(node.getAttribute("data-qualified-name") || "").trim())
+      .filter((id) => id && !S.isReviewNoteQualifiedName?.(id));
+  };
+
+  S.applyCommentAffordances = function applyCommentAffordances() {
+    if (!S.__striffsSvg) return;
+    try {
+      const nodes = S.__striffsSvg.querySelectorAll("g.entity[data-qualified-name]");
+      for (const node of nodes) {
+        if (node.querySelector("foreignObject.striffs-comment-affordance")) continue;
+        const rect = node.querySelector("rect");
+        if (!rect) continue;
+        const bx = parseFloat(rect.getAttribute("x") || "0");
+        const by = parseFloat(rect.getAttribute("y") || "0");
+        const bw = parseFloat(rect.getAttribute("width") || "0");
+        const fo = document.createElementNS("http://www.w3.org/2000/svg", "foreignObject");
+        fo.setAttribute("x", bx + bw - 20);
+        fo.setAttribute("y", by - 20);
+        fo.setAttribute("width", "48");
+        fo.setAttribute("height", "48");
+        fo.setAttribute("class", "striffs-comment-affordance");
+        fo.style.pointerEvents = "auto";
+        const selected = S.__commentState.selectedIds.includes(
+          node.getAttribute("data-qualified-name") || ""
+        );
+        const span = document.createElement("span");
+        span.className = "striffs-comment-affordance";
+        span.textContent = selected ? "\u2212" : "+";
+        span.style.cssText = "display:block;width:44px;height:44px;line-height:44px;text-align:center;cursor:pointer;";
+        fo.appendChild(span);
+        node.appendChild(fo);
+
+        // Sticky hover: keep affordance visible while mouse is inside
+        // the entity group (including the foreignObject button area)
+        if (!node.__striffsCommentHoverHandlersAttached) {
+          node.__striffsCommentHoverHandlersAttached = true;
+          node.addEventListener("mouseenter", () => {
+            node.classList.add("striffs-comment-hover");
+          });
+          node.addEventListener("mouseleave", () => {
+            node.classList.remove("striffs-comment-hover");
+          });
+        }
+      }
+    } catch (e) {
+      cwarn?.("applyCommentAffordances failed", e);
+    }
+  };
+
+  S.removeCommentAffordances = function removeCommentAffordances() {
+    if (!S.__striffsSvg) return;
+    try {
+      const affs = S.__striffsSvg.querySelectorAll("foreignObject.striffs-comment-affordance");
+      for (const a of affs) a.remove();
+      const hovered = S.__striffsSvg.querySelectorAll("g.entity.striffs-comment-hover");
+      for (const node of hovered) node.classList.remove("striffs-comment-hover");
+    } catch {}
+  };
+
+  S.schedulePreviewRequest = function schedulePreviewRequest() {
+    if (S.__commentDebounceTimer) clearTimeout(S.__commentDebounceTimer);
+    S.updateCommentPanelPreview?.();
+    S.__commentDebounceTimer = setTimeout(() => {
+      S.firePreviewRequest?.();
+    }, 400);
+  };
+
+  S.firePreviewRequest = async function firePreviewRequest() {
+    const { selectedIds, operationId, diagramIndex } = S.__commentState;
+    if (!selectedIds.length) {
+      S.__commentState.previewSvg = null;
+      S.__commentState.previewError = null;
+      S.updateCommentPanelPreview?.();
+      return;
+    }
+    const seq = ++S.__commentState.requestSeq;
+
+    let svg = null;
+    const opId = operationId || S.__engagementCtx?.operationId;
+    if (opId) {
+      try {
+        const componentList = selectedIds.join(",");
+        const resp = await S.fetchSubdiagramRender?.({
+          operationId: opId,
+          diagramIndex: diagramIndex || 0,
+          components: componentList,
+          timeoutMs: 8000
+        });
+        if (seq !== S.__commentState.requestSeq) return;
+        if (resp?.ok && resp?.svg) {
+          const hasContent = resp.svg.includes("<text") || resp.svg.includes("<g ");
+          if (hasContent) {
+            svg = resp.svg;
+            S.clog?.('[subdiagram] backend render succeeded', { components: selectedIds.length, cached: resp.cached, pumlLength: resp.pumlSource?.length, componentCount: resp.componentCount });
+            if (S.isDebug?.() && resp.pumlSource) {
+              S.clog?.('[subdiagram] extracted PUML:\n', resp.pumlSource);
+            }
+          } else {
+            S.clog?.('[subdiagram] backend SVG appears empty');
+          }
+        } else {
+          S.clog?.('[subdiagram] backend render failed', { error: resp?.error });
+        }
+      } catch (e) {
+        S.clog?.('[subdiagram] backend render error', { error: e?.message });
+      }
+    }
+
+    if (seq !== S.__commentState.requestSeq) return;
+    S.__commentState.completedSeq = seq;
+    if (svg) {
+      S.__commentState.previewSvg = svg;
+      S.__commentState.previewError = null;
+    } else {
+      S.__commentState.previewSvg = null;
+      S.__commentState.previewError = "Could not build subdiagram from selection";
+    }
+    S.updateCommentPanelPreview?.();
+  };
+
+  S.handleCommentDiagramClick = async function handleCommentDiagramClick(e) {
+    if (!S.__commentState) { S.clog?.('[comment-click] abort: no commentState'); return false; }
+    if (e?.button != null && e.button !== 0) return false;
+
+    // When clicking HTML elements inside an SVG foreignObject, e.target.closest()
+    // cannot traverse into the SVG tree. Use composedPath() to find the SVG entity.
+    let target = e.target instanceof Element
+      ? e.target.closest("g.entity[data-qualified-name]")
+      : null;
+    if (!target) {
+      // Walk composed path to find foreignObject → SVG g.entity
+      for (const node of e.composedPath()) {
+        if (node instanceof SVGElement && node.classList?.contains("entity") && node.hasAttribute?.("data-qualified-name")) {
+          target = node;
+          break;
+        }
+      }
+    }
+    if (!target) { S.clog?.('[comment-click] abort: no entity target', { tagName: e.target?.tagName, classList: e.target?.classList?.toString?.() }); return false; }
+    const qn = target.getAttribute("data-qualified-name");
+    if (!qn) { S.clog?.('[comment-click] abort: empty qualified-name'); return false; }
+
+    // If comment mode is not yet active, enter it (fetches context lazily)
+    if (!S.__commentState.active) {
+      S.clog?.('[comment-click] entering comment mode first');
+      await S.enterCommentMode?.();
+    }
+
+    if (!S.__commentState.active) { S.clog?.('[comment-click] abort: not active after enter attempt', { opId: S.__engagementCtx?.operationId || '' }); return false; }
+    S.clog?.('[comment-click] toggling', qn, { selectedIds: [...S.__commentState.selectedIds] });
+    S.toggleComponentSelection?.(qn);
+    return true;
+  };
+
+  // ---------- Comment panel (inlined from striffs-comment-panel.js) ----------
+
+  const PANEL_ID = "striffs-comment-panel";
+
+  // Restore persisted panel width from storage
+  try {
+    if (typeof chrome?.storage?.local?.get === "function") {
+      chrome.storage.local.get(['striffsCommentPanelWidth'], (res) => {
+        if (res?.striffsCommentPanelWidth) {
+          S.__commentPanelWidth = res.striffsCommentPanelWidth;
+        }
+      });
+    }
+  } catch {}
+
+  S.openCommentPanel = function openCommentPanel() {
+    let panel = document.getElementById(PANEL_ID);
+    const host = document.getElementById("striff-diagram-view") || document.body;
+    if (!panel) {
+      panel = createCommentPanel();
+      // Insert as first child so it pushes content to the right
+      host.insertBefore(panel, host.firstChild);
+    } else if (panel.parentElement !== host) {
+      host.insertBefore(panel, host.firstChild);
+    }
+    const panelWidth = Math.max(375, Number(S.__commentPanelWidth) || 375);
+    panel.style.width = panelWidth + "px";
+    panel.setAttribute("aria-hidden", "false");
+    panel.classList.add("striffs-comment-panel--open");
+    void panel.offsetHeight;
+    // Set margin-left on siblings to match panel width
+    if (host) {
+      host.querySelectorAll(":scope > #striffs-controls-wrap, :scope > #striffs-surface").forEach(s => {
+        s.style.marginLeft = panelWidth + "px";
+        s.style.transition = "margin-left .25s ease";
+      });
+    }
+    S.updateCommentPanelSelection?.();
+    S.updateCommentPanelPreview?.();
+  };
+
+  S.closeCommentPanel = function closeCommentPanel() {
+    const panel = document.getElementById(PANEL_ID);
+    if (!panel) return;
+    panel.classList.remove("striffs-comment-panel--open");
+    panel.style.width = "0px";
+    panel.setAttribute("aria-hidden", "true");
+    // Reset sibling margins
+    const host = panel.parentElement;
+    if (host) {
+      host.querySelectorAll(":scope > #striffs-controls-wrap, :scope > #striffs-surface").forEach(s => {
+        s.style.marginLeft = "";
+      });
+    }
+  };
+
+  function createCommentPanel() {
+    const panel = document.createElement("div");
+    panel.id = PANEL_ID;
+    panel.className = "striffs-comment-panel";
+    panel.setAttribute("aria-hidden", "true");
+    panel.addEventListener("click", (e) => e.stopPropagation());
+    panel.innerHTML = `
+      <div class="striffs-comment-panel__header">
+        <div class="striffs-comment-panel__header-text">
+          <span class="striffs-comment-panel__title">Leave a comment</span>
+          <span class="striffs-comment-panel__subtitle">Click on components to include them in the diagram, then click "Start review" below to open GitHub's review dialog.</span>
+        </div>
+        <button type="button" class="striffs-comment-panel__close" title="Close (Esc)" aria-label="Close">&times;</button>
+      </div>
+      <div class="striffs-comment-panel__chips">
+        <div class="striffs-comment-panel__chips-header">
+          <span class="striffs-comment-panel__chips-label">Selected components</span>
+          <div class="striffs-comment-panel__chips-actions">
+            <button type="button" class="striffs-comment-panel__action-btn striffs-comment-panel__action-btn--select-all">Select all</button>
+            <button type="button" class="striffs-comment-panel__action-btn striffs-comment-panel__action-btn--deselect-all">Deselect all</button>
+          </div>
+        </div>
+        <div class="striffs-comment-panel__chips-divider"></div>
+        <div class="striffs-comment-panel__chips-list"></div>
+      </div>
+      <div class="striffs-comment-panel__preview">
+        <div class="striffs-comment-panel__preview-label">Preview</div>
+        <div class="striffs-comment-panel__preview-content"></div>
+      </div>
+      <div class="striffs-comment-panel__error" style="display:none"></div>
+      <div class="striffs-comment-panel__actions">
+        <button type="button" class="striffs-comment-panel__submit" disabled>Start review</button>
+      </div>
+      <div class="striffs-comment-panel__resize-handle"></div>
+    `;
+
+    panel.querySelector(".striffs-comment-panel__close").addEventListener("click", () => {
+      S.exitCommentMode?.();
+    });
+
+    panel.querySelector(".striffs-comment-panel__submit").addEventListener("click", () => {
+      S.submitComment?.();
+    });
+
+    panel.querySelector(".striffs-comment-panel__action-btn--select-all").addEventListener("click", () => {
+      if (!S.__commentState?.active || !S.__striffsSvg) return;
+      const allIds = S.getSelectableCommentComponentIds?.() || [];
+      for (const id of allIds) {
+        if (S.__commentState.selectedIds.includes(id)) continue;
+        if (S.__commentState.selectedIds.length >= S.COMMENT_MAX_SELECTION) break;
+        S.__commentState.selectedIds.push(id);
+        S.setEntitySelectionHighlight?.(id, true);
+      }
+      S.updateCommentPanelSelection?.();
+      S.reapplySelectionHighlights?.();
+      S.schedulePreviewRequest?.();
+    });
+
+    panel.querySelector(".striffs-comment-panel__action-btn--deselect-all").addEventListener("click", () => {
+      if (!S.__commentState?.active) return;
+      for (const id of [...S.__commentState.selectedIds]) {
+        S.setEntitySelectionHighlight?.(id, false);
+      }
+      S.__commentState.selectedIds.length = 0;
+      S.updateCommentPanelSelection?.();
+      S.reapplySelectionHighlights?.();
+      S.schedulePreviewRequest?.();
+    });
+
+    // Resize handle drag
+    const handle = panel.querySelector(".striffs-comment-panel__resize-handle");
+    let resizing = false;
+    let startX = 0;
+    let startWidth = 0;
+    handle.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      resizing = true;
+      startX = e.clientX;
+      startWidth = panel.offsetWidth;
+      document.body.style.cursor = "ew-resize";
+      document.body.style.userSelect = "none";
+    });
+    document.addEventListener("mousemove", (e) => {
+      if (!resizing) return;
+      const diff = e.clientX - startX;
+      const newWidth = Math.max(375, Math.min(600, startWidth + diff));
+      panel.style.width = newWidth + "px";
+      S.__commentPanelWidth = newWidth;
+      // Keep siblings in sync with the panel width
+      const host = panel.parentElement;
+      if (host) {
+        const siblings = host.querySelectorAll(":scope > #striffs-controls-wrap, :scope > #striffs-surface");
+        siblings.forEach(s => { s.style.marginLeft = newWidth + "px"; });
+      }
+    });
+    document.addEventListener("mouseup", () => {
+      if (!resizing) return;
+      resizing = false;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      // Persist width
+      try {
+        if (S.__commentPanelWidth && typeof chrome?.storage?.local?.set === "function") {
+          chrome.storage.local.set({ striffsCommentPanelWidth: S.__commentPanelWidth });
+        }
+      } catch {}
+    });
+
+    return panel;
+  }
+
+  S.updateCommentPanelSelection = function updateCommentPanelSelection() {
+    const panel = document.getElementById(PANEL_ID);
+    if (!panel) return;
+    const list = panel.querySelector(".striffs-comment-panel__chips-list");
+    const selectAllBtn = panel.querySelector(".striffs-comment-panel__action-btn--select-all");
+    const deselectAllBtn = panel.querySelector(".striffs-comment-panel__action-btn--deselect-all");
+    if (!list) return;
+
+    const allIds = S.getSelectableCommentComponentIds?.() || [];
+    const hasSelection = S.__commentState.selectedIds.length > 0;
+    const allSelected = allIds.length > 0 && allIds.every(id => S.__commentState.selectedIds.includes(id));
+    const selectAllVisible = allIds.length > 0 && allIds.length <= S.COMMENT_MAX_SELECTION && !allSelected;
+
+    if (selectAllBtn) {
+      selectAllBtn.style.display = selectAllVisible ? "" : "none";
+      selectAllBtn.disabled = !selectAllVisible;
+    }
+
+    if (deselectAllBtn) {
+      deselectAllBtn.style.display = hasSelection ? "" : "none";
+      deselectAllBtn.disabled = !hasSelection;
+    }
+
+    list.innerHTML = "";
+    for (const id of S.__commentState.selectedIds) {
+      const chip = document.createElement("span");
+      chip.className = "striffs-comment-panel__chip";
+      const fullName = S.toDottedName?.(id) || id;
+      const shortName = fullName.split(".").pop() || fullName;
+      chip.innerHTML = `<span class="striffs-comment-panel__chip-icon">&#9670;</span>${shortName}`;
+      chip.title = fullName;
+      chip.addEventListener("click", () => {
+        S.toggleComponentSelection?.(id);
+      });
+      list.appendChild(chip);
+    }
+  };
+
+  S.updateCommentPanelPreview = function updateCommentPanelPreview(opts = {}) {
+    const panel = document.getElementById(PANEL_ID);
+    if (!panel) return;
+    const content = panel.querySelector(".striffs-comment-panel__preview-content");
+    const errorEl = panel.querySelector(".striffs-comment-panel__error");
+    if (!content || !errorEl) return;
+
+    if (opts.loading) {
+      content.innerHTML = '<div class="striffs-comment-panel__preview-loading">Loading preview...</div>';
+      errorEl.style.display = "none";
+      return;
+    }
+
+    if (S.__commentState.previewError) {
+      content.innerHTML = "";
+      errorEl.textContent = S.__commentState.previewError;
+      errorEl.style.display = "block";
+      updateSubmitState(panel);
+      return;
+    }
+
+    errorEl.style.display = "none";
+
+    if (S.__commentState.previewSvg) {
+      content.innerHTML = "";
+      try {
+        const doc = new DOMParser().parseFromString(S.__commentState.previewSvg, "image/svg+xml");
+        const svg = doc.querySelector("svg");
+        if (svg) {
+          svg.style.display = "block";
+          svg.style.maxWidth = "100%";
+          svg.style.maxHeight = "220px";
+          svg.style.width = "auto";
+          svg.style.height = "auto";
+          svg.style.objectFit = "contain";
+          svg.style.margin = "0 auto";
+          content.appendChild(svg);
+        }
+      } catch {
+        content.innerHTML = '<div class="striffs-comment-panel__preview-empty">Preview could not be displayed</div>';
+      }
+    } else if (!S.__commentState.selectedIds.length) {
+      content.innerHTML = '<div class="striffs-comment-panel__preview-empty">Select components to see a preview</div>';
+    } else {
+      content.innerHTML = "";
+    }
+
+    updateSubmitState(panel);
+  };
+
+  function updateSubmitState(panel) {
+    const btn = panel?.querySelector(".striffs-comment-panel__submit");
+    if (!btn) return;
+    const hasPreview = Boolean(S.__commentState.previewSvg);
+    const hasError = Boolean(S.__commentState.previewError);
+    btn.disabled = !hasPreview || hasError;
+  }
+
+  // ---------- Submit flow ----------
+
+  S.submitComment = async function submitComment() {
+    const { previewSvg, selectedIds } = S.__commentState;
+    if (!previewSvg || !selectedIds.length) return;
+
+    S.emitEngagementEvent?.("comment_submitted", {
+      componentCount: selectedIds.length,
+      componentIds: selectedIds.slice(0, 10)
+    });
+
+    await fillComposer(previewSvg);
+  };
+
+  // (tryRestorePendingComment removed — clipboard approach no longer navigates)
+
+  async function fillComposer(svgString) {
+    const shortNames = S.__commentState.selectedIds
+      .filter(id => !S.isReviewNoteQualifiedName?.(id))
+      .map(id => {
+        const full = S.toDottedName?.(id) || id;
+        return full.split(".").pop() || full;
+      });
+    const componentList = shortNames.map(n => "`" + n + "`").join(", ");
+    const contextBlock = componentList ? `**Context:** ${componentList}` : "";
+
+    const existingTextareas = new Set(document.querySelectorAll("textarea"));
+    let textarea = findReviewTextarea();
+    let reviewForm = textarea ? findReviewForm(textarea) : null;
+
+    // In the old UI, the textarea exists inside a closed <details> — it's in
+    // the DOM but invisible. Detect this and open the dropdown before proceeding.
+    if (textarea) {
+      await ensureReviewComposerVisible(textarea);
+      if (isReviewComposerVisible(textarea)) {
+        reviewForm = findReviewForm(textarea);
+      } else {
+        textarea = null;
+        reviewForm = null;
+      }
+    }
+
+    if (!textarea) {
+      const reviewBtn = findReviewButton();
+      if (!reviewBtn) {
+        S.toast?.(
+          `Could not find GitHub's review controls. Make sure you have write access to this PR.`,
+          "error", { timeoutMs: 8000 }
+        );
+        return;
+      }
+      S.clog?.('[review] clicking review button', { tag: reviewBtn.tagName, text: reviewBtn.textContent?.trim().slice(0, 40), class: reviewBtn.className });
+      reviewBtn.click();
+
+      // If the button was a <summary>/<details> dropdown, look for and click
+      // the "Start a review" option inside the revealed dropdown menu
+      await new Promise(r => setTimeout(r, 200));
+      const details = reviewBtn.closest("details");
+      if (details) {
+        S.clog?.('[review] found details dropdown, looking for start-review option');
+        // Try radio button for "Comment" (the comment review type)
+        const commentRadio = details.querySelector('input[name="pull_request_review[event]"][value="comment"]');
+        if (commentRadio) { commentRadio.checked = true; commentRadio.dispatchEvent(new Event("change", { bubbles: true })); }
+        // Try submit button inside the dropdown form
+        const submitInDropdown = details.querySelector('button[type="submit"]');
+        if (submitInDropdown && /review/i.test(submitInDropdown.textContent || '')) submitInDropdown.click();
+      }
+
+      for (let i = 0; i < 30; i++) {
+        await new Promise(r => setTimeout(r, 150));
+        textarea = findReviewTextarea() || findReviewTextarea(existingTextareas);
+        if (!textarea) continue;
+        await ensureReviewComposerVisible(textarea);
+        if (!isReviewComposerVisible(textarea)) continue;
+        reviewForm = findReviewForm(textarea);
+        S.clog?.('[review] textarea found after click', { attempt: i + 1, id: textarea.id, name: textarea.name });
+        break;
+      }
+    }
+
+    if (!textarea) {
+      S.toast?.(`Could not open GitHub's review text box. Your selection was kept so you can try again.`, "error", { timeoutMs: 8000 });
+      return;
+    }
+
+    // Step 3: Ensure the "Write" tab is active (not "Preview") before editing the textarea.
+    // Drag-and-drop and value changes only work in the Write tab.
+    try {
+      const form = reviewForm || textarea?.closest("form") || textarea?.closest("[class*='comment']");
+      // Old UI: tabbed container with .js-write-tab / .js-preview-tab buttons
+      const writeTabOld = form?.querySelector?.(".js-write-tab");
+      if (writeTabOld && !writeTabOld.classList.contains("selected")) {
+        writeTabOld.click();
+        await new Promise(r => setTimeout(r, 100));
+      }
+      // New UI: buttons with data-testid or aria-selected
+      const writeTabNew = form?.querySelector?.('button[data-testid="write-tab"], button[aria-label="Write"], button.js-write-tab')
+        || form?.closest?.('[class*="comment"]')?.querySelector?.('button[data-testid="write-tab"], button[aria-label="Write"]');
+      if (writeTabNew && writeTabNew.getAttribute("aria-selected") !== "true") {
+        writeTabNew.click();
+        await new Promise(r => setTimeout(r, 100));
+      }
+      // Generic fallback: look for any tab button containing "Write" text
+      if (!writeTabOld && !writeTabNew) {
+        const tabs = form?.querySelectorAll?.("button.tabnav-tab, button[role='tab']") || [];
+        for (const tab of tabs) {
+          if (/write/i.test(tab.textContent || "") && tab.getAttribute("aria-selected") !== "true") {
+            tab.click();
+            await new Promise(r => setTimeout(r, 100));
+            break;
+          }
+        }
+      }
+    } catch (e) {
+      S.clog?.('[review] Write tab switch attempted but may not have succeeded', e?.message);
+    }
+
+    // Step 4: Set the component list text — always clear any previous unposted content
+    const commentText = buildReviewDraftTemplate(contextBlock, "");
+    textarea.focus();
+    try {
+      const nativeSetter = Object.getOwnPropertyDescriptor(
+        HTMLTextAreaElement.prototype, "value"
+      ).set;
+      nativeSetter.call(textarea, commentText);
+    } catch {
+      textarea.value = commentText;
+    }
+    const insertionOffset = getReviewDraftInsertionOffset(commentText);
+    const reviewDraftSnapshot = {
+      contextBlock,
+      initialDraftText: "",
+      submittedText: commentText
+    };
+    try {
+      textarea.setSelectionRange(insertionOffset, insertionOffset);
+    } catch {}
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+
+    try {
+      const scaledSvg = scaleSvg(svgString, 600);
+      const svgBlob = new Blob([scaledSvg], { type: "image/svg+xml" });
+      const file = new File([svgBlob], "striff-subdiagram.svg", { type: "image/svg+xml" });
+      const attachAttempt = await attachFileToReviewComposer(reviewForm, textarea, file);
+      if (!attachAttempt) throw new Error("No review upload target accepted the subdiagram file");
+      const attachmentReady = await waitForReviewAttachment(reviewForm, textarea, reviewDraftSnapshot, 12000);
+      if (!attachmentReady) {
+        throw new Error("GitHub did not confirm an embedded review attachment");
+      }
+      normalizeReviewDraftLayout(textarea, reviewDraftSnapshot);
+
+      S.toast?.(`Review opened with diagram. Submit when ready.`, "success", { timeoutMs: 8000 });
+    } catch (e) {
+      S.cwarn?.("Review diagram attach failed", e);
+      S.toast?.(`Review opened but diagram attach failed. Please add the SVG manually.`, "warning", { timeoutMs: 8000 });
+    } finally {
+      try { S.closeCommentPanel?.(); } catch {}
+      try { S.exitCommentMode?.(); } catch {}
+    }
+  }
+
+  function scaleSvg(svgString, maxWidth) {
+    try {
+      const doc = new DOMParser().parseFromString(svgString, "image/svg+xml");
+      const svg = doc.querySelector("svg");
+      if (!svg) return svgString;
+      const w = parseFloat(svg.getAttribute("width")) || svg.viewBox?.baseVal?.width || 0;
+      const h = parseFloat(svg.getAttribute("height")) || svg.viewBox?.baseVal?.height || 0;
+      if (!w || !h || w <= maxWidth) return svgString;
+      const ratio = h / w;
+      svg.setAttribute("width", String(maxWidth));
+      svg.setAttribute("height", String(Math.round(maxWidth * ratio)));
+      return new XMLSerializer().serializeToString(svg);
+    } catch {
+      return svgString;
+    }
+  }
+
+  function buildReviewDraftTemplate(contextBlock, existingDraftText = "") {
+    const preserved = String(existingDraftText || "").trim();
+    if (!contextBlock) {
+      return preserved ? `${preserved}\n\n` : "\n\n";
+    }
+    if (!preserved) return `\n\n${contextBlock}`;
+    return `${preserved}\n\n${contextBlock}`;
+  }
+
+  function getReviewDraftInsertionOffset(text) {
+    if (typeof text !== "string") return 0;
+    const firstNonNewline = text.search(/[^\n]/);
+    if (firstNonNewline === -1) return Math.min(2, text.length);
+    return Math.min(2, firstNonNewline);
+  }
+
+  function normalizeReviewDraftLayout(textarea, draftSnapshot = {}) {
+    if (!textarea) return;
+    const current = String(textarea.value || "");
+    if (!current) return;
+    const contextBlock = String(draftSnapshot?.contextBlock || "").trim();
+    const submittedText = String(draftSnapshot?.submittedText || "");
+    const initialDraftText = String(draftSnapshot?.initialDraftText || "").trim();
+
+    // Match both markdown ![alt](url) and HTML <img ...> image tags
+    const markdownImageRegex = /!\[[^\]]*\]\([^)]+\)/i;
+    const htmlImageRegex = /<img\s[^>]*src=["'][^"']+["'][^>]*>/i;
+    const imageMatch = current.match(markdownImageRegex) || current.match(htmlImageRegex);
+    if (!imageMatch) return;
+
+    const imageTag = imageMatch[0];
+    let userIntro = current.replace(imageTag, "\n").trim();
+    if (contextBlock) {
+      const escapedContext = contextBlock.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      userIntro = userIntro.replace(new RegExp(`\\n*${escapedContext}\\s*`, "g"), "\n").trim();
+    }
+    if (submittedText) {
+      userIntro = userIntro.replace(submittedText, "\n").trim();
+    }
+    if (!userIntro && initialDraftText) {
+      userIntro = initialDraftText;
+    }
+
+    const parts = ["", ""];
+    if (userIntro) parts.push(userIntro.trim(), "");
+    parts.push(imageTag);
+    if (contextBlock) parts.push("", "", contextBlock);
+    let normalized = parts.join("\n").replace(/\n{4,}/g, "\n\n\n");
+    // Guarantee exactly one blank line between image and context block (handles both markdown and HTML img)
+    if (contextBlock) {
+      // Handle markdown ![...](...) images
+      normalized = normalized.replace(
+        /(!\[[^\]]*\]\([^)]+\))\n*(\*\*Context:\*\*)/i,
+        "$1\n\n$2"
+      );
+      // Handle HTML <img ...> tags
+      normalized = normalized.replace(
+        /(<img\s[^>]*>)\n*(\*\*Context:\*\*)/i,
+        "$1\n\n$2"
+      );
+    }
+
+    try {
+      const nativeSetter = Object.getOwnPropertyDescriptor(
+        HTMLTextAreaElement.prototype, "value"
+      ).set;
+      nativeSetter.call(textarea, normalized);
+    } catch {
+      textarea.value = normalized;
+    }
+    try {
+      textarea.setSelectionRange(0, 0);
+    } catch {}
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+
+  function isReviewTextareaCandidate(textarea) {
+    if (!(textarea instanceof HTMLTextAreaElement)) return false;
+    if (!isReviewComposerVisible(textarea)) return false;
+    const scope = textarea.closest(
+      '[class*="CommentBox"], [class*="MarkdownEditor"], [class*="review"], [data-testid*="review"], form, details'
+    );
+    return Boolean(scope);
+  }
+
+  function findReviewTextarea(existingTextareas = null) {
+    const direct = document.querySelector("#pull_request_review_body") ||
+      document.querySelector('textarea[name="pull_request_review[body]"]') ||
+      document.querySelector("textarea.js-review-field") ||
+      document.querySelector('textarea.prc-Textarea-TextArea-snlco[aria-label="Markdown value"]');
+    if (direct && isReviewTextareaCandidate(direct)) return direct;
+    if (!existingTextareas) return null;
+    const all = document.querySelectorAll("textarea");
+    for (const ta of all) {
+      if (existingTextareas.has(ta)) continue;
+      if (isReviewTextareaCandidate(ta)) return ta;
+    }
+    return null;
+  }
+
+  async function ensureReviewComposerVisible(textarea) {
+    if (!textarea) return;
+    const details = textarea.closest("details");
+    if (!details) return;
+    if (!details.open) {
+      const summary = details.querySelector("summary");
+      if (summary) {
+        summary.click();
+      }
+      if (!details.open) {
+        details.open = true;
+      }
+      S.clog?.('[review] ensured details dropdown containing review textarea is open');
+    }
+    for (let i = 0; i < 20; i++) {
+      const rects = textarea.getClientRects();
+      if (rects.length && textarea.offsetParent !== null) return;
+      await new Promise(r => setTimeout(r, 100));
+    }
+  }
+
+  function isReviewComposerVisible(textarea) {
+    if (!textarea) return false;
+    try {
+      const rects = textarea.getClientRects();
+      const style = window.getComputedStyle?.(textarea);
+      return Boolean(
+        rects.length &&
+        textarea.offsetParent !== null &&
+        style &&
+        style.display !== "none" &&
+        style.visibility !== "hidden"
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  function findReviewForm(textarea) {
+    if (!textarea) return null;
+    return textarea.closest('[class*="CommentBox"]') ||
+      textarea.closest('[class*="MarkdownEditor"]') ||
+      textarea.closest('[data-testid="review-thread-comment-form"]') ||
+      textarea.closest("form") ||
+      textarea.closest("fieldset");
+  }
+
+  async function attachFileToReviewComposer(reviewForm, textarea, file) {
+    // Try drag-and-drop first — works reliably in both old and new GitHub UI
+    if (reviewForm) {
+      try {
+        const dt = new DataTransfer();
+        dt.items.add(file);
+        const dropEvent = new DragEvent("drop", {
+          bubbles: true,
+          cancelable: true,
+          dataTransfer: dt,
+        });
+        reviewForm.dispatchEvent(dropEvent);
+        return "drop";
+      } catch {}
+    }
+
+    // Fallback: set file input value directly (can trigger X-Digest-Sha256 errors in old UI)
+    const attachWithInput = (input) => {
+      if (!(input instanceof HTMLInputElement) || input.type !== "file") return false;
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      try {
+        input.files = dt.files;
+      } catch {
+        return false;
+      }
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+      return true;
+    };
+
+    const scopedInputs = [];
+    if (reviewForm) {
+      scopedInputs.push(...reviewForm.querySelectorAll('input[type="file"]'));
+    }
+    scopedInputs.push(...document.querySelectorAll('input[type="file"]'));
+    for (const input of scopedInputs) {
+      if (attachWithInput(input)) return "input";
+    }
+
+    // Last resort: clipboard paste
+    try {
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      const pasteEvent = new ClipboardEvent("paste", {
+        bubbles: true,
+        cancelable: true,
+        clipboardData: dt,
+      });
+      textarea.dispatchEvent(pasteEvent);
+      return "paste";
+    } catch {}
+
+    return "";
+  }
+
+  async function waitForReviewAttachment(reviewForm, textarea, draftSnapshot = {}, timeoutMs = 12000) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      const snapshot = getReviewAttachmentSnapshot(reviewForm, textarea, draftSnapshot);
+      if (snapshot.embedded) {
+        S.clog?.('[review] attachment confirmed', snapshot);
+        return true;
+      }
+      await new Promise(r => setTimeout(r, 200));
+    }
+    S.cwarn?.('[review] attachment confirmation timed out', getReviewAttachmentSnapshot(reviewForm, textarea, draftSnapshot));
+    return false;
+  }
+
+  function getReviewAttachmentSnapshot(reviewForm, textarea, draftSnapshot = {}) {
+    const text = String(textarea?.value || "");
+    const initialText = String(draftSnapshot?.submittedText || "");
+    const markdownMatches = text.match(/!\[[^\]]*\]\(([^)]+)\)/g) || [];
+    const initialMarkdownMatches = initialText.match(/!\[[^\]]*\]\(([^)]+)\)/g) || [];
+    const hasNewMarkdownEmbed = markdownMatches.length > initialMarkdownMatches.length;
+    const hasAttachmentUrl = /githubusercontent\.com|github\.com\/user-attachments\//i.test(text);
+    const previewRoot = reviewForm || textarea?.closest("form") || document;
+    const uploadPreview = previewRoot?.querySelector?.(
+      'img[src*="githubusercontent.com"], img[src*="user-attachments"], a[href*="user-attachments"], a[href*="githubusercontent.com"], .js-upload-markdown-image, .js-uploaded-markdown-image'
+    );
+    return {
+      embedded: Boolean(hasNewMarkdownEmbed || hasAttachmentUrl || uploadPreview),
+      hasMarkdownEmbed: hasNewMarkdownEmbed,
+      hasUploadPreview: Boolean(uploadPreview),
+      textLength: text.length
+    };
+  }
+
+  function findReviewButton() {
+    const hotkeyBtn = document.querySelector('[data-hotkey="r"]');
+    if (hotkeyBtn) return hotkeyBtn;
+    const newUiBtn = document.querySelector('[data-testid="review-changes-button"]') ||
+      document.querySelector('[class*="ReviewMenuButton"]');
+    if (newUiBtn) return newUiBtn;
+    const oldUiInline = document.querySelector('.js-review-changes');
+    const oldUiInlineButton = oldUiInline?.closest?.('button, summary, a, [role="button"]');
+    if (oldUiInlineButton) return oldUiInlineButton;
+
+    const candidates = document.querySelectorAll(
+      'button, summary, a.btn, [role="button"]'
+    );
+    for (const el of candidates) {
+      const text = (el.textContent || "").trim().toLowerCase();
+      if (el.getAttribute?.('data-hotkey') === 'r') {
+        return el;
+      }
+    }
+    // Also try known selectors
+    return (
+      document.querySelector(".js-review-changes-button") ||
+      document.querySelector('summary.btn-primary[href*="review"]') ||
+      document.querySelector('button[data-octo-click="review_start"]')
+    );
+  }
+
+  // ---------- Panel styles (injected once) ----------
+
+  if (!document.getElementById("striffs-comment-panel-styles")) {
+    const style = document.createElement("style");
+    style.id = "striffs-comment-panel-styles";
+    style.textContent = `
+      .striffs-comment-panel{
+        position:absolute;top:0;left:0;width:0;height:100%;
+        background:var(--bgColor-default,#fff);
+        border-right:none;
+        box-shadow:none;
+        z-index:10;display:flex;flex-direction:column;
+        overflow:hidden;
+        transition:width .25s ease, border-right .25s ease, box-shadow .25s ease;
+        font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+        font-size:13px;color:var(--fgColor-default,#1f2328);
+      }
+      .striffs-comment-panel--open{width:375px;border-right:2px solid var(--borderColor-accent,#0969da);box-shadow:6px 0 24px rgba(9,105,218,.12), 2px 0 8px rgba(0,0,0,.06);}
+      .striffs-comment-panel__header{
+        display:flex;align-items:flex-start;justify-content:space-between;
+        padding:14px 16px;border-bottom:1px solid var(--borderColor-muted,#d8dee4);flex-shrink:0;
+        background:var(--bgColor-accent-muted,#f0f6ff);
+      }
+      .striffs-comment-panel__header-text{
+        display:flex;flex-direction:column;min-width:0;flex:1;
+      }
+      .striffs-comment-panel__title{
+        font-weight:600;font-size:14px;color:var(--fgColor-default,#1f2328);
+        display:flex;align-items:center;gap:6px;
+      }
+      .striffs-comment-panel__title::before{
+        content:'';
+        display:inline-block;width:8px;height:8px;border-radius:50%;
+        background:var(--borderColor-accent,#0969da);
+      }
+      .striffs-comment-panel__subtitle{
+        font-size:11px;color:var(--fgColor-muted,#57606a);line-height:1.4;margin-top:4px;
+      }
+      .striffs-comment-panel__close{
+        background:none;border:none;font-size:18px;cursor:pointer;
+        color:var(--fgColor-muted,#57606a);padding:0 0 0 8px;line-height:1;flex-shrink:0;
+        border-radius:4px;transition:background .12s;
+      }
+      .striffs-comment-panel__close:hover{
+        color:var(--fgColor-default,#1f2328);background:var(--bgColor-muted,#f6f8fa);
+      }
+      .striffs-comment-panel__chips{
+        padding:10px 16px;border-bottom:1px solid var(--borderColor-muted,#d8dee4);
+        flex-shrink:0;max-height:180px;overflow-y:auto;
+      }
+      .striffs-comment-panel__chips-label{
+        font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;
+        color:var(--fgColor-muted,#57606a);
+      }
+      .striffs-comment-panel__chips-header{
+        display:flex;align-items:center;justify-content:space-between;
+      }
+      .striffs-comment-panel__chips-actions{
+        display:flex;align-items:center;gap:6px;
+      }
+      .striffs-comment-panel__action-btn{
+        padding:2px 8px;border-radius:4px;font-size:9px;font-weight:700;
+        letter-spacing:.06em;cursor:pointer;transition:all .12s;
+        text-transform:uppercase;border:1px solid;
+      }
+      .striffs-comment-panel__action-btn--select-all{
+        background:#1a7f37;color:#fff;
+        border-color:rgba(26,127,55,.5);
+      }
+      .striffs-comment-panel__action-btn--select-all:hover{
+        background:#116320;color:#fff;border-color:rgba(17,99,32,.6);
+      }
+      .striffs-comment-panel__action-btn--deselect-all{
+        background:var(--bgColor-danger-muted,#ffebe9);color:var(--fgColor-danger,#cf222e);
+        border-color:rgba(207,34,46,.25);
+      }
+      .striffs-comment-panel__action-btn--deselect-all:hover{
+        background:#ffcecb;color:#a40e26;border-color:rgba(164,14,38,.3);
+      }
+      .striffs-comment-panel__action-btn:disabled{
+        opacity:.45;cursor:not-allowed;
+      }
+      .striffs-comment-panel__chips-divider{
+        height:1px;background:var(--borderColor-muted,#d8dee4);margin:8px 0;
+      }
+      .striffs-comment-panel__chips-list{display:flex;flex-wrap:wrap;gap:5px;}
+      .striffs-comment-panel__chip{
+        display:inline-flex;align-items:center;gap:4px;
+        padding:3px 10px;
+        background:var(--bgColor-accent-muted,#ddf4ff);color:var(--fgColor-accent,#0969da);
+        border-radius:99px;font-size:11px;font-weight:500;cursor:pointer;
+        overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+        border:1px solid rgba(9,105,218,.2);transition:all .15s;
+      }
+      .striffs-comment-panel__chip-icon{font-size:9px;opacity:.6;}
+      .striffs-comment-panel__chip:hover{
+        background:var(--bgColor-danger-muted,#ffebe9);color:var(--fgColor-danger,#cf222e);
+        border-color:var(--borderColor-danger,rgba(207,34,46,.3));
+      }
+      .striffs-comment-panel__preview{
+        padding:10px 16px;border-bottom:1px solid var(--borderColor-muted,#d8dee4);
+        flex:1 1 auto;min-height:0;overflow-y:auto;
+        background:var(--bgColor-default,#fff);
+      }
+      .striffs-comment-panel__preview-label{
+        font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;
+        color:var(--fgColor-muted,#57606a);margin-bottom:6px;
+      }
+      .striffs-comment-panel__preview-content svg{
+        display:block;max-width:100%;max-height:220px;
+        width:auto;height:auto;margin:0 auto;
+      }
+      .striffs-comment-panel__preview-empty,
+      .striffs-comment-panel__preview-loading{
+        color:var(--fgColor-muted,#57606a);font-size:12px;padding:16px 0;text-align:center;
+      }
+      .striffs-comment-panel__error{
+        padding:10px 16px;color:var(--fgColor-danger,#cf222e);
+        background:var(--bgColor-danger-muted,#ffebe9);font-size:12px;
+      }
+      .striffs-comment-panel__actions{
+        padding:12px 16px;border-top:1px solid var(--borderColor-muted,#d8dee4);flex-shrink:0;
+      }
+      .striffs-comment-panel__submit{
+        width:100%;padding:8px 16px;border-radius:6px;
+        border:1px solid rgba(27,31,36,.15);
+        background:var(--color-btn-primary-bg,#1f2328);
+        color:var(--color-btn-primary-text,#fff);
+        font-weight:600;font-size:13px;cursor:pointer;transition:background .12s;
+      }
+      .striffs-comment-panel__submit:hover:not(:disabled){
+        background:var(--color-btn-primary-hover-bg,#2f363d);
+      }
+      .striffs-comment-panel__submit:disabled{opacity:.5;cursor:not-allowed;}
+      .striffs-comment-panel__resize-handle{
+        position:absolute;top:0;right:-4px;width:8px;height:100%;
+        cursor:ew-resize;z-index:11;
+      }
+      .striffs-comment-panel__resize-handle:hover{
+        background:rgba(9,105,218,.2);
+      }
+    `;
+    document.head.appendChild(style);
+  }
+})();
+
+
 // ---- src/striffs-events-boot.js ----
 // Striffs — events & boot
 (async () => {
@@ -5396,6 +6971,7 @@
         if (S.__onStriffsTestMessage) window.removeEventListener("message", S.__onStriffsTestMessage);
         if (S.__striffsTestRouteObserver) S.__striffsTestRouteObserver.disconnect();
         if (S.__onResize) window.removeEventListener("resize", S.__onResize);
+        if (S.__onCommentKeyDown) document.removeEventListener("keydown", S.__onCommentKeyDown);
         S.__onFileTreeClick = null;
         S.__onDiagramClick = null;
         S.__onFileMenuClick = null;
@@ -5406,6 +6982,7 @@
         S.__striffsTestRouteObserver = null;
         S.__lastHandledStriffsTestRouteRequestId = null;
         S.__onResize = null;
+        S.__onCommentKeyDown = null;
         S.__domListenersRegistered = false;
       };
 
@@ -5565,6 +7142,30 @@
 
         S.__onDiagramClick = (e) => {
         if (!S.__striffsSvg) return;
+        // In comment mode: intercept all entity clicks for selection
+        if (S.__commentState?.active) {
+          S.clog?.('[diagram-click] comment mode active, handling');
+          S.handleCommentDiagramClick?.(e);
+          return;
+        }
+        // Not in comment mode: check if click is on an affordance (+ button)
+        // Must check composedPath for clicks inside SVG foreignObjects
+        let affTarget = e.target.closest?.(".striffs-comment-affordance");
+        if (!affTarget) {
+          for (const node of e.composedPath()) {
+            if (node instanceof Element && node.classList?.contains("striffs-comment-affordance")) {
+              affTarget = node;
+              break;
+            }
+          }
+        }
+        // Route affordance clicks to comment handler regardless of engagement
+        // context availability — enterCommentMode handles context fetch lazily.
+        if (affTarget) {
+          S.clog?.('[diagram-click] affordance clicked');
+          S.handleCommentDiagramClick?.(e);
+          return;
+        }
         const target = e.target.closest("g.entity[data-qualified-name]");
         if (!target) return;
         if (S.isReviewNoteNode?.(target)) {
@@ -5832,21 +7433,19 @@
         document.addEventListener("click", S.__onFileMenuClick);
         document.addEventListener("toggle", S.__onFileMenuToggle, true);
         window.addEventListener("hashchange", S.__onHashChange);
+
+        S.__onCommentKeyDown = (e) => {
+          if (e.key === "Escape" && S.__commentState?.active) {
+            e.preventDefault();
+            S.exitCommentMode?.();
+          }
+        };
+        document.addEventListener("keydown", S.__onCommentKeyDown);
+
         S.syncTestHarnessState?.();
 
       S.__domListenersRegistered = true;
     }
-
-  // ---------- Toast (legacy view-local) ----------
-  S.showToast = (msg) => {
-    const view = S.ensureStriffContainer();
-    if (!view) return;
-    const toast = view.querySelector("#striffs-toast");
-    if (!toast) return;
-    toast.textContent = msg;
-    toast.classList.add("show");
-    setTimeout(() => toast.classList.remove("show"), 7500);
-  };
 
   // ---------- Auto fetch (background-powered) ----------
   const cacheStorageKey = () => {
@@ -5900,7 +7499,7 @@
   S.readCacheFromChromeStorage = readCacheFromChromeStorage;
   S.removeCacheFromChromeStorage = removeCacheFromChromeStorage;
 
-  const STRIFFS_CACHE_DB = 'striffs-cache-db';
+  const STRIFFS_CACHE_DB = S.STRIFFS_CACHE_DB;
   const STRIFFS_CACHE_STORE = 'diagrams';
 
   function openStriffsCacheDb() {
@@ -6053,6 +7652,7 @@
       if (!key) return false;
       localStorage.removeItem(key);
       localStorage.removeItem(`striffsCacheMeta:${key}`);
+      localStorage.removeItem(`${key}:engagement`);
       return true;
     } catch {
       return false;
@@ -6062,6 +7662,28 @@
   S.writeCacheToLocalStorage = writeCacheToLocalStorage;
   S.readCacheFromLocalStorage = readCacheFromLocalStorage;
   S.removeCacheFromLocalStorage = removeCacheFromLocalStorage;
+
+  S.purgeExpiredLocalStorageCaches = () => {
+    try {
+      const now = Date.now();
+      const maxAge = 24 * 60 * 60 * 1000;
+      const toRemove = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (!key) continue;
+        const isCacheKey = key.startsWith('striffs:') || key.startsWith('striffscache:') || key.startsWith('striffscachemeta:');
+        if (!isCacheKey) continue;
+        try {
+          const raw = localStorage.getItem(key);
+          const parsed = JSON.parse(raw);
+          if (parsed && parsed.savedAt && (now - Number(parsed.savedAt)) > maxAge) {
+            toRemove.push(key);
+          }
+        } catch {}
+      }
+      toRemove.forEach(key => localStorage.removeItem(key));
+    } catch {}
+  };
 
   async function readCachedDiagram(meta) {
     const clearAt = await S.getCacheClearAt?.();
@@ -6092,17 +7714,31 @@
     const commitCount = meta?.commit_count;
     if (commitCount != null && parsed.commit_count != null && Number(parsed.commit_count) !== Number(commitCount)) return null;
     if ((Date.now() - parsed.savedAt) > (S.CACHE_TTL_MS || 0)) return null;
-    // Only return cached diagrams that are enriched (READY) or have no enrichment (null)
-    // Skip PENDING, RUNNING, and FAILED diagrams
-    const cachedStatus = String(parsed?.cachedAiReviewStatus || "").trim().toUpperCase() || null;
-    if (cachedStatus === "PENDING" || cachedStatus === "RUNNING" || cachedStatus === "FAILED") {
-      // Remove stale non-enriched cache entries
-      await removeCacheFromChromeStorage();
-      removeCacheFromLocalStorage();
-      await removeCacheFromIndexedDb();
-      return null;
-    }
     return parsed.result || null;
+  }
+
+  function buildCacheableResultWithEngagement(result) {
+    if (!result || typeof result !== 'object') return result;
+    const currentCtx = S.__engagementCtx || {};
+    const currentOperationId = String(
+      S.__aiReviewOperationId || currentCtx.operationId || ''
+    ).trim();
+    const currentToken = String(currentCtx.engagementWriteToken || '').trim();
+    if (!currentOperationId && !currentToken) return result;
+
+    const extracted = S.extractEngagementContextFromPayload?.(result) || {};
+    const existingOperationId = String(extracted.operationId || '').trim();
+    const existingToken = String(extracted.engagementWriteToken || '').trim();
+    if (existingOperationId && existingToken) return result;
+
+    const cachedResult = Array.isArray(result) ? result.slice() : { ...result };
+    if (!existingOperationId && currentOperationId) {
+      cachedResult.operationId = currentOperationId;
+    }
+    if (!existingToken && currentToken) {
+      cachedResult.engagementWriteToken = currentToken;
+    }
+    return cachedResult;
   }
 
   async function writeCachedDiagram(result, meta) {
@@ -6111,9 +7747,12 @@
     try {
       const key = S.cacheKey();
       if (!key) return false;
+        const cacheableResult = buildCacheableResultWithEngagement(result);
 	      const payload = {
-	        result,
+	        result: cacheableResult,
           cachedAiReviewStatus: S.getAiReviewStatusFromResult?.(result),
+          cachedOperationId: String(S.__aiReviewOperationId || S.__engagementCtx?.operationId || '').trim() || null,
+          cachedEngagementWriteToken: String(S.__engagementCtx?.engagementWriteToken || '').trim() || null,
 	        updated_at: updatedAt,
 	        commit_count: commitCount != null ? commitCount : null,
 	        savedAt: Date.now(),
@@ -6128,6 +7767,15 @@
       };
       try { window.__striffsCacheMeta = payload.savedAt; window.__striffsCacheKey = key; } catch {}
       setCacheDataset(payload.savedAt);
+      if (payload.cachedOperationId && payload.cachedEngagementWriteToken) {
+        try {
+          localStorage.setItem(`${key}:engagement`, JSON.stringify({
+            operationId: payload.cachedOperationId,
+            engagementWriteToken: payload.cachedEngagementWriteToken,
+            savedAt: payload.savedAt
+          }));
+        } catch {}
+      }
       const localOk = writeCacheToLocalStorage(payload);
       const [chromeOk, indexedOk] = await Promise.all([
         writeCacheToChromeStorage(payload),
@@ -6154,6 +7802,58 @@
     }
   }
 
+  // --- Architecture Review button (manual enrichment trigger) ---
+  S.updateArchReviewButton = function updateArchReviewButton() {
+    const btn = document.getElementById("striffs-arch-review-btn");
+    if (!btn) return;
+    const view = S.getCurrentView?.();
+    const diagramReady = S.__striffsReady && S.__striffsSvg;
+    const enriching = S.__aiReviewStatus === "PENDING" || S.__aiReviewStatus === "RUNNING";
+    const commentActive = S.__commentState?.active;
+    if (view === "striffs" && diagramReady && !commentActive) {
+      btn.style.display = "";
+      btn.disabled = enriching;
+    } else {
+      btn.style.display = "none";
+    }
+  };
+
+  S.triggerArchitectureReview = async function triggerArchitectureReview() {
+    const btn = document.getElementById("striffs-arch-review-btn");
+    if (btn) btn.disabled = true;
+
+    let operationId = String(S.__engagementCtx?.operationId || "").trim();
+    let engagementWriteToken = String(S.__engagementCtx?.engagementWriteToken || "").trim();
+
+    // If engagement context is missing, try to obtain it via a fresh API call
+    // before starting enrichment polling.
+    if (!operationId || !engagementWriteToken) {
+      S.toast?.("Obtaining operation context...", "info", { timeoutMs: 4000 });
+      try {
+        const refreshed = await S.refreshEngagementContextFromFreshResult?.(S.extractPRMetadata?.());
+        if (!refreshed) {
+          S.toast?.("Cannot start review: unable to obtain operation context.", "warning", { timeoutMs: 5000 });
+          if (btn) btn.disabled = false;
+          return;
+        }
+        operationId = String(S.__engagementCtx?.operationId || "").trim();
+        engagementWriteToken = String(S.__engagementCtx?.engagementWriteToken || "").trim();
+      } catch {
+        S.toast?.("Cannot start review: unable to obtain operation context.", "warning", { timeoutMs: 5000 });
+        if (btn) btn.disabled = false;
+        return;
+      }
+    }
+
+    if (!operationId || !engagementWriteToken) {
+      S.toast?.("Cannot start review: missing operation context. Try reloading the page.", "warning", { timeoutMs: 5000 });
+      if (btn) btn.disabled = false;
+      return;
+    }
+    S.toast?.("Requesting architecture review...", "info", { timeoutMs: 4000 });
+    S.startEnrichmentPolling?.({ immediate: true, reason: "manual-button" });
+  };
+
   S.refreshDiagramWithEnrichment = async (result, meta = null) => {
     const container = S.ensureStriffContainer?.();
     if (!container) return false;
@@ -6171,11 +7871,10 @@
       scrollEl.scrollTop = previousScrollTop;
       scrollEl.scrollLeft = previousScrollLeft;
     } catch {}
-    if (meta) {
-      await writeCachedDiagram(result, meta);
-    }
+    // Enriched diagrams are never cached — only base diagrams are cached.
+    S.clog?.('[enrichment] skipping enriched diagram cache write (base-only caching)');
     if (S.getCurrentView?.() === 'striffs') {
-      S.toast?.("AI enrichment applied.", "info", { timeoutMs: 3000 });
+      S.toast?.("Architecture review applied.", "info", { timeoutMs: 3000 });
     }
     // Complete the progress bar when enrichment is done
     const btn = document.querySelector("#striffs-btn");
@@ -6187,6 +7886,7 @@
         if (wrap) wrap.remove();
       }, 500);
     }
+    S.updateArchReviewButton?.();
     return true;
   };
 
@@ -6196,10 +7896,21 @@
       S.__aiReviewPollTimer = null;
     }
     const status = String(S.__aiReviewStatus || "").trim().toUpperCase();
-    const operationId = String(S.__aiReviewOperationId || S.__engagementCtx?.operationId || "").trim();
+    const operationId = String(S.__engagementCtx?.operationId || S.__aiReviewOperationId || "").trim();
     const engagementToken = String(S.__engagementCtx?.engagementWriteToken || "").trim();
-    if (!(status === "PENDING" || status === "RUNNING")) return false;
-    if (!operationId || !engagementToken) return false;
+    if (!(status === "PENDING" || status === "RUNNING")) {
+      S.cinfo?.("[Striffs] Enrichment polling skipped: status not pollable", { status, reason });
+      return false;
+    }
+    if (!operationId || !engagementToken) {
+      S.cwarn?.("[Striffs] Enrichment polling skipped: missing engagement context", {
+        status,
+        operationId,
+        hasEngagementToken: Boolean(engagementToken),
+        reason
+      });
+      return false;
+    }
     const expectedOperationId = operationId;
     const pollDelayMs = immediate ? 0 : Math.max(1000, Number(S.__lastAiReviewPollAfterMs || 5000));
 
@@ -6219,7 +7930,7 @@
         return;
       }
 
-      if (String(S.__aiReviewOperationId || S.__engagementCtx?.operationId || "").trim() !== expectedOperationId) {
+      if (String(S.__engagementCtx?.operationId || S.__aiReviewOperationId || "").trim() !== expectedOperationId) {
         S.cancelEnrichmentPolling?.("operation-mismatch");
         return;
       }
@@ -6231,6 +7942,14 @@
           timeoutMs: 15000
         });
         if (!resp?.ok) {
+          S.cwarn?.("[Striffs] AI review status poll failed", {
+            status: Number(resp?.status || 0) || null,
+            error: String(resp?.error || ""),
+            operationId: expectedOperationId,
+            ctxOperationId: String(S.__engagementCtx?.operationId || "").trim() || null,
+            aiReviewOperationId: String(S.__aiReviewOperationId || "").trim() || null,
+            hasEngagementToken: Boolean(engagementToken)
+          });
           if (Number(resp?.status || 0) === 403) {
             S.cancelEnrichmentPolling?.("poll-forbidden");
             S.updateStriffButton?.({ success: true, tooltip: "AI review unavailable. Authorization required." });
@@ -6255,6 +7974,8 @@
         if (nextStatus === "FAILED") {
           S.cancelEnrichmentPolling?.("failed");
           S.updateStriffButton?.({ success: true, tooltip: result?.aiReviewErrorMessage || "AI review failed. Base diagram is still available." });
+          S.updateArchReviewButton?.();
+          S.toast?.(result?.aiReviewErrorMessage || "Architecture review failed.", "warning", { timeoutMs: 5000 });
           return;
         }
         if (nextStatus === "PENDING" || nextStatus === "RUNNING") {
@@ -6333,6 +8054,212 @@
     return payload;
   }
 
+  function buildPrefetchRequestKey(meta) {
+    const owner = String(meta?.owner || '').trim();
+    const repo = String(meta?.repo || '').trim();
+    const pullNumber = String(meta?.pull_number || '').trim();
+    const updatedAt = String(meta?.updated_at || '').trim();
+    if (!owner || !repo || !pullNumber || !updatedAt) return '';
+    return `${owner}/${repo}#${pullNumber}@${updatedAt}`;
+  }
+
+  async function submitArtifactPrefetch(meta, token, prFiles = []) {
+    const { refs, changedFiles } = await collectZipRequestArtifacts(meta, {
+      quiet: true,
+      token,
+      prFiles
+    });
+    const changedFilesCount = Array.isArray(changedFiles) ? changedFiles.length : 0;
+    const changedFilesBytes = sumChangedFilesContentBytes(changedFiles);
+    if (changedFilesCount < 1) {
+      return false;
+    }
+    if (changedFilesCount > S.PREFETCH_ARTIFACT_MAX_CHANGED_FILES) {
+      S.cinfo?.('Artifact prefetch skipped: changed files count exceeds limit', {
+        changedFilesCount,
+        limit: S.PREFETCH_ARTIFACT_MAX_CHANGED_FILES
+      });
+      return false;
+    }
+    if (changedFilesBytes > S.PREFETCH_ARTIFACT_MAX_CHANGED_FILES_BYTES) {
+      S.cinfo?.('Artifact prefetch skipped: changed file bytes exceed limit', {
+        changedFilesBytes,
+        limit: S.PREFETCH_ARTIFACT_MAX_CHANGED_FILES_BYTES
+      });
+      return false;
+    }
+
+    const changedFilesStorageKey = await storeTempChangedFiles(changedFiles);
+    const resp = await S.bgRequest({
+      type: 'prefetchStriffsWithArtifacts',
+      baseOwner: refs.baseOwner,
+      baseRepo: refs.baseRepo,
+      baseBranch: refs.baseBranch,
+      changedFilesStorageKey,
+      owner: meta.owner,
+      repo: meta.repo,
+      pull_number: meta.pull_number,
+      updated_at: meta.updated_at
+    }, timeoutFor('bgArtifactPrefetch', timeoutFor('message', 7000)));
+    if (!resp?.ok) {
+      throw new Error(resp?.error || 'artifact prefetch request failed');
+    }
+    S.cinfo?.('Artifact prefetch submitted', {
+      owner: meta.owner,
+      repo: meta.repo,
+      pull_number: meta.pull_number,
+      updated_at: meta.updated_at,
+      changedFilesCount,
+      changedFilesBytes,
+      timings: resp?.timings || null
+    });
+    return true;
+  }
+
+  const isPRPrefetchEligible = () => {
+    try {
+      // Classic GitHub UI
+      const legacyReviewableState = document.querySelector('[reviewable_state]');
+      if (legacyReviewableState) {
+        const state = String(legacyReviewableState.getAttribute('reviewable_state') || '').trim().toLowerCase();
+        if (state === 'open' || state === 'draft') return true;
+        if (state === 'merged' || state === 'closed') return false;
+      }
+      const classicStateSelector = [
+        '.State--open',
+        '.State.Color--open',
+        '.State--draft',
+        '.State.Color--draft',
+        '.State--merged',
+        '.State.Color--merged',
+        '.State--closed',
+        '.State.Color--closed'
+      ].join(', ');
+      if (document.querySelector(classicStateSelector)) {
+        return Boolean(document.querySelector([
+          '.State--open',
+          '.State.Color--open',
+          '.State--draft',
+          '.State.Color--draft'
+        ].join(', ')));
+      }
+      const classicStateText = Array.from(document.querySelectorAll('.State'))
+        .map((el) => String(el.textContent || '').trim().toLowerCase())
+        .find(Boolean) || '';
+      if (classicStateText === 'open' || classicStateText === 'draft') return true;
+      if (classicStateText === 'merged' || classicStateText === 'closed') return false;
+      // React-based GitHub UI: data-status="pullOpened" or "draft"
+      const statusEl = document.querySelector('[data-status]');
+      if (statusEl) {
+        const status = statusEl.getAttribute('data-status') || '';
+        if (/open|pullOpened|draft/i.test(status)) return true;
+        if (/merged|closed/i.test(status)) return false;
+      }
+      // Newer GitHub UI with state label text
+      const stateLabel = document.querySelector('[data-testid="state-label"]');
+      if (stateLabel) {
+        const text = (stateLabel.textContent || '').trim().toLowerCase();
+        if (/open|draft/.test(text)) return true;
+        if (/merged|closed/.test(text)) return false;
+      }
+      // Fallback: check the prc-StateLabel component text
+      const stateSpan = document.querySelector('[data-component="Octicon"] ~ *');
+      if (stateSpan && /^open|draft$/i.test(stateSpan.textContent?.trim() || '')) return true;
+      return false;
+    } catch {
+      return false;
+    }
+  };
+
+  S.maybePrefetchStriffs = async () => {
+    if (S.__disabledByRemote) {
+      S.cinfo?.('Prefetch skipped: disabled by remote config');
+      return false;
+    }
+    if (!isPRPrefetchEligible()) {
+      S.cinfo?.('Prefetch skipped: pull request is not open or draft');
+      return false;
+    }
+    const meta = S.extractPRMetadata?.() || null;
+    const key = buildPrefetchRequestKey(meta);
+    if (!key) {
+      S.cinfo?.('Prefetch skipped: could not build request key');
+      return false;
+    }
+    if (S.__lastPrefetchRequestKey === key) {
+      return S.__prefetchPromise || false;
+    }
+
+    const cached = await readCachedDiagram(meta);
+    if (cached) {
+      S.cinfo?.('Prefetch skipped: fresh cache available');
+      S.__lastPrefetchRequestKey = null;
+      return false;
+    }
+
+    S.__lastPrefetchRequestKey = key;
+    S.__prefetchPromise = (async () => {
+      const bgReady = await S.waitForBackgroundReady?.({ attempts: 8, delayMs: 200 });
+      if (!bgReady) {
+        throw new Error('background not ready for prefetch');
+      }
+      const token = await S.getStoredToken?.();
+      const eligibility = await resolvePrefetchEligibility(meta, token);
+      if (!eligibility?.eligible) {
+        S.cinfo?.('Prefetch skipped: no eligible source files', {
+          owner: meta.owner,
+          repo: meta.repo,
+          pull_number: meta.pull_number,
+          updated_at: meta.updated_at
+        });
+        return false;
+      }
+
+      if (token) {
+        const resp = await S.bgRequest({
+          type: 'prefetchStriffsWithToken',
+          owner: meta.owner,
+          repo: meta.repo,
+          pull_number: meta.pull_number,
+          updated_at: meta.updated_at,
+          token
+        }, timeoutFor('bgPrefetch', timeoutFor('message', 7000)));
+        if (!resp?.ok) {
+          throw new Error(resp?.error || 'prefetch request failed');
+        }
+        S.cinfo?.('Prefetch submitted', {
+          owner: meta.owner,
+          repo: meta.repo,
+          pull_number: meta.pull_number,
+          updated_at: meta.updated_at,
+          mode: 'token',
+          timings: resp?.timings || null
+        });
+        return true;
+      }
+
+      return await submitArtifactPrefetch(meta, token, eligibility.prFiles || []);
+    })();
+
+    try {
+      return await S.__prefetchPromise;
+    } catch (err) {
+      const message = String(err?.message || err);
+      if (/background not ready|unknown message type|Receiving end does not exist|No service worker|timeout/i.test(message)) {
+        S.__lastPrefetchRequestKey = null;
+      }
+      S.cwarn?.('Prefetch request failed', {
+        key,
+        error: message
+      });
+      return false;
+    } finally {
+      if (S.__lastPrefetchRequestKey === key) {
+        S.__prefetchPromise = null;
+      }
+    }
+  };
+
   function normalizeChangedFilePath(path) {
     return String(path || '').replace(/\\/g, '/').replace(/^\/+/, '').trim();
   }
@@ -6367,7 +8294,7 @@
     };
     if (token) mergedHeaders.Authorization = `token ${token}`;
     if (credentials !== 'include') {
-      const resp = await S.bgRequest({
+      const resp = await proxyFetchWithTimeout({
         type: 'proxyFetch',
         url,
         method: 'GET',
@@ -6408,7 +8335,7 @@
     const mergedHeaders = { ...headers };
     if (token) mergedHeaders.Authorization = `token ${token}`;
     if (credentials !== 'include') {
-      const resp = await S.bgRequest({
+      const resp = await proxyFetchWithTimeout({
         type: 'proxyFetch',
         url,
         method: 'GET',
@@ -6448,6 +8375,30 @@
       };
     } finally {
       clearTimeout(timer);
+    }
+  }
+
+  async function proxyFetchWithTimeout(msg, timeoutMs) {
+    const retryable = (errMsg) =>
+      /timeout|port closed|Receiving end does not exist|No service worker/i.test(String(errMsg || ''));
+
+    const send = async () => {
+      const resp = await S.sendMessageWithTimeout(msg, timeoutMs ?? S.TIMEOUTS.message);
+      if (resp == null || typeof resp !== 'object') {
+        throw new Error('empty/invalid response from background');
+      }
+      return resp;
+    };
+
+    try {
+      return await send();
+    } catch (err) {
+      const errMsg = err?.message || err;
+      if (retryable(errMsg)) {
+        await S.waitForBackgroundReady({ attempts: 8, delayMs: 200 });
+        return await send();
+      }
+      throw err;
     }
   }
 
@@ -6494,6 +8445,17 @@
     return Array.from(seen.values());
   }
 
+  function buildPrFilesFromVisibleList(filterFiles = []) {
+    return (Array.isArray(filterFiles) ? filterFiles : [])
+      .map((file) => normalizeChangedFilePath(file))
+      .filter(Boolean)
+      .map((filename) => ({
+        filename,
+        status: 'modified',
+        previous_filename: null
+      }));
+  }
+
   async function fetchPrFilesMetadata(meta, filterFiles, token) {
     const wanted = new Set((filterFiles || []).map((f) => normalizeChangedFilePath(f)).filter(Boolean));
     const items = [];
@@ -6525,6 +8487,86 @@
     }
 
     return items;
+  }
+
+  async function resolvePrFilesMetadata(meta, filterFiles, token) {
+    if (!token) {
+      const domFirst = parsePrFilesFromDom(filterFiles);
+      if (Array.isArray(domFirst) && domFirst.length) {
+        return domFirst;
+      }
+      const visibleListFallback = buildPrFilesFromVisibleList(filterFiles);
+      if (visibleListFallback.length) {
+        return visibleListFallback;
+      }
+    }
+
+    try {
+      return await fetchPrFilesMetadata(meta, filterFiles, token);
+    } catch (apiError) {
+      S.cwarn?.('Failed to fetch PR files metadata from GitHub API; falling back to DOM metadata.', apiError);
+      const prFiles = parsePrFilesFromDom(filterFiles);
+      if (!Array.isArray(prFiles) || !prFiles.length) {
+        const visibleListFallback = !token ? buildPrFilesFromVisibleList(filterFiles) : [];
+        if (visibleListFallback.length) {
+          return visibleListFallback;
+        }
+        throw apiError;
+      }
+      return prFiles;
+    }
+  }
+
+  function isSupportedPrefetchPath(path, supportedExts) {
+    const normalizedPath = normalizeChangedFilePath(path);
+    if (!normalizedPath) return false;
+    return S.checkIfRelevantFilesExist?.([normalizedPath], supportedExts) === true;
+  }
+
+  function countProcessablePrefetchFiles(prFiles, supportedExts) {
+    if (!Array.isArray(prFiles) || !Array.isArray(supportedExts) || !supportedExts.length) return 0;
+    let count = 0;
+    for (const file of prFiles) {
+      const status = String(file?.status || 'modified').trim().toLowerCase();
+      const path = normalizeChangedFilePath(file?.filename || file?.path);
+      const previousPath = normalizeChangedFilePath(file?.previous_filename || file?.previousPath);
+      if (status === 'removed') continue;
+      if (isSupportedPrefetchPath(path, supportedExts) || (status === 'renamed' && isSupportedPrefetchPath(previousPath, supportedExts))) {
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  function sumChangedFilesContentBytes(changedFiles) {
+    return (Array.isArray(changedFiles) ? changedFiles : []).reduce((total, file) => {
+      const content = typeof file?.content === 'string' ? file.content : '';
+      return total + new TextEncoder().encode(content).length;
+    }, 0);
+  }
+
+  async function resolvePrefetchEligibility(meta, token) {
+    await S.ensureSupportedExtensionsReady?.();
+    const supportedExts = Array.isArray(S.__supportedExtensionsForUi) ? S.__supportedExtensionsForUi : [];
+    if (!supportedExts.length) {
+      return { eligible: false, prFiles: [] };
+    }
+
+    const visibleFiles = S.getFilesInPR?.() || [];
+    if (Array.isArray(visibleFiles) && visibleFiles.length >= 1 && S.checkIfRelevantFilesExist?.(visibleFiles, supportedExts)) {
+      return { eligible: true, prFiles: [] };
+    }
+
+    try {
+      const prFiles = await resolvePrFilesMetadata(meta, [], token);
+      return {
+        eligible: countProcessablePrefetchFiles(prFiles, supportedExts) >= 1,
+        prFiles
+      };
+    } catch (error) {
+      S.cwarn?.('Prefetch eligibility check failed', error);
+      return { eligible: false, prFiles: [] };
+    }
   }
 
   async function fetchHeadFileContent(refs, path, token) {
@@ -6586,24 +8628,17 @@
     return rawResp.text;
   }
 
-  async function buildChangedFiles(refs, meta, filterFiles) {
-    const token = await S.getStoredToken();
-    let prFiles;
-    try {
-      prFiles = await fetchPrFilesMetadata(meta, filterFiles, token);
-    } catch (apiError) {
-      S.cwarn?.('Failed to fetch PR files metadata from GitHub API; falling back to DOM metadata.', apiError);
-      prFiles = parsePrFilesFromDom(filterFiles);
-      if (!Array.isArray(prFiles) || !prFiles.length) {
-        throw apiError;
-      }
-    }
+  async function buildChangedFiles(refs, meta, filterFiles, { token = null, prFiles = null } = {}) {
+    const effectiveToken = typeof token === 'string' ? token : await S.getStoredToken();
+    const resolvedPrFiles = Array.isArray(prFiles) && prFiles.length
+      ? prFiles
+      : await resolvePrFilesMetadata(meta, filterFiles, effectiveToken);
 
     const supportedExts = Array.isArray(S.__supportedExtensionsForUi) ? S.__supportedExtensionsForUi : [];
     const hasSupportedExtFilter = supportedExts.length > 0;
     const changedFiles = [];
 
-    for (const file of prFiles) {
+    for (const file of resolvedPrFiles) {
       const status = String(file?.status || 'modified').trim().toLowerCase();
       const path = normalizeChangedFilePath(file?.filename || file?.path);
       const previousPath = normalizeChangedFilePath(file?.previous_filename || file?.previousPath);
@@ -6622,7 +8657,7 @@
       }
 
       const normalizedStatus = status === 'added' ? 'added' : 'modified';
-      const content = await fetchHeadFileContent(refs, path, token);
+      const content = await fetchHeadFileContent(refs, path, effectiveToken);
       if (typeof content !== 'string' || !content.length) continue;
       changedFiles.push({ path, status: normalizedStatus, content });
     }
@@ -6630,21 +8665,26 @@
     return changedFiles;
   }
 
+  async function collectZipRequestArtifacts(meta, { quiet = false, token = null, prFiles = null } = {}) {
+    const filterFiles = S.getFilterFilesFromNav();
+    const refs = S.extractHeadBaseRefs();
+    if (!quiet) {
+      S.updateStriffButton({ loading: true, phase: "Fetching", tooltip: "Fetching" });
+    }
+    const changedFiles = await buildChangedFiles(refs, meta, filterFiles, { token, prFiles });
+    return { refs, filterFiles, changedFiles };
+  }
+
   async function requestWithZips(meta, { quiet = false } = {}) {
     const { updated_at } = meta;
     const reqStart = Date.now();
     S.__lastRequestType = 'zips';
     try { document.documentElement.dataset.striffsLastRequestType = 'zips'; } catch {}
-    const filterFiles = S.getFilterFilesFromNav();
-    const { baseOwner, baseRepo, baseBranch, headOwner, headRepo, headBranch } = S.extractHeadBaseRefs();
-
-    // Phase 1: Fetch files from GitHub
-    if (!quiet) {
-      S.updateStriffButton({ loading: true, phase: "Fetching", tooltip: "Fetching" });
-    }
-    const changedFiles = await buildChangedFiles({ baseOwner, baseRepo, baseBranch, headOwner, headRepo, headBranch }, meta, filterFiles);
+    const token = await S.getStoredToken();
+    const { refs, filterFiles, changedFiles } = await collectZipRequestArtifacts(meta, { quiet, token });
     S.cinfo?.("Striffs request (zips)", {
-      baseOwner, baseRepo, baseBranch, headOwner, headRepo, headBranch,
+      baseOwner: refs.baseOwner, baseRepo: refs.baseRepo, baseBranch: refs.baseBranch,
+      headOwner: refs.headOwner, headRepo: refs.headRepo, headBranch: refs.headBranch,
       filterFilesCount: filterFiles.length,
       filterFilesPreview: filterFiles.slice(0, 20),
       changedFilesCount: changedFiles.length,
@@ -6658,7 +8698,7 @@
     const changedFilesStorageKey = await storeTempChangedFiles(changedFiles);
     const resp = await S.bgRequest({
       type: "generateStriffs",
-      baseOwner, baseRepo, baseBranch,
+      baseOwner: refs.baseOwner, baseRepo: refs.baseRepo, baseBranch: refs.baseBranch,
       changedFilesStorageKey,
       updated_at,
     }, timeoutFor("bgGenerate", timeoutFor("message", 7000)));
@@ -6679,7 +8719,11 @@
     }
 
     const durationMs = Date.now() - reqStart;
-    S.cinfo?.("Striffs timings", resp?.timings || { type: "generate", durationMs, note: "no timings payload from background" });
+    const timings = resp?.timings || { type: "generate", durationMs, note: "no timings payload from background" };
+    if (timings.zipFromCache) {
+      S.cinfo?.("ZIP fetched from cache — skipped download");
+    }
+    S.cinfo?.("Striffs timings", timings);
     S.__debugLastApiResponse = payload || null;
     const componentRecords = S.extractApiComponentRecords?.(payload) || [];
     const componentFilenames = S.extractApiComponentFilenames?.(payload) || [];
@@ -6703,7 +8747,8 @@
     'ZIP_ENTRY_TOO_LARGE',
     'ZIP_TOO_MANY_ENTRIES',
     'ZIP_UNCOMPRESSED_SIZE_TOO_LARGE',
-    'GITHUB_ZIP_DOWNLOAD_FAILED'
+    'GITHUB_ZIP_DOWNLOAD_FAILED',
+    'ZIP_TOO_LARGE'
   ]);
 
   const ZIP_REDUCE_SCOPE_ERROR_CODES = new Set([
@@ -6720,14 +8765,33 @@
 
   const shouldPromptForTokenForZipLimit = ({ token, status, errorCode, message }) => {
     if (token) return false;
-    if (!(status === 400 || status === 413)) return false;
     if (errorCode && ZIP_LIMIT_ERROR_CODES.has(String(errorCode).trim().toUpperCase())) return true;
-    return /zip entry exceeds maximum allowed size|too many changes|request too large|repo too large/i.test(String(message || ''));
+    if (!(status === 400 || status === 413)) return false;
+    return /zip entry exceeds maximum allowed size|too many changes|request too large|repo too large|repository is too large/i.test(String(message || ''));
+  };
+
+  const extractHumanMessage = (raw) => {
+    const s = String(raw || '').trim();
+    if (!s) return s;
+    // Try parsing as JSON to extract errorMessage
+    try {
+      const json = JSON.parse(s);
+      if (json?.errorMessage) return json.errorMessage;
+    } catch {}
+    // Strip leading JSON prefix like: "Failed downloading base zip: {"errorMessage":..."
+    const m = s.match(/^(.+?):\s*(\{.+\})$/s);
+    if (m) {
+      try {
+        const json = JSON.parse(m[2]);
+        if (json?.errorMessage) return `${m[1]}: ${json.errorMessage}`;
+      } catch {}
+    }
+    return s;
   };
 
   const describeApiError = ({ token, status, errorCode, message }) => {
     const code = String(errorCode || '').trim().toUpperCase();
-    const text = String(message || '').trim() || `API request failed${status ? ` (${status})` : ''}`;
+    const text = extractHumanMessage(String(message || '').trim() || `API request failed${status ? ` (${status})` : ''}`);
     const isTransportFailure =
       !status &&
       /failed to fetch|networkerror|network error|timeout|background request failed|port closed|receiving end does not exist/i.test(text);
@@ -6757,8 +8821,8 @@
 
     if ((!token && TOKEN_GUIDANCE_ERROR_CODES.has(code)) || shouldPromptForTokenForZipLimit({ token, status, errorCode: code, message: text })) {
       return {
-        tooltip: "This pull request is too large. Add a GitHub token to continue.",
-        toast: "<strong>Pull request too large.</strong> Connect a GitHub token to generate Striffs.",
+        tooltip: "This pull request is too large for the ZIP generation path.",
+        toast: "<strong>Pull request too large for ZIP generation.</strong> Reduce the scope or connect a GitHub token to try token-based generation.",
         tone: 'error',
         disabled: true,
         waitingForToken: false,
@@ -6844,45 +8908,73 @@
       try {
         const token = await S.getStoredToken?.();
         if (!token && S.isPrivateRepo?.()) {
-          const sessionId = S.ensureEngagementSessionId?.() || S.__engagementCtx?.sessionId || null;
-          S.__engagementCtx = {
-            sessionId,
-            operationId: null,
-            engagementWriteToken: null
-          };
           S.__lastEngagementContextError = "cache refresh unavailable";
           S.syncEngagementDebugState?.();
           S.logEngagementCollectionBlocked?.("cache refresh unavailable", {
-            privateRepo: true
+            privateRepo: true,
+            cachedOperationId: S.__engagementCtx?.operationId || null
           });
           return false;
         }
-        const result = token
-          ? await requestWithToken(token, meta, { quiet: true })
-          : await requestWithZips(meta, { quiet: true });
+        const fetchFreshResult = async () => (
+          token
+            ? await requestWithToken(token, meta, { quiet: true })
+            : await requestWithZips(meta, { quiet: true })
+        );
+        let result = null;
+        let lastError = null;
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
+          try {
+            result = await fetchFreshResult();
+            lastError = null;
+            break;
+          } catch (e) {
+            lastError = e;
+            const message = String(e?.message || e);
+            if (!/Failed to fetch|NetworkError|fetch/i.test(message) || attempt === 3) {
+              throw e;
+            }
+            S.cwarn?.('[Striffs] Engagement context refresh attempt failed; retrying', {
+              attempt,
+              error: message
+            });
+            await S.waitForBackgroundReady?.({ attempts: 4, delayMs: 200 });
+            await S.sleep?.(Math.min(400 * attempt, 1200));
+          }
+        }
+        if (!result && lastError) throw lastError;
         const validationError = S.getStriffsResultValidationError?.(result);
         if (validationError) throw new Error(validationError);
         const engagementReady = S.updateEngagementContextFromResult?.(result);
         if (!engagementReady) {
           S.cwarn?.('Engagement telemetry not available after refresh');
         }
-        writeCachedDiagram(result, meta);
+        const freshStatus = S.syncAiReviewStateFromResult?.(result);
+        // No auto-enrichment on cache refresh — user triggers via Architecture Review button
+        if (freshStatus === null || freshStatus === "READY") {
+          // Preserve engagement token from existing cache if the fresh result doesn't have one
+          const freshExtracted = S.extractEngagementContextFromPayload?.(result) || {};
+          const freshToken = String(freshExtracted.engagementWriteToken || "").trim();
+          if (!freshToken && S.__engagementCtx?.engagementWriteToken) {
+            try {
+              const resultObj = result && typeof result === 'object' ? result : {};
+              resultObj.engagementWriteToken = S.__engagementCtx.engagementWriteToken;
+            } catch {}
+          }
+          writeCachedDiagram(result, meta);
+        }
         S.debugDump?.("engagement context refreshed after cache load", {
           operationId: String(S.__engagementCtx?.operationId || ""),
           loadSource: S.__lastLoadSource || null
         });
         return true;
       } catch (e) {
-        const sessionId = S.ensureEngagementSessionId?.() || S.__engagementCtx?.sessionId || null;
-        S.__engagementCtx = {
-          sessionId,
-          operationId: null,
-          engagementWriteToken: null
-        };
-        S.__lastEngagementContextError = "cache refresh failed";
+        S.cwarn?.('Engagement context refresh failed, keeping existing context from cache', e);
+        S.__lastEngagementContextError = "cache refresh failed (cached context preserved)";
         S.syncEngagementDebugState?.();
-        S.logEngagementCollectionBlocked?.("cache refresh failed", {
-          error: String(e?.message || e)
+        S.logEngagementCollectionBlocked?.("cache refresh failed (cached context preserved)", {
+          error: String(e?.message || e),
+          cachedOperationId: S.__engagementCtx?.operationId || null
         });
         return false;
       } finally {
@@ -6916,7 +9008,7 @@
     if (Array.isArray(result.striffs) && result.striffs.length === 0) {
       S.__striffsNoChanges = true;
       S.__lastFetchedUpdatedAt = updated_at;
-      S.__lastLoadSource = fromCache ? "cache" : "fresh";
+      { const v = fromCache ? "cache" : "fresh"; S.__lastLoadSource = v; try { document.documentElement.dataset.striffsLoadSource = v; } catch {} }
       S.applyNoChangesUiState?.("No changes were found");
       S.toast?.("No changes were found.", "neutral", { timeoutMs: 5000 });
       return;
@@ -6935,29 +9027,25 @@
         cerr("Render returned false");
         throw new Error("Failed to render diagram.");
       }
-      // Only cache enriched diagrams (READY) or diagrams without enrichment (null)
-      // Do NOT cache PENDING, RUNNING, or FAILED diagrams
-      const shouldCache = !fromCache && (aiReviewStatus === null || aiReviewStatus === "READY");
+      // Only cache base diagrams (no enrichment status). Enriched diagrams
+      // are never cached — the user can re-trigger via Architecture Review.
+      const shouldCache = !fromCache && aiReviewStatus === null;
       if (shouldCache) {
         writeCachedDiagram(result, meta);
-        S.__lastLoadSource = "fresh";
+        S.__lastLoadSource = "fresh"; try { document.documentElement.dataset.striffsLoadSource = "fresh"; } catch {}
       } else if (!fromCache) {
-        // Fresh result but not cached (waiting for enrichment)
-        S.__lastLoadSource = "fresh-uncached";
+        // Fresh result but intentionally not cached.
+        S.__lastLoadSource = "fresh-uncached"; try { document.documentElement.dataset.striffsLoadSource = "fresh-uncached"; } catch {}
       } else {
-        S.__lastLoadSource = "cache";
+        S.__lastLoadSource = "cache"; try { document.documentElement.dataset.striffsLoadSource = "cache"; } catch {}
       }
     }
 
 	    S.__striffsReady = true;
 	    S.__lastFetchedUpdatedAt = updated_at;
 	    S.setAutoGenerateIntent?.(true);
-      if (aiReviewStatus === "PENDING" || aiReviewStatus === "RUNNING") {
-        S.__lastAiReviewPollAfterMs = Number(result?.aiReviewPollAfterMs || result?.pollAfterMs || 5000);
-        S.updateStriffButton({ enriching: true, tooltip: "Enriching" });
-        S.startEnrichmentPolling?.({ immediate: false, reason: "fresh-render" });
-        return;
-      }
+      S.updateArchReviewButton?.();
+      // No auto-enrichment — user triggers via Architecture Review button
       if (aiReviewStatus === "FAILED") {
         S.updateStriffButton({ success: true, tooltip: result?.aiReviewErrorMessage || "AI enrichment failed. Base Striffs are still available." });
         return;
@@ -6994,6 +9082,18 @@
         }, 30000);
       }
 
+      const requestMode = token ? 'token' : 'zips';
+      const debugCtx = await S.getStriffsDebugContext?.();
+      S.cinfo?.('autoFetchStriffs context', {
+        apiBase: debugCtx?.apiBase || null,
+        mode: requestMode,
+        hasToken: Boolean(token),
+        owner: meta?.owner || '',
+        repo: meta?.repo || '',
+        pull_number: meta?.pull_number || '',
+        updated_at: updated_at || ''
+      });
+
       // Start building the file path to diff ID map early
       const diffMapPromise = S.buildFilePathToDiffIdMapAsync?.();
 
@@ -7001,6 +9101,9 @@
         S.__striffsNoChanges = false;
         let result = await readCachedDiagram(meta);
         let fromCache = !!result;
+        if (fromCache) {
+          S.cinfo?.("Diagram loaded from cache — no API request needed");
+        }
         if (result && !S.isValidStriffsResult(result)) {
           await removeCacheFromChromeStorage();
           try { localStorage.removeItem(S.cacheKey()); } catch {}
@@ -7024,7 +9127,7 @@
         let message = err?.message || String(err);
         const status = Number(err?.status || 0) || null;
         const errorCode = String(err?.errorCode || '').trim().toUpperCase();
-        cerr("autoFetchStriffs error:", message, err);
+        cerr("autoFetchStriffs error:", extractHumanMessage(message), { status, errorCode });
         S.__striffsReady = false;
 
         const handled = describeApiError({ token, status, errorCode, message });
@@ -7174,10 +9277,110 @@
           });
         return;
       }
+      if (data.fn === 'maybePrefetchStriffs') {
+        if (data.resetKey && S.__lastPrefetchRequestKey != null) S.__lastPrefetchRequestKey = null;
+        Promise.resolve(S.maybePrefetchStriffs?.())
+          .then((result) => {
+            window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: result === undefined ? null : result, key: S.__lastPrefetchRequestKey || null }, '*');
+          })
+          .catch((e) => {
+            window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: { error: String(e?.message || e) } }, '*');
+          });
+        return;
+      }
+      if (data.fn === 'setRemoteDisabled') {
+        S.__disabledByRemote = !!data.disabled;
+        window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: S.__disabledByRemote }, '*');
+        return;
+      }
+      if (data.fn === 'getPrefetchState') {
+        window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: {
+          lastKey: S.__lastPrefetchRequestKey || null,
+          disabled: S.__disabledByRemote || false,
+          prefetchPromise: !!S.__prefetchPromise,
+        } }, '*');
+        return;
+      }
+      if (data.fn === 'getLoadSource') {
+        window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: {
+          loadSource: S.__lastLoadSource || null,
+          ready: S.__striffsReady || false,
+          noChanges: S.__striffsNoChanges || false,
+        } }, '*');
+        return;
+      }
+      if (data.fn === 'getEngagementState') {
+        const ctx = S.__engagementCtx || {};
+        window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: {
+          operationId: String(ctx.operationId || '').trim() || null,
+          engagementWriteToken: String(ctx.engagementWriteToken || '').trim() || null,
+          hasOperationId: Boolean(String(ctx.operationId || '').trim()),
+          hasToken: Boolean(String(ctx.engagementWriteToken || '').trim()),
+          commentModeAvailable: Boolean(S.isCommentModeAvailable?.()),
+          lastError: S.__lastEngagementContextError || null
+        } }, '*');
+        return;
+      }
+      if (data.fn === 'getCommentState') {
+        const state = S.__commentState || {};
+        const selectedIds = Array.isArray(state.selectedIds) ? [...state.selectedIds] : [];
+        window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: {
+          active: Boolean(state.active),
+          operationId: String(state.operationId || '').trim() || null,
+          diagramIndex: Number.isFinite(Number(state.diagramIndex)) ? Number(state.diagramIndex) : 0,
+          selectedIds,
+          selectedCount: selectedIds.length,
+          draftText: String(state.draftText || ''),
+          previewSvgPresent: Boolean(state.previewSvg),
+          previewError: state.previewError || null,
+          maxSelection: Number(S.COMMENT_MAX_SELECTION || 10)
+        } }, '*');
+        return;
+      }
+      if (data.fn === 'clearStriffsCache') {
+        (async () => {
+          try {
+            const key = S.cacheKey?.();
+            await S.clearLocalDiagramCaches?.({ resetLiveDiagram: true });
+            window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: { ok: true, key } }, '*');
+          } catch (e) {
+            window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: { ok: false, reason: String(e?.message || e) } }, '*');
+          }
+        })();
+        return;
+      }
+      if (data.fn === 'exitCommentMode') {
+        Promise.resolve(S.exitCommentMode?.())
+          .then(() => {
+            window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: { ok: true } }, '*');
+          })
+          .catch((e) => {
+            window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: { ok: false, reason: String(e?.message || e) } }, '*');
+          });
+        return;
+      }
+      if (data.fn === 'runCommentSelectionCapTest') {
+        const cap = Number(S.COMMENT_MAX_SELECTION || 10);
+        const state = S.__commentState || {};
+        const previous = Array.isArray(state.selectedIds) ? [...state.selectedIds] : [];
+        try {
+          state.selectedIds = Array.from({ length: cap }, (_, index) => `__test_fake_${index}`);
+          S.toggleComponentSelection?.('__test_overflow');
+          const blocked = Array.isArray(state.selectedIds) && state.selectedIds.length === cap;
+          window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: { ok: true, blocked, cap } }, '*');
+        } catch (e) {
+          window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: { ok: false, reason: String(e?.message || e), cap } }, '*');
+        } finally {
+          state.selectedIds = previous;
+          try { S.updateCommentPanelSelection?.(); } catch {}
+          try { S.reapplySelectionHighlights?.(); } catch {}
+        }
+        return;
+      }
       if (data.fn === 'runAiReviewManualChecks') {
         Promise.resolve((async () => {
           const container = S.ensureStriffContainer?.();
-          const currentSvg = container?.querySelector?.('#striffs-content svg') || document.querySelector('#striff-diagram-view svg');
+          const currentSvg = S.getPrimaryDiagramSvg?.() || container?.querySelector?.('#striffs-content svg');
           if (!container || !currentSvg) {
             return {
               ok: false,
@@ -7211,56 +9414,6 @@
             }]
           });
 
-          const applyResult = async (resultPayload) => {
-            S.updateEngagementContextFromResult?.(resultPayload);
-            const aiReviewStatus = S.syncAiReviewStateFromResult?.(resultPayload);
-            const rendered = S.renderStriffsInto?.(container, resultPayload);
-            if (!rendered) {
-              return { ok: false, reason: 'render-failed', aiReviewStatus };
-            }
-            S.__striffsReady = true;
-            S.__lastFetchedUpdatedAt = Date.now();
-            S.setAutoGenerateIntent?.(true);
-            if (aiReviewStatus === 'PENDING' || aiReviewStatus === 'RUNNING') {
-              S.updateStriffButton?.({ enriching: true, tooltip: 'Enriching' });
-            } else if (aiReviewStatus === 'FAILED') {
-              S.updateStriffButton?.({ success: true, tooltip: resultPayload.aiReviewErrorMessage || 'AI review failed. Base diagram is still available.' });
-            } else {
-              const rawPollStatus = String(resultPayload?.aiReviewStatus || '').trim().toUpperCase();
-              const skipMsg = rawPollStatus === 'SKIPPED' && resultPayload.aiReviewErrorMessage
-                ? resultPayload.aiReviewErrorMessage : 'View';
-              S.updateStriffButton?.({ success: true, tooltip: skipMsg });
-            }
-            const cachePayload = {
-              result: resultPayload,
-              cachedAiReviewStatus: S.getAiReviewStatusFromResult?.(resultPayload),
-              updated_at: null,
-              commit_count: null,
-              savedAt: Date.now()
-            };
-            await S.writeCacheToChromeStorage?.(cachePayload);
-            S.writeCacheToLocalStorage?.(cachePayload);
-            S.showStriffView?.();
-            return { ok: true, aiReviewStatus };
-          };
-
-          const pendingResult = makeResult('PENDING', originalSvg, { aiReviewId: 'manual-pending' });
-          const pendingApplied = await applyResult(pendingResult);
-          if (!pendingApplied?.ok) return pendingApplied;
-
-          const btnAfterPending = document.querySelector('#striffs-btn');
-          const pendingState = {
-            status: String(S.__aiReviewStatus || ''),
-            title: String(btnAfterPending?.title || ''),
-            html: String(btnAfterPending?.innerHTML || '')
-          };
-          const key = S.cacheKey?.();
-          let cachedAiReviewStatus = null;
-          try {
-            const parsed = JSON.parse(localStorage.getItem(key) || 'null');
-            cachedAiReviewStatus = parsed?.cachedAiReviewStatus || null;
-          } catch {}
-
           const enrichedSvg = originalSvg.replace('<svg', '<svg data-manual-enriched="1"');
           const readyResult = makeResult('READY', enrichedSvg, { aiReviewId: 'manual-ready' });
           const failedResult = makeResult('FAILED', originalSvg, {
@@ -7269,21 +9422,47 @@
             aiReviewErrorMessage: 'Manual smoke failure'
           });
 
+          // --- Step 1: Verify Architecture Review button exists and is visible ---
+          const archBtn = document.getElementById('striffs-arch-review-btn');
+          if (!archBtn) {
+            return { ok: false, reason: 'missing-arch-review-button' };
+          }
+          if (archBtn.style.display === 'none') {
+            return { ok: false, reason: 'arch-review-button-hidden' };
+          }
+
           const originalFetchAiReviewStatus = S.fetchAiReviewStatus;
           try {
+            // --- Step 2: Click Architecture Review button (READY path) ---
+            // Mock fetchAiReviewStatus to return READY immediately
             let readyCalls = 0;
             S.fetchAiReviewStatus = async () => {
               readyCalls += 1;
               return { ok: true, status: 200, json: readyResult };
             };
             S.__lastAiReviewPollAfterMs = 10;
-            S.startEnrichmentPolling?.({ immediate: true, reason: 'manual-ready' });
+
+            // Simulate clicking the button
+            S.triggerArchitectureReview?.();
+
+            // Verify button is disabled after click
+            const disabledAfterClick = archBtn.disabled;
+            if (!disabledAfterClick) {
+              return { ok: false, reason: 'button-not-disabled-after-click' };
+            }
+
+            // Wait for enrichment to complete (READY)
             const readyOutcome = await new Promise((resolve) => {
               const started = Date.now();
               const tick = () => {
-                const enrichedNode = document.querySelector('#striff-diagram-view svg[data-manual-enriched="1"]');
+                const enrichedNode = document.querySelector('#striffs-content svg[data-manual-enriched="1"]');
                 const btn = document.querySelector('#striffs-btn');
-                const buttonLooksReady = !!(btn && (/check-circle/.test(btn.innerHTML) || /enriched/i.test(btn.title || '')));
+                const buttonLooksReady = !!(btn && (
+                  /check-circle/.test(btn.innerHTML) ||
+                  /enriched/i.test(btn.title || '') ||
+                  /view/i.test(btn.title || '') ||
+                  String(S.__aiReviewStatus || '').trim().toUpperCase() === 'READY'
+                ));
                 if (enrichedNode && buttonLooksReady) {
                   resolve({
                     ok: true,
@@ -7291,7 +9470,8 @@
                     html: String(btn?.innerHTML || ''),
                     title: String(btn?.title || ''),
                     enriched: true,
-                    pollTimerActive: Boolean(S.__aiReviewPollTimer)
+                    pollTimerActive: Boolean(S.__aiReviewPollTimer),
+                    archBtnDisabled: archBtn.disabled
                   });
                   return;
                 }
@@ -7302,7 +9482,8 @@
                     html: String(btn?.innerHTML || ''),
                     title: String(btn?.title || ''),
                     enriched: Boolean(enrichedNode),
-                    pollTimerActive: Boolean(S.__aiReviewPollTimer)
+                    pollTimerActive: Boolean(S.__aiReviewPollTimer),
+                    archBtnDisabled: archBtn.disabled
                   });
                   return;
                 }
@@ -7311,8 +9492,14 @@
               tick();
             });
 
-            const reAppliedPending = await applyResult(pendingResult);
-            if (!reAppliedPending?.ok) return { ok: false, reason: 'reapply-pending-failed' };
+            // --- Step 3: Click Architecture Review button again (FAILED path) ---
+            // Re-render base diagram first by applying a null-status result
+            const baseResult = makeResult(null, originalSvg, { aiReviewId: 'manual-base' });
+            S.syncAiReviewStateFromResult?.(baseResult);
+            S.renderStriffsInto?.(container, baseResult);
+            S.__striffsReady = true;
+            S.showStriffView?.();
+            S.updateArchReviewButton?.();
 
             let failedCalls = 0;
             S.fetchAiReviewStatus = async () => {
@@ -7320,11 +9507,13 @@
               return { ok: true, status: 200, json: failedResult };
             };
             S.__lastAiReviewPollAfterMs = 10;
-            S.startEnrichmentPolling?.({ immediate: true, reason: 'manual-failed' });
+
+            S.triggerArchitectureReview?.();
+
             const failedOutcome = await new Promise((resolve) => {
               const started = Date.now();
               const tick = () => {
-                const enrichedNode = document.querySelector('#striff-diagram-view svg[data-manual-enriched="1"]');
+                const enrichedNode = document.querySelector('#striffs-content svg[data-manual-enriched="1"]');
                 const btn = document.querySelector('#striffs-btn');
                 const buttonShowsBase = !!(btn && (/check-circle/.test(btn.innerHTML) || /failed|failure/i.test(btn.title || '')));
                 const title = String(btn?.title || '');
@@ -7334,7 +9523,8 @@
                     calls: failedCalls,
                     title,
                     enrichedStillPresent: Boolean(enrichedNode),
-                    status: String(S.__aiReviewStatus || '')
+                    status: String(S.__aiReviewStatus || ''),
+                    archBtnDisabled: archBtn.disabled
                   });
                   return;
                 }
@@ -7345,7 +9535,8 @@
                     title,
                     enrichedStillPresent: Boolean(enrichedNode),
                     status: String(S.__aiReviewStatus || ''),
-                    pollTimerActive: Boolean(S.__aiReviewPollTimer)
+                    pollTimerActive: Boolean(S.__aiReviewPollTimer),
+                    archBtnDisabled: archBtn.disabled
                   });
                   return;
                 }
@@ -7355,21 +9546,24 @@
             });
 
             return {
-              ok: pendingState.status === 'PENDING' &&
-                pendingState.html.includes('Enriching') &&
-                cachedAiReviewStatus === 'PENDING' &&
+              ok: disabledAfterClick &&
                 readyOutcome?.ok &&
+                readyOutcome.archBtnDisabled === false &&
                 failedOutcome?.ok &&
-                failedOutcome.enrichedStillPresent === false,
-              pendingState,
-              cachedAiReviewStatus,
+                failedOutcome.enrichedStillPresent === false &&
+                failedOutcome.archBtnDisabled === false,
+              buttonState: { disabledAfterClick },
               readyOutcome,
               failedOutcome
             };
           } finally {
             S.fetchAiReviewStatus = originalFetchAiReviewStatus;
             const restored = makeResult('READY', originalSvg, { aiReviewId: 'manual-restored' });
-            await applyResult(restored).catch(() => {});
+            S.syncAiReviewStateFromResult?.(restored);
+            S.renderStriffsInto?.(container, restored);
+            S.__striffsReady = true;
+            S.showStriffView?.();
+            S.updateArchReviewButton?.();
           }
         })())
           .then((result) => {
@@ -7384,20 +9578,22 @@
         Promise.resolve((async () => {
           const timeoutMs = Math.max(1000, Number(data.timeoutMs || 180000));
           const startedAt = Date.now();
-          const currentSvgNode = document.querySelector('#striff-diagram-view svg') || S.__striffsSvg || null;
+          const currentSvgNode = S.getPrimaryDiagramSvg?.() || null;
           if (!currentSvgNode) {
             return { ok: false, reason: 'missing-base-svg' };
           }
           const serializer = new XMLSerializer();
           const baseSvg = serializer.serializeToString(currentSvgNode);
-          const operationId = String(S.__aiReviewOperationId || S.__engagementCtx?.operationId || '').trim();
+          const operationId = String(S.__engagementCtx?.operationId || S.__aiReviewOperationId || '').trim();
           const engagementWriteToken = String(S.__engagementCtx?.engagementWriteToken || '').trim();
           if (!operationId || !engagementWriteToken) {
             return {
               ok: false,
               reason: 'missing-engagement-context',
               operationId,
-              hasToken: Boolean(engagementWriteToken)
+              hasToken: Boolean(engagementWriteToken),
+              ctxOperationId: String(S.__engagementCtx?.operationId || '').trim() || null,
+              aiReviewOperationId: String(S.__aiReviewOperationId || '').trim() || null
             };
           }
 
@@ -7416,7 +9612,10 @@
                 ok: false,
                 reason: 'poll-failed',
                 status: Number(resp?.status || 0),
-                error: String(resp?.error || '')
+                error: String(resp?.error || ''),
+                operationId,
+                ctxOperationId: String(S.__engagementCtx?.operationId || '').trim() || null,
+                aiReviewOperationId: String(S.__aiReviewOperationId || '').trim() || null
               };
             }
             const result = resp.json || {};
@@ -7429,7 +9628,7 @@
                 const meta = S.extractPRMetadata?.() || null;
                 await S.refreshDiagramWithEnrichment?.(result, meta);
               }
-              const liveSvgNode = document.querySelector('#striff-diagram-view svg') || S.__striffsSvg || null;
+              const liveSvgNode = S.getPrimaryDiagramSvg?.() || null;
               const finalSvg = liveSvgNode ? serializer.serializeToString(liveSvgNode) : '';
               const hasNote = finalSvg.includes(S.REVIEW_NOTE_PREFIX);
               if (!hasNote) {
@@ -7754,8 +9953,18 @@
       S.updateStriffButton?.({ loading: true, tooltip: "Refreshing Striffs…", phase: "Refreshing" });
       await S.autoFetchStriffs?.();
     } else if (cacheStatus === 'fresh') {
-      // Engagement context refresh failures are silent
-      try { await S.refreshEngagementContextFromFreshResult?.(S.extractPRMetadata?.()); } catch {}
+      // primeDiagramFromCache already restored engagement context from the
+      // cached payload (Chrome Storage / IndexedDB / localStorage).  If the
+      // context is still missing, making a full API call here is wasteful —
+      // the same API response would be missing engagement data too.  Context
+      // will be obtained when the user next triggers Review Architecture.
+      const hasCachedCtx = Boolean(
+        String(S.__engagementCtx?.operationId || '').trim() &&
+        String(S.__engagementCtx?.engagementWriteToken || '').trim()
+      );
+      if (!hasCachedCtx) {
+        S.cwarn?.('[Striffs] Engagement context missing after cache load — will be obtained on next generation');
+      }
     }
 
     S.setDefaultButtonIfIdle?.();
@@ -7771,6 +9980,9 @@
     S.ensureFilesObserver?.(filesRoot);
     S.buildFilePathToDiffIdMapAsync?.();
     S.refreshSupportedFilesState?.();
+    setTimeout(() => {
+      try { S.maybePrefetchStriffs?.(); } catch {}
+    }, 500);
     const cacheStatus = await S.primeDiagramFromCache?.();
     await S.restoreViewAfterBoot?.({ cacheStatus });
     return true;
@@ -7807,14 +10019,19 @@
   } catch (e) {
     S.__striffsErrors = S.__striffsErrors || [];
     S.__striffsErrors.push({ where: 'addSpinAnimation', error: String(e) });
-    console.error('[Striffs] addSpinAnimation failed', e);
+    S.cerr?.('[Striffs] addSpinAnimation failed', e);
   }
+
+  setTimeout(() => {
+    try { S.maybePrefetchStriffs?.(); } catch {}
+  }, 500);
 
   if (!onFilesPage) {
     return;
   }
 
   await S.checkGlobalCacheClearFlag?.();
+  S.purgeExpiredLocalStorageCaches?.();
   const toolbarPromise = S.waitForToolbar?.();
   const extsPromise = S.ensureSupportedExtensionsReady?.();
   const filesRootPromise = S.waitForFilesRoot?.();
@@ -7887,7 +10104,6 @@
 
     try {
       S.cancelEnrichmentPolling?.("navigation");
-      if (!isPRFiles(location.pathname)) return;
 
       try {
         const nextScope = S.cacheKey?.() || null;
@@ -7900,6 +10116,12 @@
           S.__activePrScopeKey = null;
         }
       } catch {}
+
+      setTimeout(() => {
+        try { S.maybePrefetchStriffs?.(); } catch {}
+      }, 500);
+
+      if (!isPRFiles(location.pathname)) return;
 
       S.__remoteConfigPostMountApplied = false;
       const cfgPromise = S.fetchRemoteConfig?.();
@@ -7956,7 +10178,7 @@
 
       await S.completeFilesPageBoot?.(filesRoot);
     } catch (e) {
-      console.warn('[Striffs] nav boot skipped', e);
+      S.cwarn?.('[Striffs] nav boot skipped', e);
     } finally {
       // Clear booting flag to allow subsequent boots
       booting = false;
@@ -8007,8 +10229,7 @@
 
     window.addEventListener('popstate', bootIfNeeded);
 
-    // Replace setInterval with MutationObserver for efficient SPA navigation detection
-    // We observe document.title and <head> changes which happen on navigation
+    // MutationObserver for efficient SPA navigation detection
     navMutationObserver = new MutationObserver(() => {
       if (location.pathname !== lastPath) bootIfNeeded();
     });
@@ -8024,6 +10245,16 @@
     if (headElement) {
       navMutationObserver.observe(headElement, { childList: true });
     }
+
+    // Polling fallback: Turbo can navigate without firing turbo:load/turbo:render
+    // or disconnecting the MutationObserver (e.g. full head replacement from cache).
+    // This lightweight interval ensures prefetch still kicks off when the URL changes
+    // to a PR page. Stopped after detection to avoid unnecessary CPU usage.
+    navIntervalId = setInterval(() => {
+      if (location.pathname !== lastPath) {
+        bootIfNeeded();
+      }
+    }, 600);
 
     S.__navListenersRegistered = true;
   }
