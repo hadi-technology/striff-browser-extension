@@ -49,6 +49,8 @@
   S.__aiReviewLastCompletedReviewId = null;
   S.__aiReviewOperationId = null;
   S.__aiReviewPollStartedAt = null;
+  S.__lastEnrichmentResult = null;
+  S.__archReviewPanelOpen = false;
   S.__supportedExtensionsForUi = S.__supportedExtensionsForUi ||
     (Array.isArray(S.DEFAULT_SUPPORTED_EXTS) ? [...S.DEFAULT_SUPPORTED_EXTS] : []);
   S.PAN_CLICK_DEBOUNCE_MS = 250;
@@ -2191,9 +2193,6 @@
               }
               // If diagram is ready, do not refetch; just show Striffs.
               if (S.__striffsReady && S.__striffsSvg) {
-                  if ((S.__aiReviewStatus === "PENDING" || S.__aiReviewStatus === "RUNNING") && !S.__aiReviewPollTimer) {
-                      S.startEnrichmentPolling?.({ immediate: true, reason: "button-resume" });
-                  }
                   S.showStriffView();
                   S.saveActiveTab('striffs');
                 return;
@@ -2361,7 +2360,7 @@
                 "Analyzing": "Analyzing",
                 "Fetching": "Fetching",
                 "Generating": "Parsing AST",
-                "Enriching": "Enriching",
+                "Enriching": "Analyzing",
                 "Loading": "Loading",
                 "default": "Loading"
             };
@@ -2441,9 +2440,9 @@
             const currentLabel = btn.querySelector('.striffs-local-btn-label');
 
             if (currentIndicator && currentLabel) {
-                currentLabel.textContent = "Enriching";
+                currentLabel.textContent = "Analyzing";
             } else {
-                updateButtonContent(loadingIndicator("Enriching"));
+                updateButtonContent(loadingIndicator("Analyzing"));
             }
             return;
         }
@@ -3259,6 +3258,7 @@
     S.getStriffsContainerMarkup = (contentHtml = '<p>Loading Striffs...</p>') => `
       <div id="striffs-controls-wrap">
         <div id="striffs-controls">
+          <button id="striffs-arch-review-btn" type="button" class="striffs-ctl-btn" title="Run AI architecture review on this diagram" style="display:none;">AI Review</button>
           <button id="striffs-comment-btn" type="button" class="striffs-ctl-btn" title="Comment on diagram" style="display:none;">
             ${S.octicon('comment')}
           </button>
@@ -3271,7 +3271,6 @@
           <a id="striffs-guide-btn" class="striffs-ctl-btn" href="https://striff.io/#how" target="_blank" rel="noopener noreferrer" title="Guide">
             ${S.octicon('question')}
           </a>
-          <button id="striffs-arch-review-btn" type="button" class="striffs-ctl-btn" title="Run AI architecture review on this diagram" style="display:none;">Review Architecture</button>
         </div>
       </div>
       ${S.getStriffsScrollMarkup(contentHtml)}`;
@@ -3563,6 +3562,7 @@
     S.setCurrentView('diffs');
     S.cancelFileTreeAvailabilityRefresh?.();
     S.resetFileTreeAvailability?.();
+    S.closeArchReviewPanel?.();
     S.showAllDiffs();
     const striffView = document.getElementById("striff-diagram-view");
     if (striffView) striffView.style.display = "none";
@@ -3631,9 +3631,6 @@
         }
         S.setCurrentView('striffs');
         S.updateArchReviewButton?.();
-        if ((S.__aiReviewStatus === "PENDING" || S.__aiReviewStatus === "RUNNING") && !S.__aiReviewPollTimer) {
-          S.startEnrichmentPolling?.({ immediate: true, reason: "show-view" });
-        }
     };
 
     S.saveActiveTab = (tabName) => {
@@ -5457,7 +5454,10 @@
 	        S.__striffsReady = true;
 	        S.__lastFetchedUpdatedAt = updated_at;
 	        S.setAutoGenerateIntent?.(true);
-          // No auto-enrichment on cache load
+          // Restore enrichment result for panel if cached diagram was enriched
+          if (S.__aiReviewStatus === "READY") {
+            S.__lastEnrichmentResult = parsed.result;
+          }
           S.updateStriffButton({ success: true, tooltip: "View" });
           S.updateArchReviewButton?.();
 	        return true;
@@ -5746,7 +5746,7 @@
         if (S.__aiReviewStatus === "PENDING" || S.__aiReviewStatus === "RUNNING") {
           S.updateStriffButton({
             enriching: true,
-            tooltip: "Enriching"
+            tooltip: "Analyzing"
           });
           return;
         }
@@ -6296,7 +6296,7 @@
       chip.className = "striffs-comment-panel__chip";
       const fullName = S.toDottedName?.(id) || id;
       const shortName = fullName.split(".").pop() || fullName;
-      chip.innerHTML = `<span class="striffs-comment-panel__chip-icon">&#9670;</span>${shortName}`;
+      chip.innerHTML = `<span class="striffs-comment-panel__chip-icon">&#9670;</span>${shortName}<span class="striffs-comment-panel__chip-remove" title="Remove">&minus;</span>`;
       chip.title = fullName;
       chip.addEventListener("click", () => {
         S.toggleComponentSelection?.(id);
@@ -6491,14 +6491,14 @@
     } catch {
       textarea.value = commentText;
     }
-    const insertionOffset = getReviewDraftInsertionOffset(commentText);
     const reviewDraftSnapshot = {
       contextBlock,
       initialDraftText: "",
       submittedText: commentText
     };
+    // Place cursor at the top so the user starts typing their message there
     try {
-      textarea.setSelectionRange(insertionOffset, insertionOffset);
+      textarea.setSelectionRange(0, 0);
     } catch {}
     textarea.dispatchEvent(new Event("input", { bubbles: true }));
 
@@ -6899,6 +6899,11 @@
         border:1px solid rgba(9,105,218,.2);transition:all .15s;
       }
       .striffs-comment-panel__chip-icon{font-size:9px;opacity:.6;}
+      .striffs-comment-panel__chip-remove{
+        margin-left:4px;width:16px;height:16px;border-radius:3px;
+        background:#cf222e;color:#fff;font-size:13px;font-weight:700;
+        line-height:16px;text-align:center;cursor:pointer;flex-shrink:0;
+      }
       .striffs-comment-panel__chip:hover{
         background:var(--bgColor-danger-muted,#ffebe9);color:var(--fgColor-danger,#cf222e);
         border-color:var(--borderColor-danger,rgba(207,34,46,.3));
@@ -6944,6 +6949,159 @@
       }
       .striffs-comment-panel__resize-handle:hover{
         background:rgba(9,105,218,.2);
+      }
+
+      /* ---- Architecture Review Results Panel ---- */
+      .striffs-arch-review-panel{
+        position:absolute;
+        top:0;
+        right:0;
+        width:0;
+        height:100%;
+        background:var(--bgColor-default,#fff);
+        border-left:none;
+        box-shadow:none;
+        z-index:10;
+        display:flex;
+        flex-direction:column;
+        overflow:hidden;
+        transition:width .25s ease,border-left .25s ease,box-shadow .25s ease;
+        font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+        font-size:13px;
+        color:var(--fgColor-default,#1f2328);
+      }
+      .striffs-arch-review-panel--open{
+        width:400px;
+        border-left:2px solid var(--borderColor-accent,#0969da);
+        box-shadow:-6px 0 24px rgba(9,105,218,.12),-2px 0 8px rgba(0,0,0,.06);
+      }
+      .striffs-arch-review-panel__header{
+        display:flex;
+        align-items:flex-start;
+        justify-content:space-between;
+        padding:14px 16px;
+        border-bottom:1px solid var(--borderColor-muted,#d8dee4);
+        flex-shrink:0;
+        background:var(--bgColor-accent-muted,#f0f6ff);
+      }
+      .striffs-arch-review-panel__title{
+        font-size:14px;
+        font-weight:600;
+        color:var(--fgColor-default,#1f2328);
+      }
+      .striffs-arch-review-panel__close{
+        background:none;
+        border:none;
+        font-size:18px;
+        cursor:pointer;
+        color:var(--fgColor-muted,#6e7781);
+        padding:0 4px;
+        line-height:1;
+      }
+      .striffs-arch-review-panel__close:hover{
+        color:var(--fgColor-default,#1f2328);
+      }
+      .striffs-arch-review-panel__body{
+        flex:1 1 auto;
+        overflow-y:auto;
+        padding:16px;
+      }
+      .striffs-arch-review-panel__risk{
+        display:flex;
+        align-items:center;
+        gap:8px;
+        margin-bottom:16px;
+        padding:10px 14px;
+        border-radius:8px;
+        font-weight:600;
+        font-size:13px;
+      }
+      .striffs-arch-review-panel__risk--LOW{background:#dafbe1;color:#116329;}
+      .striffs-arch-review-panel__risk--MEDIUM{background:#fff8c5;color:#7a5e00;}
+      .striffs-arch-review-panel__risk--HIGH{background:#ff818266;color:#82071e;}
+      .striffs-arch-review-panel__risk--CRITICAL{background:#ffd5dc;color:#82071e;}
+      .striffs-arch-review-panel__section{
+        margin-bottom:16px;
+      }
+      .striffs-arch-review-panel__section-title{
+        font-size:12px;
+        font-weight:600;
+        text-transform:uppercase;
+        letter-spacing:.04em;
+        color:var(--fgColor-muted,#6e7781);
+        margin-bottom:8px;
+      }
+      .striffs-arch-review-panel__overview{
+        line-height:1.5;
+        color:var(--fgColor-default,#1f2328);
+      }
+      .striffs-arch-review-panel__finding{
+        margin-bottom:6px;
+        padding-left:16px;
+        position:relative;
+        line-height:1.5;
+      }
+      .striffs-arch-review-panel__finding::before{
+        content:"•";
+        position:absolute;
+        left:0;
+        color:var(--fgColor-muted,#6e7781);
+      }
+      .striffs-arch-review-panel__item{
+        padding:12px;
+        border:1px solid var(--borderColor-muted,#d8dee4);
+        border-radius:8px;
+        margin-bottom:10px;
+      }
+      .striffs-arch-review-panel__item-header{
+        display:flex;
+        align-items:center;
+        gap:6px;
+        margin-bottom:6px;
+      }
+      .striffs-arch-review-panel__item-severity{
+        font-size:11px;
+        font-weight:600;
+        padding:2px 7px;
+        border-radius:99px;
+        text-transform:uppercase;
+        letter-spacing:.03em;
+      }
+      .striffs-arch-review-panel__item-severity--HIGH{background:#ff818266;color:#82071e;}
+      .striffs-arch-review-panel__item-severity--MEDIUM{background:#fff8c5;color:#7a5e00;}
+      .striffs-arch-review-panel__item-severity--LOW{background:#dafbe1;color:#116329;}
+      .striffs-arch-review-panel__item-severity--CRITICAL{background:#ffd5dc;color:#82071e;}
+      .striffs-arch-review-panel__item-title{
+        font-weight:600;
+        font-size:13px;
+      }
+      .striffs-arch-review-panel__item-text{
+        font-size:12px;
+        line-height:1.5;
+        color:var(--fgColor-muted,#6e7781);
+        margin-top:4px;
+      }
+      .striffs-arch-review-panel__item-action{
+        font-size:12px;
+        line-height:1.5;
+        color:var(--fgColor-accent,#0969da);
+        margin-top:4px;
+      }
+      .striffs-arch-review-panel__good{
+        text-align:center;
+        padding:32px 16px;
+        color:var(--fgColor-muted,#6e7781);
+      }
+      .striffs-arch-review-panel__good-icon{
+        font-size:32px;
+        margin-bottom:12px;
+      }
+      .striffs-arch-review-panel__footer{
+        padding:10px 16px;
+        border-top:1px solid var(--borderColor-muted,#d8dee4);
+        font-size:11px;
+        color:var(--fgColor-muted,#6e7781);
+        flex-shrink:0;
       }
     `;
     document.head.appendChild(style);
@@ -7802,6 +7960,167 @@
     }
   }
 
+  // --- Architecture Review Results Panel ---
+  const ARCH_PANEL_ID = "striffs-arch-review-panel";
+
+  function escHtml(s) {
+    const d = document.createElement("div");
+    d.textContent = String(s || "");
+    return d.innerHTML;
+  }
+
+  function buildArchReviewPanelHtml(result) {
+    const summary = result?.reviewSummary || {};
+    const surfacedItems = Array.isArray(result?.surfacedItems) ? result.surfacedItems : [];
+    const findings = Array.isArray(result?.findings) ? result.findings : [];
+    const riskLevel = String(summary.riskLevel || "LOW").toUpperCase();
+    const keyFindings = Array.isArray(summary.keyFindings) ? summary.keyFindings : [];
+    const hasContent = keyFindings.length > 0 || surfacedItems.length > 0 || findings.length > 0;
+
+    let bodyHtml = "";
+
+    // Risk badge
+    const riskLabel = riskLevel === "CRITICAL" ? "Critical" :
+                      riskLevel === "HIGH" ? "High" :
+                      riskLevel === "MEDIUM" ? "Medium" : "Low";
+    bodyHtml += `<div class="striffs-arch-review-panel__risk striffs-arch-review-panel__risk--${riskLevel}">
+      <span style="font-size:16px;">${riskLevel === "LOW" ? "✓" : "⚡"}</span>
+      Risk Level: ${riskLabel}
+    </div>`;
+
+    if (!hasContent && (!summary.overview || riskLevel === "LOW")) {
+      bodyHtml += `<div class="striffs-arch-review-panel__good">
+        <div class="striffs-arch-review-panel__good-icon">✓</div>
+        <div style="font-size:15px;font-weight:600;margin-bottom:6px;">Everything looks good</div>
+        <div>No architectural concerns were found in this changeset.</div>
+      </div>`;
+    } else {
+      // Overview
+      if (summary.overview) {
+        bodyHtml += `<div class="striffs-arch-review-panel__section">
+          <div class="striffs-arch-review-panel__section-title">Overview</div>
+          <div class="striffs-arch-review-panel__overview">${escHtml(summary.overview) || ""}</div>
+        </div>`;
+      }
+
+      // Key Findings
+      if (keyFindings.length > 0) {
+        bodyHtml += `<div class="striffs-arch-review-panel__section">
+          <div class="striffs-arch-review-panel__section-title">Key Findings</div>
+          ${keyFindings.map(f => `<div class="striffs-arch-review-panel__finding">${escHtml(f) || ""}</div>`).join("")}
+        </div>`;
+      }
+
+      // Review Items (surfaced items)
+      const extensionItems = surfacedItems.filter(i => i.showInExtension !== false);
+      if (extensionItems.length > 0) {
+        bodyHtml += `<div class="striffs-arch-review-panel__section">
+          <div class="striffs-arch-review-panel__section-title">Review Items</div>
+          ${extensionItems.map(item => {
+            const severity = String(item.priority || item.severity || "LOW").toUpperCase();
+            const sevClass = ["HIGH","CRITICAL"].includes(severity) ? severity : severity === "MEDIUM" ? "MEDIUM" : "LOW";
+            return `<div class="striffs-arch-review-panel__item">
+              <div class="striffs-arch-review-panel__item-header">
+                <span class="striffs-arch-review-panel__item-severity striffs-arch-review-panel__item-severity--${sevClass}">${sevClass}</span>
+                <span class="striffs-arch-review-panel__item-title">${escHtml(item.title || "") || ""}</span>
+              </div>
+              ${item.whyShown ? `<div class="striffs-arch-review-panel__item-text">${escHtml(item.whyShown) || ""}</div>` : ""}
+              ${item.reviewAction ? `<div class="striffs-arch-review-panel__item-action">→ ${escHtml(item.reviewAction) || ""}</div>` : ""}
+              ${item.suggestedDirection ? `<div class="striffs-arch-review-panel__item-action">💡 ${escHtml(item.suggestedDirection) || ""}</div>` : ""}
+            </div>`;
+          }).join("")}
+        </div>`;
+      }
+
+      // Findings (if no surfaced items, show findings as fallback)
+      if (extensionItems.length === 0 && findings.length > 0) {
+        bodyHtml += `<div class="striffs-arch-review-panel__section">
+          <div class="striffs-arch-review-panel__section-title">Findings</div>
+          ${findings.map(f => {
+            const severity = String(f.severity || "LOW").toUpperCase();
+            const sevClass = ["HIGH","CRITICAL"].includes(severity) ? severity : severity === "MEDIUM" ? "MEDIUM" : "LOW";
+            return `<div class="striffs-arch-review-panel__item">
+              <div class="striffs-arch-review-panel__item-header">
+                <span class="striffs-arch-review-panel__item-severity striffs-arch-review-panel__item-severity--${sevClass}">${sevClass}</span>
+                <span class="striffs-arch-review-panel__item-title">${escHtml(f.title || "") || ""}</span>
+              </div>
+              ${f.summary ? `<div class="striffs-arch-review-panel__item-text">${escHtml(f.summary) || ""}</div>` : ""}
+            </div>`;
+          }).join("")}
+        </div>`;
+      }
+    }
+
+    // Footer stats
+    const changed = summary.changedComponents || 0;
+    const total = summary.totalComponents || 0;
+    const footerHtml = `<div class="striffs-arch-review-panel__footer">
+      Components: ${changed} changed / ${total} total
+    </div>`;
+
+    return `
+      <div class="striffs-arch-review-panel__header">
+        <span class="striffs-arch-review-panel__title">Architecture Review</span>
+        <button type="button" class="striffs-arch-review-panel__close" title="Close">&times;</button>
+      </div>
+      <div class="striffs-arch-review-panel__body">${bodyHtml}</div>
+      ${footerHtml}`;
+  }
+
+  S.openArchReviewPanel = function openArchReviewPanel(result) {
+    const data = result || S.__lastEnrichmentResult;
+    if (!data) return;
+    let panel = document.getElementById(ARCH_PANEL_ID);
+    const host = document.getElementById("striff-diagram-view") || document.body;
+    if (!panel) {
+      panel = document.createElement("div");
+      panel.id = ARCH_PANEL_ID;
+      panel.className = "striffs-arch-review-panel";
+      panel.setAttribute("aria-hidden", "true");
+      host.appendChild(panel);
+      // Close handler
+      panel.addEventListener("click", (e) => {
+        if (e.target.closest?.(".striffs-arch-review-panel__close")) {
+          S.closeArchReviewPanel?.();
+        }
+      });
+    }
+    panel.innerHTML = buildArchReviewPanelHtml(data);
+    panel.setAttribute("aria-hidden", "false");
+    panel.classList.add("striffs-arch-review-panel--open");
+    void panel.offsetHeight;
+    // Push diagram content left
+    if (host) {
+      host.querySelectorAll(":scope > #striffs-controls-wrap, :scope > #striffs-surface").forEach(s => {
+        s.style.marginRight = "400px";
+        s.style.transition = "margin-right .25s ease";
+      });
+    }
+    S.__archReviewPanelOpen = true;
+  };
+
+  S.closeArchReviewPanel = function closeArchReviewPanel() {
+    const panel = document.getElementById(ARCH_PANEL_ID);
+    if (!panel) return;
+    panel.classList.remove("striffs-arch-review-panel--open");
+    panel.setAttribute("aria-hidden", "true");
+    const host = panel.parentElement;
+    if (host) {
+      host.querySelectorAll(":scope > #striffs-controls-wrap, :scope > #striffs-surface").forEach(s => {
+        s.style.marginRight = "";
+      });
+    }
+    S.__archReviewPanelOpen = false;
+  };
+
+  S.toggleArchReviewPanel = function toggleArchReviewPanel() {
+    if (S.__archReviewPanelOpen) {
+      S.closeArchReviewPanel?.();
+    } else {
+      S.openArchReviewPanel?.();
+    }
+  };
+
   // --- Architecture Review button (manual enrichment trigger) ---
   S.updateArchReviewButton = function updateArchReviewButton() {
     const btn = document.getElementById("striffs-arch-review-btn");
@@ -7809,10 +8128,22 @@
     const view = S.getCurrentView?.();
     const diagramReady = S.__striffsReady && S.__striffsSvg;
     const enriching = S.__aiReviewStatus === "PENDING" || S.__aiReviewStatus === "RUNNING";
+    const reviewReady = S.__aiReviewStatus === "READY";
     const commentActive = S.__commentState?.active;
-    if (view === "striffs" && diagramReady && !commentActive) {
+
+    if (view === "striffs" && diagramReady) {
       btn.style.display = "";
-      btn.disabled = enriching;
+      // Only show "Analyzing..." when polling is actually active (user-triggered)
+      if (enriching && S.__aiReviewPollTimer) {
+        btn.textContent = "Analyzing...";
+        btn.disabled = true;
+      } else if (reviewReady) {
+        btn.textContent = "View AI Review";
+        btn.disabled = commentActive;
+      } else {
+        btn.textContent = "AI Review";
+        btn.disabled = commentActive;
+      }
     } else {
       btn.style.display = "none";
     }
@@ -7820,6 +8151,13 @@
 
   S.triggerArchitectureReview = async function triggerArchitectureReview() {
     const btn = document.getElementById("striffs-arch-review-btn");
+
+    // If review is already complete, toggle the results panel instead
+    if (S.__aiReviewStatus === "READY" && S.__lastEnrichmentResult) {
+      S.toggleArchReviewPanel?.();
+      return;
+    }
+
     if (btn) btn.disabled = true;
 
     let operationId = String(S.__engagementCtx?.operationId || "").trim();
@@ -7850,8 +8188,12 @@
       if (btn) btn.disabled = false;
       return;
     }
-    S.toast?.("Requesting architecture review...", "info", { timeoutMs: 4000 });
+    S.toast?.("Executing architecture review...", "info", { timeoutMs: 4000 });
+    S.__aiReviewStatus = "PENDING";
+    S.__aiReviewPollStartedAt = Date.now();
+    S.updateStriffButton?.({ enriching: true, tooltip: "Analyzing" });
     S.startEnrichmentPolling?.({ immediate: true, reason: "manual-button" });
+    S.updateArchReviewButton?.();
   };
 
   S.refreshDiagramWithEnrichment = async (result, meta = null) => {
@@ -7871,10 +8213,11 @@
       scrollEl.scrollTop = previousScrollTop;
       scrollEl.scrollLeft = previousScrollLeft;
     } catch {}
-    // Enriched diagrams are never cached — only base diagrams are cached.
-    S.clog?.('[enrichment] skipping enriched diagram cache write (base-only caching)');
+    // Cache the enriched diagram so it persists across view switches and reloads
+    S.__lastEnrichmentResult = result;
+    try { writeCachedDiagram(result, meta); } catch (e) { S.cwarn?.('[enrichment] cache write failed', e); }
     if (S.getCurrentView?.() === 'striffs') {
-      S.toast?.("Architecture review applied.", "info", { timeoutMs: 3000 });
+      S.toast?.("Architecture review complete.", "info", { timeoutMs: 3000 });
     }
     // Complete the progress bar when enrichment is done
     const btn = document.querySelector("#striffs-btn");
@@ -7968,7 +8311,10 @@
             const meta = S.extractPRMetadata?.() || null;
             await S.refreshDiagramWithEnrichment?.(result, meta);
           }
+          S.__lastEnrichmentResult = result;
           S.updateStriffButton?.({ success: true, tooltip: "View" });
+          S.updateArchReviewButton?.();
+          S.openArchReviewPanel?.(result);
           return;
         }
         if (nextStatus === "FAILED") {
@@ -7979,7 +8325,7 @@
           return;
         }
         if (nextStatus === "PENDING" || nextStatus === "RUNNING") {
-          S.updateStriffButton?.({ enriching: true, tooltip: "Enriching" });
+          S.updateStriffButton?.({ enriching: true, tooltip: "Analyzing" });
           const retryMs = Math.max(1000, Number(result?.aiReviewPollAfterMs || result?.pollAfterMs || 5000));
           S.__aiReviewPollTimer = setTimeout(() => S.startEnrichmentPolling?.({ immediate: true, reason: "continue" }), retryMs);
           return;
@@ -9027,15 +9373,11 @@
         cerr("Render returned false");
         throw new Error("Failed to render diagram.");
       }
-      // Only cache base diagrams (no enrichment status). Enriched diagrams
-      // are never cached — the user can re-trigger via Architecture Review.
-      const shouldCache = !fromCache && aiReviewStatus === null;
+      // Cache both base and enriched diagrams so the latest state persists.
+      const shouldCache = !fromCache;
       if (shouldCache) {
         writeCachedDiagram(result, meta);
         S.__lastLoadSource = "fresh"; try { document.documentElement.dataset.striffsLoadSource = "fresh"; } catch {}
-      } else if (!fromCache) {
-        // Fresh result but intentionally not cached.
-        S.__lastLoadSource = "fresh-uncached"; try { document.documentElement.dataset.striffsLoadSource = "fresh-uncached"; } catch {}
       } else {
         S.__lastLoadSource = "cache"; try { document.documentElement.dataset.striffsLoadSource = "cache"; } catch {}
       }
@@ -9045,7 +9387,16 @@
 	    S.__lastFetchedUpdatedAt = updated_at;
 	    S.setAutoGenerateIntent?.(true);
       S.updateArchReviewButton?.();
-      // No auto-enrichment — user triggers via Architecture Review button
+      // No auto-enrichment — user triggers via AI Review button.
+      // If the API returned PENDING/RUNNING (server-side auto-start), do NOT
+      // begin polling.  Reset the status so it doesn't pollute the button state.
+      // Store the result if it came back READY (server completed enrichment already).
+      if (aiReviewStatus === "READY") {
+        S.__lastEnrichmentResult = result;
+      } else if (aiReviewStatus === "PENDING" || aiReviewStatus === "RUNNING") {
+        S.__aiReviewStatus = null;
+        S.updateArchReviewButton?.();
+      }
       if (aiReviewStatus === "FAILED") {
         S.updateStriffButton({ success: true, tooltip: result?.aiReviewErrorMessage || "AI enrichment failed. Base Striffs are still available." });
         return;
@@ -9406,6 +9757,16 @@
             aiReviewId: extras.aiReviewId || `manual-${status.toLowerCase()}`,
             aiReviewErrorCode: extras.aiReviewErrorCode || null,
             aiReviewErrorMessage: extras.aiReviewErrorMessage || null,
+            reviewSummary: extras.reviewSummary || (status === 'READY' ? {
+              headline: 'Manual test review',
+              overview: 'This is a manual smoke test review.',
+              riskLevel: 'LOW',
+              keyFindings: [],
+              changedComponents: 1,
+              totalComponents: 1
+            } : undefined),
+            surfacedItems: extras.surfacedItems || [],
+            findings: extras.findings || [],
             striffs: [{
               svgCode: svgText,
               size: 1,
@@ -9432,6 +9793,12 @@
           }
 
           const originalFetchAiReviewStatus = S.fetchAiReviewStatus;
+          // Reset any state left by prior live AI review checks so
+          // triggerArchitectureReview starts enrichment instead of toggling the panel
+          S.__aiReviewStatus = null;
+          S.__lastEnrichmentResult = null;
+          S.closeArchReviewPanel?.();
+          S.updateArchReviewButton?.();
           try {
             // --- Step 2: Click Architecture Review button (READY path) ---
             // Mock fetchAiReviewStatus to return READY immediately
@@ -9457,13 +9824,15 @@
               const tick = () => {
                 const enrichedNode = document.querySelector('#striffs-content svg[data-manual-enriched="1"]');
                 const btn = document.querySelector('#striffs-btn');
+                const archBtnNow = document.getElementById('striffs-arch-review-btn');
+                const statusReady = String(S.__aiReviewStatus || '').trim().toUpperCase() === 'READY';
+                const panelOpen = Boolean(document.getElementById('striffs-arch-review-panel'));
                 const buttonLooksReady = !!(btn && (
                   /check-circle/.test(btn.innerHTML) ||
-                  /enriched/i.test(btn.title || '') ||
                   /view/i.test(btn.title || '') ||
-                  String(S.__aiReviewStatus || '').trim().toUpperCase() === 'READY'
+                  statusReady
                 ));
-                if (enrichedNode && buttonLooksReady) {
+                if (enrichedNode && buttonLooksReady && statusReady) {
                   resolve({
                     ok: true,
                     calls: readyCalls,
@@ -9471,7 +9840,9 @@
                     title: String(btn?.title || ''),
                     enriched: true,
                     pollTimerActive: Boolean(S.__aiReviewPollTimer),
-                    archBtnDisabled: archBtn.disabled
+                    archBtnDisabled: archBtnNow?.disabled,
+                    archBtnText: String(archBtnNow?.textContent || '').trim(),
+                    panelOpen
                   });
                   return;
                 }
@@ -9483,7 +9854,10 @@
                     title: String(btn?.title || ''),
                     enriched: Boolean(enrichedNode),
                     pollTimerActive: Boolean(S.__aiReviewPollTimer),
-                    archBtnDisabled: archBtn.disabled
+                    archBtnDisabled: archBtnNow?.disabled,
+                    archBtnText: String(archBtnNow?.textContent || '').trim(),
+                    panelOpen,
+                    status: String(S.__aiReviewStatus || '')
                   });
                   return;
                 }
@@ -9492,12 +9866,14 @@
               tick();
             });
 
-            // --- Step 3: Click Architecture Review button again (FAILED path) ---
-            // Re-render base diagram first by applying a null-status result
+            // --- Step 3: Click AI Review button again (FAILED path) ---
+            // Close panel and re-render base diagram first
+            S.closeArchReviewPanel?.();
             const baseResult = makeResult(null, originalSvg, { aiReviewId: 'manual-base' });
             S.syncAiReviewStateFromResult?.(baseResult);
             S.renderStriffsInto?.(container, baseResult);
             S.__striffsReady = true;
+            S.__lastEnrichmentResult = null;
             S.showStriffView?.();
             S.updateArchReviewButton?.();
 
@@ -9515,16 +9891,19 @@
               const tick = () => {
                 const enrichedNode = document.querySelector('#striffs-content svg[data-manual-enriched="1"]');
                 const btn = document.querySelector('#striffs-btn');
-                const buttonShowsBase = !!(btn && (/check-circle/.test(btn.innerHTML) || /failed|failure/i.test(btn.title || '')));
+                const archBtnNow = document.getElementById('striffs-arch-review-btn');
+                const statusFailed = String(S.__aiReviewStatus || '').trim().toUpperCase() === 'FAILED';
                 const title = String(btn?.title || '');
-                if (!S.__aiReviewPollTimer && buttonShowsBase && /failed|failure/i.test(title)) {
+                const buttonShowsDone = !!(btn && (/check-circle/.test(btn.innerHTML) || /failed|failure|view/i.test(title)));
+                if (!S.__aiReviewPollTimer && buttonShowsDone && statusFailed) {
                   resolve({
                     ok: true,
                     calls: failedCalls,
                     title,
                     enrichedStillPresent: Boolean(enrichedNode),
                     status: String(S.__aiReviewStatus || ''),
-                    archBtnDisabled: archBtn.disabled
+                    archBtnDisabled: archBtnNow?.disabled,
+                    archBtnText: String(archBtnNow?.textContent || '').trim()
                   });
                   return;
                 }
@@ -9536,7 +9915,8 @@
                     enrichedStillPresent: Boolean(enrichedNode),
                     status: String(S.__aiReviewStatus || ''),
                     pollTimerActive: Boolean(S.__aiReviewPollTimer),
-                    archBtnDisabled: archBtn.disabled
+                    archBtnDisabled: archBtnNow?.disabled,
+                    archBtnText: String(archBtnNow?.textContent || '').trim()
                   });
                   return;
                 }
@@ -9548,7 +9928,8 @@
             return {
               ok: disabledAfterClick &&
                 readyOutcome?.ok &&
-                readyOutcome.archBtnDisabled === false &&
+                readyOutcome.enriched &&
+                readyOutcome.pollTimerActive === false &&
                 failedOutcome?.ok &&
                 failedOutcome.enrichedStillPresent === false &&
                 failedOutcome.archBtnDisabled === false,
