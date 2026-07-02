@@ -2191,11 +2191,19 @@
                   S.updateStriffButton({ neutral: true, disabled: true, tooltip: "Token required" });
                   return;
               }
-              // If diagram is ready, do not refetch; just show Striffs.
-              if (S.__striffsReady && S.__striffsSvg) {
+              // If diagram is ready and SVG is still in the document, just show Striffs.
+              // GitHub SPA navigation can detach __striffsSvg from the DOM even though
+              // the reference is still held — treat that as "not ready".
+              const svgAttached = S.__striffsSvg && document.body.contains(S.__striffsSvg);
+              if (S.__striffsReady && svgAttached) {
                   S.showStriffView();
                   S.saveActiveTab('striffs');
                 return;
+            }
+
+            // If SVG is detached, clear the stale reference so we re-render from cache.
+            if (S.__striffsReady && S.__striffsSvg && !svgAttached) {
+                S.__striffsSvg = null;
             }
 
             // FIRST PHASE: diagram not ready yet → generate then show Striffs.
@@ -5269,7 +5277,10 @@
     try { S.cancelEnrichmentPolling?.(`pr-scope-change:${reason}`); } catch {}
     try { S.exitCommentMode?.(); } catch {}
 
-    S.__striffsReady = false;
+    // Do NOT clear __striffsReady, __striffsSvg, or the path/component maps here.
+    // The diagram remains valid when navigating within the same PR (e.g. switching
+    // tabs or submitting a review). These are only invalid for a different PR,
+    // which is handled by the full teardown in the clear-local-cache path.
     S.__striffsNoChanges = false;
     S.__lastFetchedUpdatedAt = null;
     S.__lastPrefetchRequestKey = null;
@@ -5298,13 +5309,7 @@
       S.__engagementCtx = { sessionId, operationId: null, engagementWriteToken: null };
     } catch {}
 
-    try { S.__striffsSvg = null; } catch {}
     try { S.clearReviewNoteFeedback?.(); } catch {}
-    try { S.__striffsPathToComponentId?.clear?.(); } catch {}
-    try { S.__striffsComponentIdToFile?.clear?.(); } catch {}
-    try { S.__striffsComponentIdToDiffId?.clear?.(); } catch {}
-    try { S.__striffsComponentIdToSvgElement?.clear?.(); } catch {}
-    try { S.__stablePathToComponentId?.clear?.(); } catch {}
     try { S.__stableComponentIdToFile?.clear?.(); } catch {}
     try { S.__stableComponentIdToDiffId?.clear?.(); } catch {}
     try { S.__stableFilePathToDiffId?.clear?.(); } catch {}
@@ -6400,8 +6405,39 @@
       if (isReviewComposerVisible(textarea)) {
         reviewForm = findReviewForm(textarea);
       } else {
-        textarea = null;
-        reviewForm = null;
+        // Textarea exists but is not visible. Before giving up, try switching to the
+        // Write tab — it might be hidden because we're on the Preview tab.
+        reviewForm = findReviewForm(textarea);
+        const form = reviewForm || textarea?.closest("form") || textarea?.closest("[class*='comment']");
+        // Old UI: tabbed container with .js-write-tab / .js-preview-tab buttons
+        const writeTabOld = form?.querySelector?.(".js-write-tab");
+        if (writeTabOld && !writeTabOld.classList.contains("selected")) {
+          writeTabOld.click();
+          await new Promise(r => setTimeout(r, 150));
+        }
+        // New UI: buttons with data-testid or aria-selected
+        const writeTabNew = form?.querySelector?.('button[data-testid="write-tab"], button[aria-label="Write"], button.js-write-tab')
+          || form?.closest?.('[class*="comment"]')?.querySelector?.('button[data-testid="write-tab"], button[aria-label="Write"]');
+        if (writeTabNew && writeTabNew.getAttribute("aria-selected") !== "true") {
+          writeTabNew.click();
+          await new Promise(r => setTimeout(r, 150));
+        }
+        // Generic fallback: look for any tab button containing "Write" text
+        if (!writeTabOld && !writeTabNew) {
+          const tabs = form?.querySelectorAll?.("button.tabnav-tab, button[role='tab']") || [];
+          for (const tab of tabs) {
+            if (/write/i.test(tab.textContent || "") && tab.getAttribute("aria-selected") !== "true") {
+              tab.click();
+              await new Promise(r => setTimeout(r, 150));
+              break;
+            }
+          }
+        }
+        // Check visibility again after tab switch
+        if (!isReviewComposerVisible(textarea)) {
+          textarea = null;
+          reviewForm = null;
+        }
       }
     }
 
@@ -6778,8 +6814,7 @@
   }
 
   function findReviewButton() {
-    const hotkeyBtn = document.querySelector('[data-hotkey="r"]');
-    if (hotkeyBtn) return hotkeyBtn;
+    // Specific selectors first — these are unambiguous
     const newUiBtn = document.querySelector('[data-testid="review-changes-button"]') ||
       document.querySelector('[class*="ReviewMenuButton"]');
     if (newUiBtn) return newUiBtn;
@@ -6787,12 +6822,26 @@
     const oldUiInlineButton = oldUiInline?.closest?.('button, summary, a, [role="button"]');
     if (oldUiInlineButton) return oldUiInlineButton;
 
+    // data-hotkey="r" is shared with "Quote reply" — only accept if the element
+    // or its nearby text clearly indicates a review action.
+    for (const el of document.querySelectorAll('[data-hotkey="r"]')) {
+      const text = (el.textContent || "").trim().toLowerCase();
+      const href = el.getAttribute?.("href") || "";
+      const cls = el.className || "";
+      if (/review/i.test(text) || /review/i.test(href) ||
+          /\bjs-review\b/.test(cls) || /\bjs-review-changes\b/.test(cls) ||
+          el.closest?.('.js-reviews-container, [class*="review"], [data-review]')) {
+        return el;
+      }
+    }
+
+    // Fallback: scan for elements whose text explicitly says "Review changes" or similar
     const candidates = document.querySelectorAll(
       'button, summary, a.btn, [role="button"]'
     );
     for (const el of candidates) {
       const text = (el.textContent || "").trim().toLowerCase();
-      if (el.getAttribute?.('data-hotkey') === 'r') {
+      if (/review\s*(changes)?/i.test(text) && !/quote/i.test(text)) {
         return el;
       }
     }
@@ -7012,14 +7061,24 @@
         gap:8px;
         margin-bottom:16px;
         padding:10px 14px;
-        border-radius:8px;
-        font-weight:600;
+        border-radius:10px;
+        font-weight:700;
         font-size:13px;
+        background:var(--bgColor-muted,#f6f8fa);
+        border:1px solid var(--borderColor-muted,#d8dee4);
+        color:var(--fgColor-default,#1f2328);
       }
-      .striffs-arch-review-panel__risk--LOW{background:#dafbe1;color:#116329;}
-      .striffs-arch-review-panel__risk--MEDIUM{background:#fff8c5;color:#7a5e00;}
-      .striffs-arch-review-panel__risk--HIGH{background:#ff818266;color:#82071e;}
-      .striffs-arch-review-panel__risk--CRITICAL{background:#ffd5dc;color:#82071e;}
+      .striffs-arch-review-panel__risk::before{
+        content:"";
+        width:0.5rem;
+        height:0.5rem;
+        border-radius:999px;
+        flex-shrink:0;
+      }
+      .striffs-arch-review-panel__risk--LOW::before{background:#1a7f37;}
+      .striffs-arch-review-panel__risk--MEDIUM::before{background:#d97706;}
+      .striffs-arch-review-panel__risk--HIGH::before{background:#cf222e;}
+      .striffs-arch-review-panel__risk--CRITICAL::before{background:#cf222e;}
       .striffs-arch-review-panel__section{
         margin-bottom:16px;
       }
@@ -7048,42 +7107,73 @@
         color:var(--fgColor-muted,#6e7781);
       }
       .striffs-arch-review-panel__item{
-        padding:12px;
-        border:1px solid var(--borderColor-muted,#d8dee4);
-        border-radius:8px;
+        display:flex;
+        align-items:flex-start;
+        gap:10px;
+        padding:12px 13px;
+        border:1px solid rgba(15,23,42,.08);
+        border-radius:10px;
         margin-bottom:10px;
+        background:#f8fafc;
+      }
+      .striffs-arch-review-panel__item--HIGH,
+      .striffs-arch-review-panel__item--CRITICAL{
+        border-color:rgba(207,34,46,.15);
+        background:#fef2f2;
+      }
+      .striffs-arch-review-panel__item--MEDIUM{
+        border-color:rgba(154,103,0,.15);
+        background:#fffbeb;
       }
       .striffs-arch-review-panel__item-header{
         display:flex;
-        align-items:center;
-        gap:6px;
-        margin-bottom:6px;
+        align-items:flex-start;
+        gap:8px;
+        flex:1;
+        min-width:0;
       }
       .striffs-arch-review-panel__item-severity{
-        font-size:11px;
-        font-weight:600;
-        padding:2px 7px;
-        border-radius:99px;
+        display:inline-flex;
+        align-items:center;
+        gap:3px;
+        min-width:52px;
+        padding:3px 7px;
+        border-radius:6px;
+        font-size:10px;
+        font-weight:800;
         text-transform:uppercase;
-        letter-spacing:.03em;
+        letter-spacing:.05em;
+        flex-shrink:0;
+        margin-top:1px;
       }
-      .striffs-arch-review-panel__item-severity--HIGH{background:#ff818266;color:#82071e;}
-      .striffs-arch-review-panel__item-severity--MEDIUM{background:#fff8c5;color:#7a5e00;}
-      .striffs-arch-review-panel__item-severity--LOW{background:#dafbe1;color:#116329;}
-      .striffs-arch-review-panel__item-severity--CRITICAL{background:#ffd5dc;color:#82071e;}
+      .striffs-arch-review-panel__item-severity-icon{
+        width:9px;
+        height:9px;
+        flex-shrink:0;
+      }
+      .striffs-arch-review-panel__item-severity--HIGH,
+      .striffs-arch-review-panel__item-severity--CRITICAL{background:rgba(207,34,46,.1);color:#cf222e;}
+      .striffs-arch-review-panel__item-severity--MEDIUM{background:rgba(154,103,0,.1);color:#92400e;}
+      .striffs-arch-review-panel__item-severity--LOW{background:rgba(26,127,55,.1);color:#1a7f37;}
+      .striffs-arch-review-panel__item-body{
+        min-width:0;
+        flex:1;
+      }
       .striffs-arch-review-panel__item-title{
-        font-weight:600;
+        font-weight:700;
         font-size:13px;
+        line-height:1.35;
+        color:var(--fgColor-default,#1f2328);
       }
       .striffs-arch-review-panel__item-text{
         font-size:12px;
-        line-height:1.5;
+        line-height:1.6;
         color:var(--fgColor-muted,#6e7781);
         margin-top:4px;
       }
       .striffs-arch-review-panel__item-action{
         font-size:12px;
-        line-height:1.5;
+        line-height:1.6;
         color:var(--fgColor-accent,#0969da);
         margin-top:4px;
       }
@@ -7969,6 +8059,8 @@
     return d.innerHTML;
   }
 
+  const SEVERITY_ICON_SVG = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" class="striffs-arch-review-panel__item-severity-icon"><path d="M8 1L1 14h14L8 1z"/><path d="M8 6v4M8 12h.01"/></svg>';
+
   function buildArchReviewPanelHtml(result) {
     const summary = result?.reviewSummary || {};
     const surfacedItems = Array.isArray(result?.surfacedItems) ? result.surfacedItems : [];
@@ -7984,7 +8076,6 @@
                       riskLevel === "HIGH" ? "High" :
                       riskLevel === "MEDIUM" ? "Medium" : "Low";
     bodyHtml += `<div class="striffs-arch-review-panel__risk striffs-arch-review-panel__risk--${riskLevel}">
-      <span style="font-size:16px;">${riskLevel === "LOW" ? "✓" : "⚡"}</span>
       Risk Level: ${riskLabel}
     </div>`;
 
@@ -8019,14 +8110,14 @@
           ${extensionItems.map(item => {
             const severity = String(item.priority || item.severity || "LOW").toUpperCase();
             const sevClass = ["HIGH","CRITICAL"].includes(severity) ? severity : severity === "MEDIUM" ? "MEDIUM" : "LOW";
-            return `<div class="striffs-arch-review-panel__item">
-              <div class="striffs-arch-review-panel__item-header">
-                <span class="striffs-arch-review-panel__item-severity striffs-arch-review-panel__item-severity--${sevClass}">${sevClass}</span>
-                <span class="striffs-arch-review-panel__item-title">${escHtml(item.title || "") || ""}</span>
+            return `<div class="striffs-arch-review-panel__item striffs-arch-review-panel__item--${sevClass}">
+              <span class="striffs-arch-review-panel__item-severity striffs-arch-review-panel__item-severity--${sevClass}">${SEVERITY_ICON_SVG}${sevClass}</span>
+              <div class="striffs-arch-review-panel__item-body">
+                <div class="striffs-arch-review-panel__item-title">${escHtml(item.title || "") || ""}</div>
+                ${item.whyShown ? `<div class="striffs-arch-review-panel__item-text">${escHtml(item.whyShown) || ""}</div>` : ""}
+                ${item.reviewAction ? `<div class="striffs-arch-review-panel__item-action">→ ${escHtml(item.reviewAction) || ""}</div>` : ""}
+                ${item.suggestedDirection ? `<div class="striffs-arch-review-panel__item-action">💡 ${escHtml(item.suggestedDirection) || ""}</div>` : ""}
               </div>
-              ${item.whyShown ? `<div class="striffs-arch-review-panel__item-text">${escHtml(item.whyShown) || ""}</div>` : ""}
-              ${item.reviewAction ? `<div class="striffs-arch-review-panel__item-action">→ ${escHtml(item.reviewAction) || ""}</div>` : ""}
-              ${item.suggestedDirection ? `<div class="striffs-arch-review-panel__item-action">💡 ${escHtml(item.suggestedDirection) || ""}</div>` : ""}
             </div>`;
           }).join("")}
         </div>`;
@@ -8039,12 +8130,12 @@
           ${findings.map(f => {
             const severity = String(f.severity || "LOW").toUpperCase();
             const sevClass = ["HIGH","CRITICAL"].includes(severity) ? severity : severity === "MEDIUM" ? "MEDIUM" : "LOW";
-            return `<div class="striffs-arch-review-panel__item">
-              <div class="striffs-arch-review-panel__item-header">
-                <span class="striffs-arch-review-panel__item-severity striffs-arch-review-panel__item-severity--${sevClass}">${sevClass}</span>
-                <span class="striffs-arch-review-panel__item-title">${escHtml(f.title || "") || ""}</span>
+            return `<div class="striffs-arch-review-panel__item striffs-arch-review-panel__item--${sevClass}">
+              <span class="striffs-arch-review-panel__item-severity striffs-arch-review-panel__item-severity--${sevClass}">${SEVERITY_ICON_SVG}${sevClass}</span>
+              <div class="striffs-arch-review-panel__item-body">
+                <div class="striffs-arch-review-panel__item-title">${escHtml(f.title || "") || ""}</div>
+                ${f.summary ? `<div class="striffs-arch-review-panel__item-text">${escHtml(f.summary) || ""}</div>` : ""}
               </div>
-              ${f.summary ? `<div class="striffs-arch-review-panel__item-text">${escHtml(f.summary) || ""}</div>` : ""}
             </div>`;
           }).join("")}
         </div>`;
@@ -10462,12 +10553,6 @@
   const isPRFiles = S.isPRFilesPath || ((p) => /\/[^/]+\/[^/]+\/pull\/\d+\/(files|changes)/.test(p));
 
   async function bootIfNeeded() {
-    // Immediately nuke any stale diagram from a previous PR (Turbo cache or otherwise)
-    try {
-      const stale = document.getElementById('striff-diagram-view');
-      if (stale) stale.innerHTML = S.getStriffsContainerMarkup?.('') || '';
-    } catch {}
-
     if (!isPR(location.pathname)) return;
 
     // Debounce: if a boot is already in progress, schedule a check after it completes
@@ -10489,6 +10574,11 @@
       try {
         const nextScope = S.cacheKey?.() || null;
         if (nextScope && nextScope !== S.__activePrScopeKey) {
+          // Nuke stale diagram only when navigating to a DIFFERENT PR
+          try {
+            const stale = document.getElementById('striff-diagram-view');
+            if (stale) stale.innerHTML = S.getStriffsContainerMarkup?.('') || '';
+          } catch {}
           S.resetPrScopedState?.('navigation');
           S.__activePrScopeKey = nextScope;
         } else if (!nextScope) {
