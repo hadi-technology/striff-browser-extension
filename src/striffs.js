@@ -8061,25 +8061,44 @@
 
   const SEVERITY_ICON_SVG = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" class="striffs-arch-review-panel__item-severity-icon"><path d="M8 1L1 14h14L8 1z"/><path d="M8 6v4M8 12h.01"/></svg>';
 
+  // SurfacedReviewItem.priority is a canonical label (ADR-015: no P1/P2/P3 codes), not a
+  // HIGH/MEDIUM/LOW severity tier. Map it to a severity tier for badge styling while keeping
+  // the canonical label as the badge text.
+  const SURFACED_PRIORITY_SEVERITY = {
+    STRUCTURAL_REGRESSION: "HIGH",
+    REVIEW_HOTSPOT: "MEDIUM",
+    INFORMATIONAL_SIGNAL: "LOW"
+  };
+  const SURFACED_PRIORITY_LABEL = {
+    STRUCTURAL_REGRESSION: "Structural Regression",
+    REVIEW_HOTSPOT: "Review Hotspot",
+    INFORMATIONAL_SIGNAL: "Informational Signal"
+  };
+
   function buildArchReviewPanelHtml(result) {
     const summary = result?.reviewSummary || {};
     const surfacedItems = Array.isArray(result?.surfacedItems) ? result.surfacedItems : [];
     const findings = Array.isArray(result?.findings) ? result.findings : [];
-    const riskLevel = String(summary.riskLevel || "LOW").toUpperCase();
     const keyFindings = Array.isArray(summary.keyFindings) ? summary.keyFindings : [];
     const hasContent = keyFindings.length > 0 || surfacedItems.length > 0 || findings.length > 0;
 
     let bodyHtml = "";
 
-    // Risk badge
-    const riskLabel = riskLevel === "CRITICAL" ? "Critical" :
-                      riskLevel === "HIGH" ? "High" :
-                      riskLevel === "MEDIUM" ? "Medium" : "Low";
-    bodyHtml += `<div class="striffs-arch-review-panel__risk striffs-arch-review-panel__risk--${riskLevel}">
-      Risk Level: ${riskLabel}
+    // Highest-priority badge, driven by SurfacedReviewPriority (Structural Regression >
+    // Review Hotspot) instead of the retired riskLevel field -- riskLevel and the priority
+    // model were computed independently server-side and could disagree (ADR-013 Part D).
+    const highestPriority = surfacedItems.some(item => item.priority === "STRUCTURAL_REGRESSION")
+        ? "STRUCTURAL_REGRESSION"
+        : surfacedItems.some(item => item.priority === "REVIEW_HOTSPOT")
+            ? "REVIEW_HOTSPOT"
+            : null;
+    const severityTier = highestPriority ? SURFACED_PRIORITY_SEVERITY[highestPriority] : "LOW";
+    const priorityLabel = highestPriority ? SURFACED_PRIORITY_LABEL[highestPriority] : "No structural concerns";
+    bodyHtml += `<div class="striffs-arch-review-panel__risk striffs-arch-review-panel__risk--${severityTier}">
+      Highest priority: ${priorityLabel}
     </div>`;
 
-    if (!hasContent && (!summary.overview || riskLevel === "LOW")) {
+    if (!hasContent && (!summary.overview || !highestPriority)) {
       bodyHtml += `<div class="striffs-arch-review-panel__good">
         <div class="striffs-arch-review-panel__good-icon">✓</div>
         <div style="font-size:15px;font-weight:600;margin-bottom:6px;">Everything looks good</div>
@@ -8108,10 +8127,13 @@
         bodyHtml += `<div class="striffs-arch-review-panel__section">
           <div class="striffs-arch-review-panel__section-title">Review Items</div>
           ${extensionItems.map(item => {
-            const severity = String(item.priority || item.severity || "LOW").toUpperCase();
+            const rawPriority = String(item.priority || "").toUpperCase();
+            const severity = SURFACED_PRIORITY_SEVERITY[rawPriority]
+              || String(item.priority || item.severity || "LOW").toUpperCase();
             const sevClass = ["HIGH","CRITICAL"].includes(severity) ? severity : severity === "MEDIUM" ? "MEDIUM" : "LOW";
+            const badgeLabel = SURFACED_PRIORITY_LABEL[rawPriority] || sevClass;
             return `<div class="striffs-arch-review-panel__item striffs-arch-review-panel__item--${sevClass}">
-              <span class="striffs-arch-review-panel__item-severity striffs-arch-review-panel__item-severity--${sevClass}">${SEVERITY_ICON_SVG}${sevClass}</span>
+              <span class="striffs-arch-review-panel__item-severity striffs-arch-review-panel__item-severity--${sevClass}">${SEVERITY_ICON_SVG}${badgeLabel}</span>
               <div class="striffs-arch-review-panel__item-body">
                 <div class="striffs-arch-review-panel__item-title">${escHtml(item.title || "") || ""}</div>
                 ${item.whyShown ? `<div class="striffs-arch-review-panel__item-text">${escHtml(item.whyShown) || ""}</div>` : ""}
@@ -9851,7 +9873,6 @@
             reviewSummary: extras.reviewSummary || (status === 'READY' ? {
               headline: 'Manual test review',
               overview: 'This is a manual smoke test review.',
-              riskLevel: 'LOW',
               keyFindings: [],
               changedComponents: 1,
               totalComponents: 1
