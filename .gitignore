@@ -7,7 +7,13 @@ test/.pw-profile/
 .pw-profile/
 test/.pw-*/
 test/.pw-profile-*/
+test-results/
 dist/
+
+# Scratch / probe scripts and tool run artifacts
+.tmp-*
+.claude/scheduled_tasks.lock
+.claude/**/.temp-execution-*.js
 
 # Node
 node_modules/

@@ -1,0 +1,18 @@
+{
+  "root": true,
+  "env": {
+    "browser": true,
+    "es2022": true,
+    "node": true
+  },
+  "extends": [],
+  "parserOptions": {
+    "ecmaVersion": "latest",
+    "sourceType": "script"
+  },
+  "rules": {
+    "no-unused-vars": "warn",
+    "no-empty": ["warn", { "allowEmptyCatch": true }],
+    "no-console": ["warn", { "allow": ["warn", "error"] }]
+  }
+}
