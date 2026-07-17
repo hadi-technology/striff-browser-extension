@@ -70,48 +70,12 @@
     return { ok: true, type: "classic", login };
   }
 
-  async function clearExtensionCaches() {
-    const local = chrome.storage.local;
-    const all = await local.get(null);
-    const prefixes = ["striffs:", "StriffsCache:", "striffsCache:", "striffsCacheMeta:", "StriffsCacheMeta:"];
-    const keys = [
-      "striffsActiveTab",
-      "striffsRemoteConfig",
-      "striffsRemoteConfigFetchedAt",
-      "striffsRemoteConfigUrl",
-      "striffsSupportedLangs",
-      "striffsSupportedLangsFetchedAt",
-      "striffsSupportedLangsBase",
-      "striffsConfigUrl",
-      "striffsApiBase"
-    ];
-    const toRemove = Object.keys(all).filter((key) =>
-      key !== "striffsCacheClearAt" &&
-      String(key).toLowerCase() !== "striffsdebug" &&
-      (keys.includes(key) || prefixes.some((prefix) => key.startsWith(prefix)))
-    );
-    if (toRemove.length) await local.remove(toRemove);
-  }
-
-  async function clearGithubTabsCaches() {
-    const tabs = await chrome.tabs.query({ url: ["*://github.com/*", "*://*.github.com/*"] });
-    let touched = 0;
-    await Promise.allSettled(tabs.map(async (tab) => {
-      try {
-        const resp = await chrome.tabs.sendMessage(tab.id, { type: "clearStriffsCaches" });
-        if (resp?.ok) touched += 1;
-      } catch {}
-    }));
-    return touched;
-  }
-
   async function clearAllCaches({ notifyBackground = false } = {}) {
-    await clearExtensionCaches();
-    if (notifyBackground) {
-      await chrome.runtime.sendMessage({ type: "clearStriffsCaches" });
-      return { tabsTouched: 0 };
+    const resp = await chrome.runtime.sendMessage({ type: "clearStriffsCaches" });
+    if (!resp?.ok) {
+      throw new Error(resp?.error || "Failed to clear caches");
     }
-    return { tabsTouched: await clearGithubTabsCaches() };
+    return { tabsTouched: Number(resp?.tabsTouched || 0), cacheClearAt: resp?.cacheClearAt || null };
   }
 
   function readFlagOnce(key, callback) {

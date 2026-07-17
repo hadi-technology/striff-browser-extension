@@ -4,12 +4,14 @@
 
 Browser extension that adds a `Striffs` view to GitHub pull request pages and renders architecture-aware SVG diffs from the Striff API.
 
+https://youtu.be/gte1iFYRN88
+
 ## Features
 
 - **Architecture-aware diffs**: Visualize code changes as interactive diagrams
 - **Multi-phase loading**: Animated progress indicator with status updates
 - **AI review notes**: Inline AI-generated code review feedback with helpful/unhelpful voting
-- **Smart caching**: Response caching with configurable API endpoint
+- **Smart caching**: Response caching for faster repeat PR loads
 - **Custom icons**: GitHub logo for diffs, Striffs node-graph icon for striffs
 
 ## Loading States
@@ -20,7 +22,7 @@ The Striffs button shows animated states during processing:
 |-------|----------|
 | **Analyzing** | Scanning PR files and changes |
 | **Fetching** | Downloading file content from GitHub |
-| **Generating** | *Rotating Claude-style words*: Cooking → Thinking → Pondering → Reasoning → Crafting → Building → Preparing → Considering → Deliberating |
+| **Generating** | Rotating Striffs-specific progress copy while the diagram is prepared |
 | **Enriching** | Adding metadata and relationships |
 
 A horizontal shine effect animates across the loading text, and a progress bar appears under the button during generation.
@@ -33,15 +35,16 @@ Load the repo root as an unpacked MV3 extension in Chromium-based browsers.
 - Edge: `edge://extensions`
 - Chromium: `chrome://extensions`
 
-The extension expects the API at `https://striff.io` unless `striffsApiBase` is overridden in extension options.
+The packaged extension targets `https://api.striff.io`.
+For local development, the unpacked extension defaults to `http://localhost:8080`.
 
 ### Configuration
 
 Open the extension options to configure:
 
-- **API Base URL**: Default is `https://striff.io` (set to `http://localhost:8080` for local development)
-- **GitHub Token**: Optional, for private repository access
-- **Supported Extensions**: Comma-separated list (e.g., `java,typescript`)
+- **GitHub Token**: Optional, used for private repository access and token-backed API requests
+- **Clear Cache**: Removes cached diagrams and local Striffs state
+- **Send Usage Data**: Popup toggle for engagement and review interaction events
 
 ## Runtime Layout
 
@@ -94,7 +97,7 @@ This stages only runtime files and excludes dev/test artifacts.
 node test/login-github.js
 ```
 
-This creates `test/.github-storage-state.json` without loading the extension in a headed persistent profile.
+This prepares the saved Chrome login profile used by the manual smoke harness.
 
 ### Run the live smoke tests:
 
@@ -128,10 +131,11 @@ npm test
 
 ## Privacy & Security
 
-- GitHub tokens are stored for the current browser session only
+- GitHub tokens are stored in extension storage until cleared from the popup or options page
 - Live/manual test hooks exist in source but are stripped from the packaged production artifact
-- Engagement and AI review feedback events may be sent to the configured Striffs backend
-- All API calls go to the configured base URL
+- Usage-data collection can be disabled from the popup without disabling base diagram generation
+- Engagement, review interaction, and AI review feedback events may be sent to the configured Striffs backend when usage data is enabled
+- All API calls go to the packaged production base URL or the unpacked local-development base URL
 
 ## Icons
 

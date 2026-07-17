@@ -12,15 +12,23 @@ const distDir = path.join(root, 'dist');
 const stageDir = path.join(distDir, 'extension');
 const zipPath = path.join(distDir, 'striffs-extension.zip');
 
-async function rewriteFile(relPath, transform) {
+async function rewriteFile(relPath, transform, { description = relPath, mustChange = true, mustNotContain = [] } = {}) {
   const target = path.join(stageDir, relPath);
   const current = await fs.readFile(target, 'utf8');
   const next = transform(current);
+  if (mustChange && next === current) {
+    throw new Error(`Packaging rewrite did not change ${description}`);
+  }
+  for (const marker of mustNotContain) {
+    if (next.includes(marker)) {
+      throw new Error(`Packaging rewrite for ${description} left forbidden marker: ${marker}`);
+    }
+  }
   await fs.writeFile(target, next, 'utf8');
 }
 
 function stripPopupDebugSection(html) {
-  return html.replace(/\n\s*<div class="section">\s*<label class="debug-label"[\s\S]*?<\/div>\s*/m, '\n');
+  return html.replace(/\n\s*<div class="section">\s*<label class="debug-label"[^>]*for="debugToggle"[^>]*>[\s\S]*?<\/div>\s*/m, '\n');
 }
 
 function disableBundledTestHooks(source) {
@@ -46,8 +54,10 @@ function stripStriffsRuntimeOverrides(source) {
 }
 
 function stripBackgroundRuntimeOverrides(source) {
+  // Dev default is already api.striff.io — just strip the storage-based override
+  // so the extension always uses the hardcoded base in production.
   return source.replace(
-    /async function getApiBase\(defaultBase = 'https:\/\/api\.striff\.io'\) \{[\s\S]*?return normalizeApiBase\(defaultBase\);\n\}/,
+    /const DEV_DEFAULT_API_BASE = 'https:\/\/api\.striff\.io';\n\n\/\/ API base override via chrome\.storage\.local key "striffsApiBase"\nasync function getApiBase\(defaultBase = DEV_DEFAULT_API_BASE\) \{[\s\S]*?return normalizeApiBase\(defaultBase\);\n\}/,
     "async function getApiBase(defaultBase = 'https://api.striff.io') {\n  return normalizeApiBase(defaultBase);\n}"
   );
 }
@@ -78,14 +88,39 @@ for (const relPath of ['manifest.json', 'html', 'icons', 'lib', 'src']) {
 }
 
 await rmIfExists(path.join(stageDir, 'html', 'config-local-test.json'));
-await rewriteFile('html/popup.html', stripPopupDebugSection);
-await rewriteFile('src/striffs.js', disableBundledTestHooks);
-await rewriteFile('src/striffs.js', stripStriffsRuntimeOverrides);
-await rewriteFile('src/striffs.js', stripOverrideCacheKeys);
-await rewriteFile('src/background.js', stripBackgroundRuntimeOverrides);
-await rewriteFile('src/background.js', stripOverrideCacheKeys);
-await rewriteFile('src/background-utils.js', stripOverrideCacheKeys);
-await rewriteFile('html/shared.js', stripOverrideCacheKeys);
+await rewriteFile('html/popup.html', stripPopupDebugSection, {
+  description: 'popup debug section',
+  mustNotContain: ['id="debugToggle"']
+});
+await rewriteFile('src/striffs.js', disableBundledTestHooks, {
+  description: 'bundled test hooks',
+  mustNotContain: ['stored?.striffsTest === true', 'if (!S.isTest?.()) return;']
+});
+await rewriteFile('src/striffs.js', stripStriffsRuntimeOverrides, {
+  description: 'Striffs runtime overrides',
+  mustNotContain: ['S.setApiBaseOverride = async (base)', 'S.clearApiBaseOverride = async () => new Promise']
+});
+await rewriteFile('src/striffs.js', stripOverrideCacheKeys, {
+  description: 'Striffs override cache keys',
+  mustNotContain: ['"striffsConfigUrl"', '"striffsApiBase"']
+});
+await rewriteFile('src/background.js', stripBackgroundRuntimeOverrides, {
+  description: 'background runtime overrides',
+  mustNotContain: ['stored?.striffsApiBase', "chrome.storage.local.get(['striffsApiBase'])"]
+});
+await rewriteFile('src/background.js', stripOverrideCacheKeys, {
+  description: 'background override cache keys',
+  mustNotContain: ['"striffsConfigUrl"', '"striffsApiBase"']
+});
+await rewriteFile('src/background-utils.js', stripOverrideCacheKeys, {
+  description: 'background-utils override cache keys',
+  mustNotContain: ['"striffsConfigUrl"', '"striffsApiBase"']
+});
+await rewriteFile('html/shared.js', stripOverrideCacheKeys, {
+  description: 'shared override cache keys',
+  mustChange: false,
+  mustNotContain: ['"striffsConfigUrl"', '"striffsApiBase"']
+});
 
 try {
   await execFileAsync('zip', ['-qr', zipPath, '.'], { cwd: stageDir });

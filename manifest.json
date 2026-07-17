@@ -3,6 +3,7 @@
   "name": "Striffs for GitHub",
   "description": "Adds an architectural diff tab to GitHub pull requests.",
   "version": "1.0.3",
+  "minimum_chrome_version": "111",
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self'"
   },
@@ -12,7 +13,8 @@
     "*://*.github.com/*",
     "https://codeload.github.com/*",
     "*://*.striff.io/*",
-    "https://striffs-config.tor1.cdn.digitaloceanspaces.com/*"
+    "https://striffs-config.tor1.cdn.digitaloceanspaces.com/*",
+    "http://localhost:*/*"
   ],
   "background": {
     "service_worker": "src/background.js"

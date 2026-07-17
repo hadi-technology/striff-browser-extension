@@ -198,6 +198,43 @@ async function init() {
   // Show initial status
   const hasToken = await shared.tokenExists();
   setStatus(hasToken ? "Token set." : "", hasToken ? "ok" : "");
+
+  // ---- Feedback prompt ----
+  const FEEDBACK_KEY = "striffsFeedbackAnswered";
+  const OPENS_KEY = "striffsPopupOpens";
+  const FEEDBACK_AFTER_OPENS = 5;
+
+  const feedbackPrompt = document.getElementById("feedbackPrompt");
+  const feedbackReview = document.getElementById("feedbackReview");
+  const feedbackIssue = document.getElementById("feedbackIssue");
+  const feedbackYes = document.getElementById("feedbackYes");
+  const feedbackNo = document.getElementById("feedbackNo");
+
+  if (feedbackPrompt && feedbackYes && feedbackNo) {
+    chrome.storage.local.get([FEEDBACK_KEY, OPENS_KEY], (result) => {
+      if (result[FEEDBACK_KEY]) return;
+      const opens = (result[OPENS_KEY] || 0) + 1;
+      chrome.storage.local.set({ [OPENS_KEY]: opens });
+      if (opens >= FEEDBACK_AFTER_OPENS) {
+        feedbackPrompt.style.display = "";
+      }
+    });
+
+    const dismissFeedback = () => {
+      chrome.storage.local.set({ [FEEDBACK_KEY]: true });
+      feedbackPrompt.style.display = "none";
+    };
+
+    feedbackYes.addEventListener("click", () => {
+      dismissFeedback();
+      if (feedbackReview) feedbackReview.style.display = "";
+    });
+
+    feedbackNo.addEventListener("click", () => {
+      dismissFeedback();
+      if (feedbackIssue) feedbackIssue.style.display = "";
+    });
+  }
 }
 
 document.addEventListener("DOMContentLoaded", init);

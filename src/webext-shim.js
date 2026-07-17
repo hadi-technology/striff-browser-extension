@@ -38,6 +38,51 @@
     remove: wrapAsync((keys) => b.storage[area].remove(keys)),
   });
 
+  const fallbackSessionStore = new Map();
+  const normalizeStorageKeys = (keys) => {
+    if (keys == null) return { mode: 'all', keys: null };
+    if (Array.isArray(keys)) return { mode: 'list', keys };
+    if (typeof keys === 'string') return { mode: 'list', keys: [keys] };
+    if (typeof keys === 'object') return { mode: 'object', keys: Object.keys(keys), defaults: keys };
+    return { mode: 'all', keys: null };
+  };
+  const readFallbackSession = (keys) => {
+    const normalized = normalizeStorageKeys(keys);
+    if (normalized.mode === 'all') {
+      return Object.fromEntries(fallbackSessionStore.entries());
+    }
+    const out = {};
+    for (const key of normalized.keys || []) {
+      if (fallbackSessionStore.has(key)) out[key] = fallbackSessionStore.get(key);
+      else if (normalized.mode === 'object') out[key] = normalized.defaults[key];
+    }
+    return out;
+  };
+  const writeFallbackSession = (items) => {
+    for (const [key, value] of Object.entries(items || {})) {
+      fallbackSessionStore.set(key, value);
+    }
+  };
+  const removeFallbackSession = (keys) => {
+    const normalized = normalizeStorageKeys(keys);
+    for (const key of normalized.keys || []) fallbackSessionStore.delete(key);
+  };
+  const storageSessionArea = (() => {
+    if (b.storage?.session) return storageArea('session');
+    if (b.storage?.local) {
+      return {
+        get: wrapAsync(async (keys) => readFallbackSession(keys)),
+        set: wrapAsync(async (items) => { writeFallbackSession(items); }),
+        remove: wrapAsync(async (keys) => { removeFallbackSession(keys); }),
+      };
+    }
+    return {
+      get: wrapAsync(async (keys) => readFallbackSession(keys)),
+      set: wrapAsync(async (items) => { writeFallbackSession(items); }),
+      remove: wrapAsync(async (keys) => { removeFallbackSession(keys); }),
+    };
+  })();
+
   const tabsApi = {
     query: wrapAsync((queryInfo) => b.tabs.query(queryInfo)),
     sendMessage: (tabId, message, options, cb) => {
@@ -96,6 +141,7 @@
     storage: {
       local: storageArea('local'),
       sync: storageArea('sync'),
+      session: storageSessionArea,
       onChanged: b.storage?.onChanged,
     },
     tabs: tabsApi,

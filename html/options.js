@@ -48,22 +48,18 @@ async function init() {
   const saveBtn    = document.getElementById("save");
   const clearBtn   = document.getElementById("clear");
   const clearCache = document.getElementById("clearCache");
+  const overwritePrompt = document.getElementById("overwritePrompt");
 
-  await refreshBadgeFromStorage();
+  const hasToken = await shared.tokenExists();
+  setTokenBadge(hasToken);
+  if (overwritePrompt) overwritePrompt.style.display = hasToken ? "block" : "none";
   setStatus(""); // start clean
 
-  // Save (with overwrite confirmation)
   saveBtn.addEventListener("click", async () => {
     const token = (input.value || "").trim();
     if (!token) {
       setStatus("Please paste a token.", "error");
       return;
-    }
-
-    // If a token already exists, confirm overwrite
-    if (await shared.tokenExists()) {
-      const ok = confirm("A token is already saved. Do you want to overwrite it?");
-      if (!ok) return;
     }
 
     setBusy(true);
@@ -79,8 +75,9 @@ async function init() {
     try {
       await shared.saveToken(token);
       input.value = ""; // never persist in the field
-      setStatus(`Token saved for this browser session for @${v.login} (${v.type}).`, "ok");
+      setStatus(`Token saved for @${v.login} (${v.type}).`, "ok");
       await refreshBadgeFromStorage();
+      if (overwritePrompt) overwritePrompt.style.display = "block";
     } catch (e) {
       console.error("Save error:", e);
       setStatus("Failed to save token.", "error");
@@ -95,8 +92,9 @@ async function init() {
     try {
       await shared.clearTokenEverywhere();
       input.value = "";
-      setStatus("Token cleared from this browser session.", "ok");
+      setStatus("Token cleared.", "ok");
       await refreshBadgeFromStorage();
+      if (overwritePrompt) overwritePrompt.style.display = "none";
     } catch (e) {
       console.error("Clear error:", e);
       setStatus("Failed to clear token.", "error");

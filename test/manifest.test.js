@@ -8,6 +8,7 @@ const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'manifest
 test('manifest stays on MV3 with minimal extension permissions', () => {
   assert.equal(manifest.manifest_version, 3);
   assert.deepEqual(manifest.permissions, ['storage']);
+  assert.equal(manifest.minimum_chrome_version, '111');
 });
 
 test('content scripts include shared metadata and config helpers before main bundle', () => {

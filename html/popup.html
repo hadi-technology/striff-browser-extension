@@ -6,42 +6,42 @@
   <style>
     body {
       font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, sans-serif;
-      padding: 14px;
+      padding: 10px;
       width: 280px;
       box-sizing: border-box;
     }
     h3 {
-      margin: 0 0 10px;
+      margin: 0 0 6px;
       font-size: 16px;
       font-weight: 600;
     }
     #status {
-      margin: 6px 0 10px;
+      margin: 4px 0 6px;
       font-size: 13px;
     }
     .status-ok { color: #1a7f37; }
     .status-error { color: #d1242f; }
     label {
       display: block;
-      margin: 12px 0 6px;
+      margin: 6px 0 3px;
       font-weight: 500;
       font-size: 13px;
     }
     #ghToken {
       width: 100%;
       box-sizing: border-box;
-      padding: 8px;
+      padding: 6px 8px;
       border: 1px solid #d0d7de;
       border-radius: 6px;
       font-size: 13px;
     }
     .button-row {
       display: flex;
-      gap: 8px;
-      margin-top: 8px;
+      gap: 6px;
+      margin-top: 5px;
     }
     button {
-      padding: 8px 12px;
+      padding: 6px 10px;
       cursor: pointer;
       font-size: 13px;
       border: 1px solid #d0d7de;
@@ -73,22 +73,22 @@
       background: #ffebe9;
     }
     .spacer {
-      margin-top: 16px;
+      margin-top: 10px;
     }
     .section {
-      margin-top: 16px;
-      padding-top: 12px;
+      margin-top: 8px;
+      padding-top: 8px;
       border-top: 1px solid #eaeef2;
     }
     .section-title {
       font-weight: 600;
       font-size: 13px;
-      margin-bottom: 8px;
+      margin-bottom: 4px;
     }
     .section-note {
       color: #57606a;
       font-size: 12px;
-      margin-bottom: 8px;
+      margin-bottom: 4px;
       line-height: 1.4;
     }
     .debug-label {
@@ -103,7 +103,7 @@
       align-items: center;
       gap: 4px;
       font-size: 11px;
-      padding: 3px 8px;
+      padding: 2px 7px;
       border-radius: 999px;
       margin-left: 8px;
       border: 1px solid #d0d7de;
@@ -143,8 +143,8 @@
   </div>
 
   <label for="ghToken">GitHub Token (<a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noreferrer noopener" class="note-link">Create one here</a>)</label>
-  <div class="section-note" style="margin-top: 4px; margin-bottom: 8px;">
-    Required for private repos.
+  <div class="section-note" style="margin-top: 2px; margin-bottom: 4px;">
+    Required for private repos. Saved until you clear it.
   </div>
   <input type="password" id="ghToken" placeholder="Paste token here..." autocomplete="off" />
   <div class="button-row">
@@ -173,8 +173,27 @@
     </a>
   </div>
 
+  <div id="feedbackPrompt" style="display: none; margin-top: 12px; padding: 10px; background: #f6f8fa; border-radius: 6px; border: 1px solid #d0d7de; text-align: center;">
+    <div style="font-weight: 600; font-size: 13px; margin-bottom: 8px;">Enjoying Striffs?</div>
+    <div class="button-row" style="justify-content: center;">
+      <button id="feedbackYes" type="button" class="primary" style="font-size: 12px; padding: 6px 14px;">Yes!</button>
+      <button id="feedbackNo" type="button" style="font-size: 12px; padding: 6px 14px;">Not really</button>
+    </div>
+  </div>
+
+  <div id="feedbackReview" style="display: none; margin-top: 12px; padding: 10px; background: #eef7f0; border-radius: 6px; border: 1px solid #1a7f37; text-align: center;">
+    <div style="font-size: 13px; margin-bottom: 8px;">Great to hear! Consider leaving a review:</div>
+    <a id="reviewLink" href="https://chromewebstore.google.com/detail/striffs-for-github/gcbcjajnjbplgkhnbemlkadgnjnfjoen" target="_blank" rel="noopener noreferrer" class="note-link" style="font-size: 13px; font-weight: 600;">Leave a review</a>
+  </div>
+
+  <div id="feedbackIssue" style="display: none; margin-top: 12px; padding: 10px; background: #fff8c5; border-radius: 6px; border: 1px solid #bf8700; text-align: center;">
+    <div style="font-size: 13px; margin-bottom: 8px;">Sorry to hear that. Let us know what's wrong:</div>
+    <a id="issueLink" href="https://github.com/hadii-tech/striff-browser-extension/issues" target="_blank" rel="noopener noreferrer" class="note-link" style="font-size: 13px; font-weight: 600;">Open an issue</a>
+  </div>
+
   <!-- MV3: no inline scripts; use external file -->
   <script src="../src/webext-shim.js"></script>
+  <script src="../src/background-utils.js"></script>
   <script src="shared.js"></script>
   <script src="popup.js" defer></script>
 </body>

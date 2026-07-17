@@ -40,10 +40,12 @@ if (!CHROME) {
 
 const chrome = spawn(CHROME, [
   `--user-data-dir=${PROFILE_DIR}`,
+  `--disable-extensions-except=${EXT_PATH}`,
   `--load-extension=${EXT_PATH}`,
   '--no-first-run',
   '--no-default-browser-check',
   '--disable-background-networking',
+  '--new-window',
   'chrome://extensions',
   'https://github.com/login'
 ], { stdio: 'ignore', detached: false });

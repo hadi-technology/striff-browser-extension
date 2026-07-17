@@ -10,8 +10,8 @@
     "test": "node --test test/*.test.js",
     "test:unit": "node --test test/*.test.js",
     "test:live": "node test/manual-smoke-live.js",
-    "test:ui": "node test/playwright-skill-test.js",
-    "test:visual": "node test/striffs-visual-tests.js",
+    "test:ui": "node test/manual-smoke-live.js && NEW_UI=1 node test/manual-smoke-live.js",
+    "test:visual": "node test/striffs-visual-tests.js && NEW_UI=1 node test/striffs-visual-tests.js",
     "test:login": "node test/login-github.js",
     "package:extension": "node scripts/package-extension.mjs"
   },

@@ -183,6 +183,9 @@
       '[data-testid="pr-toolbar"]',
       'div[role="toolbar"][data-view-component="true"]',
       'div[aria-label="Pull request toolbar"]',
+      // New PR "changes" experience (2026): CSS-module class, hash suffix changes
+      // per deploy so match on the stable module-name prefix instead.
+      'section[class*="PullRequestFilesToolbar-module"]',
     ],
     filesNode: [
       '#files',
@@ -826,7 +829,7 @@
         engagementWriteToken: null
       };
       S.__lastEngagementContextError = "missing operationId";
-      S.cwarn?.("[Striffs] Engagement context missing operationId", {
+      S.cwarn?.("Engagement context missing operationId", {
         hasToken: Boolean(providedToken),
         resultKeys: result && typeof result === "object" ? Object.keys(result).slice(0, 30) : []
       });
@@ -844,7 +847,7 @@
     };
     if (!S.__engagementCtx.engagementWriteToken) {
       S.__lastEngagementContextError = "missing engagementWriteToken";
-      S.cwarn?.("[Striffs] Engagement context missing engagementWriteToken", {
+      S.cwarn?.("Engagement context missing engagementWriteToken", {
         operationId: opId,
         resultKeys: result && typeof result === "object" ? Object.keys(result).slice(0, 30) : []
       });
@@ -938,8 +941,12 @@
     return String(name).replace(/-/g, '.');
   };
 
+  // Mutates svg in place, stripping scripts/styles/foreignObjects and unsafe
+  // attributes. Does not serialize -- callers that need a string should read
+  // svg.outerHTML themselves; on the hot render path we adopt the node
+  // directly and skip that serialize+reparse cost entirely.
   const sanitizeSvgTree = (svg) => {
-    if (!svg) return '';
+    if (!svg) return;
     const unsafeUrlPattern = /^\s*(?:javascript|vbscript|data)\s*:/i;
 
     for (const node of svg.querySelectorAll('script,style,foreignObject')) {
@@ -963,14 +970,16 @@
         }
       }
     }
-
-    return svg.outerHTML;
   };
 
   // Sanitize SVG content before DOM injection to prevent XSS
-  // Uses DOMParser to parse SVG, then removes potentially dangerous elements
-  S.sanitizeSvg = (svgString) => {
-    if (!svgString || typeof svgString !== 'string') return '';
+  // Uses DOMParser to parse SVG, then removes potentially dangerous elements.
+  // Returns the sanitized Element directly (not a string) so callers can adopt
+  // it into the document without a second serialize+parse round-trip -- for
+  // large diagrams (thousands of nodes) that round-trip was a measurable chunk
+  // of the render-time page freeze.
+  S.sanitizeSvgToNode = (svgString) => {
+    if (!svgString || typeof svgString !== 'string') return null;
     try {
       const parser = new DOMParser();
       let doc = parser.parseFromString(svgString, 'image/svg+xml');
@@ -980,22 +989,28 @@
         const container = document.createElement('div');
         container.innerHTML = svgString;
         const svg = container.querySelector('svg');
-        if (!svg) return '';
-        const sanitizedHtmlSvg = sanitizeSvgTree(svg);
-        // Re-serialize through XML parser for consistent output
-        doc = parser.parseFromString(sanitizedHtmlSvg, 'image/svg+xml');
-        if (doc.querySelector('parsererror')) {
-          // Still broken after re-serialization, return the HTML-sanitized version
-          return sanitizedHtmlSvg;
-        }
+        if (!svg) return null;
+        sanitizeSvgTree(svg);
+        // Re-parse through the XML parser for consistent namespacing; this
+        // extra round-trip only happens on the rare malformed-input path.
+        const reparsed = parser.parseFromString(svg.outerHTML, 'image/svg+xml');
+        return reparsed.querySelector('parsererror') ? svg : reparsed.documentElement;
       }
 
       const svg = doc.documentElement;
-      return sanitizeSvgTree(svg);
+      sanitizeSvgTree(svg);
+      return svg;
     } catch (e) {
       S.cwarn?.('SVG sanitization failed', e);
-      return '';
+      return null;
     }
+  };
+
+  // String-returning variant kept for compatibility; prefer sanitizeSvgToNode
+  // on hot paths (see comment above).
+  S.sanitizeSvg = (svgString) => {
+    const svg = S.sanitizeSvgToNode(svgString);
+    return svg ? svg.outerHTML : '';
   };
 
   try {
@@ -1085,12 +1100,13 @@
     lastEventType: S.__engagementLastEventType || null
   });
 
-  S.getPrimaryDiagramSvg = () =>
-    S.__striffsSvg ||
-    document.querySelector('#striffs-content .striff-svg-wrap > svg') ||
-    document.querySelector('#striffs-content > svg') ||
-    document.querySelector('#striff-diagram-view #striffs-content svg') ||
-    null;
+  S.getPrimaryDiagramSvg = () => {
+    if (S.__striffsSvg && document.body.contains(S.__striffsSvg)) return S.__striffsSvg;
+    return document.querySelector('#striffs-content .striff-svg-wrap > svg') ||
+      document.querySelector('#striffs-content > svg') ||
+      document.querySelector('#striff-diagram-view #striffs-content svg') ||
+      null;
+  };
 
   // ---------- Remote config / kill-switch ----------
   S.storageGet = S.storageGet || ((area, keys) => new Promise((resolve) => {
@@ -1356,7 +1372,7 @@
     S.__aiReviewPollInFlight = false;
     S.__aiReviewPollStartedAt = null;
     if (reason && S.isDebug?.()) {
-      S.cinfo?.("[Striffs] Enrichment polling cancelled", { reason });
+      S.cinfo?.("Enrichment polling cancelled", { reason });
     }
   };
 
@@ -1744,7 +1760,10 @@
         const section = node.matches?.('section') ? node : node.querySelector?.('section');
         if (section) {
             const h2 = section.querySelector('h2.sr-only');
-            if (h2 && h2.textContent.trim() === 'Pull Request Toolbar') return true;
+            // Case-insensitive: GitHub has changed this label's casing before
+            // (e.g. "Pull Request Toolbar" -> "Pull request toolbar") without
+            // changing the underlying structure.
+            if (h2 && /^pull request toolbar$/i.test(h2.textContent.trim())) return true;
         }
         return false;
     };
@@ -1992,7 +2011,10 @@
 
         document.querySelectorAll('section').forEach(sec => {
             const h2 = sec.querySelector('h2.sr-only');
-            if (h2 && h2.textContent.trim() === 'Pull Request Toolbar') {
+            // Case-insensitive: GitHub has changed this label's casing before
+            // (e.g. "Pull Request Toolbar" -> "Pull request toolbar") without
+            // changing the underlying structure.
+            if (h2 && /^pull request toolbar$/i.test(h2.textContent.trim())) {
                 push(sec);
             }
         });
@@ -2185,47 +2207,45 @@
                   S.applyNoChangesUiState?.("No changes were found");
                   return;
               }
-              // Early check for private repo without token
-              const token = await S.getStoredToken?.();
-              if (!token && S.isPrivateRepo?.()) {
-                  S.updateStriffButton({ neutral: true, disabled: true, tooltip: "Token required" });
-                  return;
-              }
-              // If diagram is ready and SVG is still in the document, just show Striffs.
-              // GitHub SPA navigation can detach __striffsSvg from the DOM even though
-              // the reference is still held — treat that as "not ready".
-              const svgAttached = S.__striffsSvg && document.body.contains(S.__striffsSvg);
-              if (S.__striffsReady && svgAttached) {
+              // If the diagram is ready, just show it — synchronously, with no
+              // await in front of it. GitHub SPA navigation can detach
+              // __striffsSvg's container from the DOM even though the
+              // reference is still held, but the node itself is still fully
+              // usable — showStriffView() already re-attaches it into a fresh
+              // container when needed. Previously this path discarded the
+              // in-memory SVG and forced a full autoFetchStriffs() cycle on
+              // every detach, which is what made switching back to the
+              // Striffs view look like a "reload" even though nothing had
+              // actually changed. The token check below (which round-trips to
+              // the background service worker, and can be slow if MV3 has
+              // terminated it after idling) only matters when we're about to
+              // fetch fresh data, so it must not gate this already-ready path.
+              if (S.__striffsReady && S.__striffsSvg) {
                   S.showStriffView();
                   S.saveActiveTab('striffs');
                 return;
             }
 
-            // If SVG is detached, clear the stale reference so we re-render from cache.
-            if (S.__striffsReady && S.__striffsSvg && !svgAttached) {
-                S.__striffsSvg = null;
-            }
-
-            // FIRST PHASE: diagram not ready yet → generate then show Striffs.
-            if (!S.__striffsReady || !S.__striffsSvg) {
-                S.updateStriffButton({
-                    loading: true,
-                    tooltip: "Generating",
-                    phase: "Analyzing"
-                });
-
-                  const ok = await S.autoFetchStriffs();
-                  // autoFetchStriffs sets button to success/neutral/error and
-                  // updates __striffsReady / __striffsSvg.
-                  if (!ok || S.__striffsNoChanges || !S.__striffsReady || !S.__striffsSvg) return;
-
-                  // Show Striffs immediately after a successful generation.
-                  S.showStriffView();
-                S.saveActiveTab('striffs');
+            // Early check for private repo without token
+            const token = await S.getStoredToken?.();
+            if (!token && S.isPrivateRepo?.()) {
+                S.updateStriffButton({ neutral: true, disabled: true, tooltip: "Token required" });
                 return;
             }
 
-            // SECOND PHASE: diagram ready → always show Striffs view.
+            // Diagram not ready yet (checked above) → generate then show Striffs.
+            S.updateStriffButton({
+                loading: true,
+                tooltip: "Generating",
+                phase: "Analyzing"
+            });
+
+            const ok = await S.autoFetchStriffs();
+            // autoFetchStriffs sets button to success/neutral/error and
+            // updates __striffsReady / __striffsSvg.
+            if (!ok || S.__striffsNoChanges || !S.__striffsReady || !S.__striffsSvg) return;
+
+            // Show Striffs immediately after a successful generation.
             S.showStriffView();
             S.saveActiveTab('striffs');
         };
@@ -4756,7 +4776,7 @@
     if (!mappedId) {
       // Debug: log why the lookup failed (only in debug mode)
       if (S.isDebug?.()) {
-        S.cwarn?.('[Striffs][findSvgTextForFile] Not found in path->component map', {
+        S.cwarn?.('[findSvgTextForFile] Not found in path->component map', {
           fullPath,
           norm,
           lookupKey,
@@ -5385,7 +5405,7 @@
           parsed = entry;
         }
       }
-      S.cinfo?.('[Striffs] primeDiagramFromCache read result', {
+      S.cinfo?.('primeDiagramFromCache read result', {
         cacheKey: key,
         hasParsed: !!parsed,
         parsedSavedAt: parsed?.savedAt || null,
@@ -5409,7 +5429,7 @@
           window.__striffsCacheKey = key || null;
           window.__striffsCacheMeta = parsed?.savedAt || null;
         } catch {}
-        S.cinfo?.('[Striffs] Cache validation', {
+        S.cinfo?.('Cache validation', {
           cacheKey: key,
           expectedCommitCount: currentCount,
           storedCommitCount: storedCount,
@@ -5425,7 +5445,7 @@
             : !freshTime
               ? 'ttl_expired'
               : `invalid_payload:${validationError}`;
-          S.cwarn?.('[Striffs] Cache rejected', { cacheKey: key, reason });
+          S.cwarn?.('Cache rejected', { cacheKey: key, reason });
           return false;
 	        }
           const cachedOperationId = String(parsed?.cachedOperationId || '').trim();
@@ -5644,13 +5664,19 @@
                 content.innerHTML = `<div id="striffs-status">Rendering diagram…</div>`;
                 const wrap = document.createElement("div");
                 wrap.className = "striff-svg-wrap";
-                // Sanitize SVG before DOM injection to prevent XSS
-                wrap.innerHTML = S.sanitizeSvg(svgText);
+                // Sanitize SVG before DOM injection to prevent XSS. Adopting the
+                // sanitized node directly (instead of round-tripping through
+                // outerHTML + innerHTML) avoids a second full parse of large
+                // diagrams, which was a measurable chunk of the render freeze.
+                const sanitizedSvg = S.sanitizeSvgToNode?.(svgText);
+                if (sanitizedSvg) {
+                    wrap.appendChild(document.adoptNode(sanitizedSvg));
+                }
                 content.appendChild(wrap);
 
                 const svg = wrap.querySelector("svg");
                 if (S.isDebug?.() && !svg) {
-                    S.cwarn?.("[Striffs][debug] svg not found after render");
+                    S.cwarn?.("[debug] svg not found after render");
                 }
                 if (svg) {
                     S.sanitizeSvgDimensions(svg);
@@ -5682,8 +5708,7 @@
                     S.__striffsSvg = svg;
                     S.buildPathIdMapping(data);
                     S.scheduleFileTreeAvailabilityRefresh?.();
-                    S.applyHoverability(); // now colors clickable text
-                    S.applyCommentAffordances?.();
+                    S.applyHoverability(); // now colors clickable text; also applies comment affordances
                     S.reapplySelectionHighlights?.();
                     S.applyPendingFocus?.();
                     S.queueReviewNoteFeedbackLayout?.();
@@ -5911,7 +5936,13 @@
       S.setEntitySelectionHighlight?.(id, true);
     }
     S.updateCommentPanelSelection?.();
-    S.reapplySelectionHighlights?.();
+    // setEntitySelectionHighlight above already updated this entity's own
+    // highlight class and +/- affordance text — no need for the full
+    // clear-and-rebuild-every-affordance pass that reapplySelectionHighlights
+    // does. That used to run on every single click (potentially hundreds of
+    // DOM node teardown/recreate cycles for large diagrams), which made
+    // rapid clicking flaky since the browser could hit-test a fresh click
+    // against affordance nodes mid-rebuild.
     S.schedulePreviewRequest?.();
   };
 
@@ -6516,8 +6547,11 @@
       S.clog?.('[review] Write tab switch attempted but may not have succeeded', e?.message);
     }
 
-    // Step 4: Set the component list text — always clear any previous unposted content
-    const commentText = buildReviewDraftTemplate(contextBlock, "");
+    // Step 4: Preserve any draft the reviewer already typed — append the context
+    // block after it rather than discarding it (a destroyed in-progress review
+    // draft has no undo).
+    const existingDraftText = String(textarea.value || "").trim();
+    const commentText = buildReviewDraftTemplate(contextBlock, existingDraftText);
     textarea.focus();
     try {
       const nativeSetter = Object.getOwnPropertyDescriptor(
@@ -6529,12 +6563,15 @@
     }
     const reviewDraftSnapshot = {
       contextBlock,
-      initialDraftText: "",
+      initialDraftText: existingDraftText,
       submittedText: commentText
     };
-    // Place cursor at the top so the user starts typing their message there
+    // If there was an existing draft, place the cursor right after it (before the
+    // appended context block) so the reviewer continues typing where they left
+    // off. Otherwise, place it at the top as before.
     try {
-      textarea.setSelectionRange(0, 0);
+      const cursorPos = existingDraftText ? existingDraftText.length : 0;
+      textarea.setSelectionRange(cursorPos, cursorPos);
     } catch {}
     textarea.dispatchEvent(new Event("input", { bubbles: true }));
 
@@ -6655,7 +6692,13 @@
 
   function isReviewTextareaCandidate(textarea) {
     if (!(textarea instanceof HTMLTextAreaElement)) return false;
-    if (!isReviewComposerVisible(textarea)) return false;
+    // Deliberately not gated on isReviewComposerVisible: an already-open review
+    // box left on the Preview tab has its textarea hidden but still present and
+    // reusable. Rejecting it here caused findReviewTextarea() to return null,
+    // which sent fillComposer down the "click review button again" path instead
+    // of the write-tab-switch recovery below — so a second "start review" with a
+    // new diagram silently failed to update the box while on Preview.
+    if (!textarea.isConnected) return false;
     const scope = textarea.closest(
       '[class*="CommentBox"], [class*="MarkdownEditor"], [class*="review"], [data-testid*="review"], form, details'
     );
@@ -7055,30 +7098,6 @@
         overflow-y:auto;
         padding:16px;
       }
-      .striffs-arch-review-panel__risk{
-        display:flex;
-        align-items:center;
-        gap:8px;
-        margin-bottom:16px;
-        padding:10px 14px;
-        border-radius:10px;
-        font-weight:700;
-        font-size:13px;
-        background:var(--bgColor-muted,#f6f8fa);
-        border:1px solid var(--borderColor-muted,#d8dee4);
-        color:var(--fgColor-default,#1f2328);
-      }
-      .striffs-arch-review-panel__risk::before{
-        content:"";
-        width:0.5rem;
-        height:0.5rem;
-        border-radius:999px;
-        flex-shrink:0;
-      }
-      .striffs-arch-review-panel__risk--LOW::before{background:#1a7f37;}
-      .striffs-arch-review-panel__risk--MEDIUM::before{background:#d97706;}
-      .striffs-arch-review-panel__risk--HIGH::before{background:#cf222e;}
-      .striffs-arch-review-panel__risk--CRITICAL::before{background:#cf222e;}
       .striffs-arch-review-panel__section{
         margin-bottom:16px;
       }
@@ -7108,8 +7127,8 @@
       }
       .striffs-arch-review-panel__item{
         display:flex;
-        align-items:flex-start;
-        gap:10px;
+        flex-direction:column;
+        gap:8px;
         padding:12px 13px;
         border:1px solid rgba(15,23,42,.08);
         border-radius:10px;
@@ -7127,29 +7146,35 @@
       }
       .striffs-arch-review-panel__item-header{
         display:flex;
-        align-items:flex-start;
+        align-items:center;
         gap:8px;
-        flex:1;
         min-width:0;
       }
       .striffs-arch-review-panel__item-severity{
         display:inline-flex;
         align-items:center;
-        gap:3px;
-        min-width:52px;
-        padding:3px 7px;
-        border-radius:6px;
+        gap:4px;
+        padding:3px 10px;
+        border-radius:999px;
         font-size:10px;
         font-weight:800;
         text-transform:uppercase;
         letter-spacing:.05em;
         flex-shrink:0;
-        margin-top:1px;
       }
-      .striffs-arch-review-panel__item-severity-icon{
-        width:9px;
-        height:9px;
+      #striff-diagram-view .striffs-arch-review-panel__item-severity-icon{
+        width:10px;
+        height:10px;
         flex-shrink:0;
+      }
+      .striffs-arch-review-panel__code{
+        font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",Menlo,monospace;
+        font-weight:700;
+        font-size:85%;
+        background:rgba(175,184,193,.2);
+        padding:.1em .4em;
+        border-radius:6px;
+        white-space:break-spaces;
       }
       .striffs-arch-review-panel__item-severity--HIGH,
       .striffs-arch-review-panel__item-severity--CRITICAL{background:rgba(207,34,46,.1);color:#cf222e;}
@@ -7157,22 +7182,22 @@
       .striffs-arch-review-panel__item-severity--LOW{background:rgba(26,127,55,.1);color:#1a7f37;}
       .striffs-arch-review-panel__item-body{
         min-width:0;
-        flex:1;
       }
       .striffs-arch-review-panel__item-title{
         font-weight:700;
-        font-size:13px;
+        font-size:14px;
         line-height:1.35;
         color:var(--fgColor-default,#1f2328);
+        min-width:0;
       }
       .striffs-arch-review-panel__item-text{
-        font-size:12px;
+        font-size:13px;
         line-height:1.6;
         color:var(--fgColor-muted,#6e7781);
         margin-top:4px;
       }
       .striffs-arch-review-panel__item-action{
-        font-size:12px;
+        font-size:13px;
         line-height:1.6;
         color:var(--fgColor-accent,#0969da);
         margin-top:4px;
@@ -7389,7 +7414,39 @@
       };
 
         S.__onDiagramClick = (e) => {
-        if (!S.__striffsSvg) return;
+        // S.__striffsSvg can go stale (null, or pointing at a node GitHub's
+        // SPA navigation detached from the document) while the diagram is
+        // still visibly showing. Self-heal by re-querying the live SVG
+        // instead of silently no-oping — a stale/null check here previously
+        // caused clicks to do nothing with zero console output, since the
+        // logging below is never reached.
+        let svg = S.__striffsSvg;
+        if (!svg || !document.body.contains(svg)) {
+          svg = S.getPrimaryDiagramSvg?.();
+          if (!svg) return;
+          if (svg !== S.__striffsSvg) {
+            S.clog?.('[diagram-click] recovered stale/detached svg reference');
+            S.__striffsSvg = svg;
+          }
+        }
+        // A click that immediately follows a pan-drag is a spurious mouseup
+        // artifact, not an intentional click — suppress it before routing to
+        // either the comment-selection handler or normal navigation. This
+        // must run before the comment-mode branch below; it previously only
+        // guarded the non-comment-mode path, so panning while in comment
+        // mode could toggle the wrong component (or hit blank canvas and
+        // log "abort: no entity target").
+        const debounceMs = S.PAN_CLICK_DEBOUNCE_MS || 250;
+        if (S.__recentPanAt && (Date.now() - S.__recentPanAt) < debounceMs) {
+          S.__recentPanAt = 0;
+          const target = e.target.closest?.("g.entity[data-qualified-name]");
+          S.syncDiagramClickDebugState?.("ignored-recent-pan", {
+            componentQualifiedName: target?.getAttribute("data-qualified-name") || null,
+            reason: "recent pan debounce",
+            targetFound: Boolean(target)
+          });
+          return;
+        }
         // In comment mode: intercept all entity clicks for selection
         if (S.__commentState?.active) {
           S.clog?.('[diagram-click] comment mode active, handling');
@@ -7420,16 +7477,6 @@
           S.syncDiagramClickDebugState?.("ignored-note", {
             componentQualifiedName: target.getAttribute("data-qualified-name") || null,
             reason: "review note nodes are not navigable",
-            targetFound: true
-          });
-          return;
-        }
-        const debounceMs = S.PAN_CLICK_DEBOUNCE_MS || 250;
-        if (S.__recentPanAt && (Date.now() - S.__recentPanAt) < debounceMs) {
-          S.__recentPanAt = 0;
-          S.syncDiagramClickDebugState?.("ignored-recent-pan", {
-            componentQualifiedName: target.getAttribute("data-qualified-name") || null,
-            reason: "recent pan debounce",
             targetFound: true
           });
           return;
@@ -7865,7 +7912,7 @@
           )
         )) {
           quotaExceeded = true;
-          S.cwarn?.('[Striffs] localStorage quota exceeded - cache not written to localStorage', e);
+          S.cwarn?.('localStorage quota exceeded - cache not written to localStorage', e);
         }
       }
       try {
@@ -7873,7 +7920,7 @@
       } catch {}
       // If quota was exceeded, surface a debug warning
       if (quotaExceeded) {
-        S.cwarn?.('[Striffs] localStorage quota exceeded - consider clearing cache or using IndexedDB');
+        S.cwarn?.('localStorage quota exceeded - consider clearing cache or using IndexedDB');
       }
       return wrotePayload;
     } catch {
@@ -8075,28 +8122,26 @@
     INFORMATIONAL_SIGNAL: "Informational Signal"
   };
 
+  function escHtmlWithCode(s) {
+    return escHtml(s).replace(/`([^`]+)`/g, '<code class="striffs-arch-review-panel__code">$1</code>');
+  }
+
   function buildArchReviewPanelHtml(result) {
     const summary = result?.reviewSummary || {};
     const surfacedItems = Array.isArray(result?.surfacedItems) ? result.surfacedItems : [];
     const findings = Array.isArray(result?.findings) ? result.findings : [];
-    const keyFindings = Array.isArray(summary.keyFindings) ? summary.keyFindings : [];
-    const hasContent = keyFindings.length > 0 || surfacedItems.length > 0 || findings.length > 0;
+    const hasContent = surfacedItems.length > 0 || findings.length > 0;
 
-    let bodyHtml = "";
-
-    // Highest-priority badge, driven by SurfacedReviewPriority (Structural Regression >
-    // Review Hotspot) instead of the retired riskLevel field -- riskLevel and the priority
-    // model were computed independently server-side and could disagree (ADR-013 Part D).
+    // Driven by SurfacedReviewPriority (Structural Regression > Review Hotspot) instead of
+    // the retired riskLevel field -- riskLevel and the priority model were computed
+    // independently server-side and could disagree (ADR-013 Part D).
     const highestPriority = surfacedItems.some(item => item.priority === "STRUCTURAL_REGRESSION")
         ? "STRUCTURAL_REGRESSION"
         : surfacedItems.some(item => item.priority === "REVIEW_HOTSPOT")
             ? "REVIEW_HOTSPOT"
             : null;
-    const severityTier = highestPriority ? SURFACED_PRIORITY_SEVERITY[highestPriority] : "LOW";
-    const priorityLabel = highestPriority ? SURFACED_PRIORITY_LABEL[highestPriority] : "No structural concerns";
-    bodyHtml += `<div class="striffs-arch-review-panel__risk striffs-arch-review-panel__risk--${severityTier}">
-      Highest priority: ${priorityLabel}
-    </div>`;
+
+    let bodyHtml = "";
 
     if (!hasContent && (!summary.overview || !highestPriority)) {
       bodyHtml += `<div class="striffs-arch-review-panel__good">
@@ -8109,15 +8154,7 @@
       if (summary.overview) {
         bodyHtml += `<div class="striffs-arch-review-panel__section">
           <div class="striffs-arch-review-panel__section-title">Overview</div>
-          <div class="striffs-arch-review-panel__overview">${escHtml(summary.overview) || ""}</div>
-        </div>`;
-      }
-
-      // Key Findings
-      if (keyFindings.length > 0) {
-        bodyHtml += `<div class="striffs-arch-review-panel__section">
-          <div class="striffs-arch-review-panel__section-title">Key Findings</div>
-          ${keyFindings.map(f => `<div class="striffs-arch-review-panel__finding">${escHtml(f) || ""}</div>`).join("")}
+          <div class="striffs-arch-review-panel__overview">${escHtmlWithCode(summary.overview) || ""}</div>
         </div>`;
       }
 
@@ -8133,12 +8170,14 @@
             const sevClass = ["HIGH","CRITICAL"].includes(severity) ? severity : severity === "MEDIUM" ? "MEDIUM" : "LOW";
             const badgeLabel = SURFACED_PRIORITY_LABEL[rawPriority] || sevClass;
             return `<div class="striffs-arch-review-panel__item striffs-arch-review-panel__item--${sevClass}">
-              <span class="striffs-arch-review-panel__item-severity striffs-arch-review-panel__item-severity--${sevClass}">${SEVERITY_ICON_SVG}${badgeLabel}</span>
+              <div class="striffs-arch-review-panel__item-header">
+                <span class="striffs-arch-review-panel__item-severity striffs-arch-review-panel__item-severity--${sevClass}">${SEVERITY_ICON_SVG}${badgeLabel}</span>
+              </div>
+              <div class="striffs-arch-review-panel__item-title">${escHtmlWithCode(item.title || "") || ""}</div>
               <div class="striffs-arch-review-panel__item-body">
-                <div class="striffs-arch-review-panel__item-title">${escHtml(item.title || "") || ""}</div>
-                ${item.whyShown ? `<div class="striffs-arch-review-panel__item-text">${escHtml(item.whyShown) || ""}</div>` : ""}
-                ${item.reviewAction ? `<div class="striffs-arch-review-panel__item-action">→ ${escHtml(item.reviewAction) || ""}</div>` : ""}
-                ${item.suggestedDirection ? `<div class="striffs-arch-review-panel__item-action">💡 ${escHtml(item.suggestedDirection) || ""}</div>` : ""}
+                ${item.whyShown ? `<div class="striffs-arch-review-panel__item-text">${escHtmlWithCode(item.whyShown) || ""}</div>` : ""}
+                ${item.reviewAction ? `<div class="striffs-arch-review-panel__item-action">→ ${escHtmlWithCode(item.reviewAction) || ""}</div>` : ""}
+                ${item.suggestedDirection && item.suggestedDirection !== item.reviewAction ? `<div class="striffs-arch-review-panel__item-action">💡 ${escHtmlWithCode(item.suggestedDirection) || ""}</div>` : ""}
               </div>
             </div>`;
           }).join("")}
@@ -8153,10 +8192,12 @@
             const severity = String(f.severity || "LOW").toUpperCase();
             const sevClass = ["HIGH","CRITICAL"].includes(severity) ? severity : severity === "MEDIUM" ? "MEDIUM" : "LOW";
             return `<div class="striffs-arch-review-panel__item striffs-arch-review-panel__item--${sevClass}">
-              <span class="striffs-arch-review-panel__item-severity striffs-arch-review-panel__item-severity--${sevClass}">${SEVERITY_ICON_SVG}${sevClass}</span>
+              <div class="striffs-arch-review-panel__item-header">
+                <span class="striffs-arch-review-panel__item-severity striffs-arch-review-panel__item-severity--${sevClass}">${SEVERITY_ICON_SVG}${sevClass}</span>
+              </div>
+              <div class="striffs-arch-review-panel__item-title">${escHtmlWithCode(f.title || "") || ""}</div>
               <div class="striffs-arch-review-panel__item-body">
-                <div class="striffs-arch-review-panel__item-title">${escHtml(f.title || "") || ""}</div>
-                ${f.summary ? `<div class="striffs-arch-review-panel__item-text">${escHtml(f.summary) || ""}</div>` : ""}
+                ${f.summary ? `<div class="striffs-arch-review-panel__item-text">${escHtmlWithCode(f.summary) || ""}</div>` : ""}
               </div>
             </div>`;
           }).join("")}
@@ -8355,11 +8396,11 @@
     const operationId = String(S.__engagementCtx?.operationId || S.__aiReviewOperationId || "").trim();
     const engagementToken = String(S.__engagementCtx?.engagementWriteToken || "").trim();
     if (!(status === "PENDING" || status === "RUNNING")) {
-      S.cinfo?.("[Striffs] Enrichment polling skipped: status not pollable", { status, reason });
+      S.cinfo?.("Enrichment polling skipped: status not pollable", { status, reason });
       return false;
     }
     if (!operationId || !engagementToken) {
-      S.cwarn?.("[Striffs] Enrichment polling skipped: missing engagement context", {
+      S.cwarn?.("Enrichment polling skipped: missing engagement context", {
         status,
         operationId,
         hasEngagementToken: Boolean(engagementToken),
@@ -8381,13 +8422,17 @@
       // Check if polling has exceeded the timeout
       if (S.__aiReviewPollStartedAt && (Date.now() - S.__aiReviewPollStartedAt) > S.ENRICHMENT_POLL_TIMEOUT_MS) {
         S.cancelEnrichmentPolling?.("timeout");
+        S.__aiReviewStatus = "FAILED";
         S.updateStriffButton?.({ success: true, tooltip: "AI review timed out. Base diagram is still available." });
+        S.updateArchReviewButton?.();
         S.toast?.("AI enrichment timed out after 2 minutes.", "neutral", { timeoutMs: 5000 });
         return;
       }
 
       if (String(S.__engagementCtx?.operationId || S.__aiReviewOperationId || "").trim() !== expectedOperationId) {
         S.cancelEnrichmentPolling?.("operation-mismatch");
+        S.__aiReviewStatus = null;
+        S.updateArchReviewButton?.();
         return;
       }
       S.__aiReviewPollInFlight = true;
@@ -8398,7 +8443,7 @@
           timeoutMs: 15000
         });
         if (!resp?.ok) {
-          S.cwarn?.("[Striffs] AI review status poll failed", {
+          S.cwarn?.("AI review status poll failed", {
             status: Number(resp?.status || 0) || null,
             error: String(resp?.error || ""),
             operationId: expectedOperationId,
@@ -8408,7 +8453,9 @@
           });
           if (Number(resp?.status || 0) === 403) {
             S.cancelEnrichmentPolling?.("poll-forbidden");
+            S.__aiReviewStatus = "FAILED";
             S.updateStriffButton?.({ success: true, tooltip: "AI review unavailable. Authorization required." });
+            S.updateArchReviewButton?.();
             return;
           }
           const retryMs = Math.max(2000, Number(S.__lastAiReviewPollAfterMs || 5000));
@@ -8444,6 +8491,9 @@
           return;
         }
         S.cancelEnrichmentPolling?.("terminal-unknown");
+        S.__aiReviewStatus = "FAILED";
+        S.updateStriffButton?.({ success: true, tooltip: "AI review returned an unexpected status. Base diagram is still available." });
+        S.updateArchReviewButton?.();
       } catch (e) {
         const retryMs = Math.max(2000, Number(S.__lastAiReviewPollAfterMs || 5000));
         S.__aiReviewPollTimer = setTimeout(() => S.startEnrichmentPolling?.({ immediate: true, reason: "retry-exception" }), retryMs);
@@ -8453,7 +8503,7 @@
     };
 
     if (reason && S.isDebug?.()) {
-      S.cinfo?.("[Striffs] Enrichment polling scheduled", { reason, pollDelayMs, operationId: expectedOperationId });
+      S.cinfo?.("Enrichment polling scheduled", { reason, pollDelayMs, operationId: expectedOperationId });
     }
     S.__aiReviewPollTimer = setTimeout(poll, pollDelayMs);
     return true;
@@ -9393,7 +9443,7 @@
             if (!/Failed to fetch|NetworkError|fetch/i.test(message) || attempt === 3) {
               throw e;
             }
-            S.cwarn?.('[Striffs] Engagement context refresh attempt failed; retrying', {
+            S.cwarn?.('Engagement context refresh attempt failed; retrying', {
               attempt,
               error: message
             });
@@ -9453,6 +9503,11 @@
 	    const engagementReady = S.updateEngagementContextFromResult?.(result);
 	    if (!engagementReady) {
 	      S.cwarn?.('Engagement telemetry not available for this response');
+	      // The initial response can omit the write token even when an operationId
+	      // is present (backend attaches it slightly after operation creation).
+	      // Retry once in the background so telemetry arms without requiring the
+	      // user to trigger AI Review or comment mode first.
+	      S.refreshEngagementContextFromFreshResult?.(meta)?.catch?.(() => {});
 	    }
       const aiReviewStatus = S.syncAiReviewStateFromResult?.(result);
 	    S.debugDump?.("render result payload summary", {
@@ -9873,7 +9928,6 @@
             reviewSummary: extras.reviewSummary || (status === 'READY' ? {
               headline: 'Manual test review',
               overview: 'This is a manual smoke test review.',
-              keyFindings: [],
               changedComponents: 1,
               totalComponents: 1
             } : undefined),
@@ -10456,7 +10510,7 @@
         String(S.__engagementCtx?.engagementWriteToken || '').trim()
       );
       if (!hasCachedCtx) {
-        S.cwarn?.('[Striffs] Engagement context missing after cache load — will be obtained on next generation');
+        S.cwarn?.('Engagement context missing after cache load — will be obtained on next generation');
       }
     }
 
@@ -10512,7 +10566,7 @@
   } catch (e) {
     S.__striffsErrors = S.__striffsErrors || [];
     S.__striffsErrors.push({ where: 'addSpinAnimation', error: String(e) });
-    S.cerr?.('[Striffs] addSpinAnimation failed', e);
+    S.cerr?.('addSpinAnimation failed', e);
   }
 
   setTimeout(() => {
@@ -10670,7 +10724,7 @@
 
       await S.completeFilesPageBoot?.(filesRoot);
     } catch (e) {
-      S.cwarn?.('[Striffs] nav boot skipped', e);
+      S.cwarn?.('nav boot skipped', e);
     } finally {
       // Clear booting flag to allow subsequent boots
       booting = false;
