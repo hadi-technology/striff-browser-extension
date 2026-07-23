@@ -7141,7 +7141,7 @@
         overflow:hidden;
         transition:width .25s ease,border-left .25s ease,box-shadow .25s ease;
         font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
-        font-size:13px;
+        font-size:15px;
         color:var(--fgColor-default,#1f2328);
       }
       .striffs-arch-review-panel--open{
@@ -7159,14 +7159,14 @@
         background:var(--bgColor-accent-muted,#f0f6ff);
       }
       .striffs-arch-review-panel__title{
-        font-size:14px;
+        font-size:16px;
         font-weight:600;
         color:var(--fgColor-default,#1f2328);
       }
       .striffs-arch-review-panel__close{
         background:none;
         border:none;
-        font-size:18px;
+        font-size:21px;
         cursor:pointer;
         color:var(--fgColor-muted,#6e7781);
         padding:0 4px;
@@ -7184,7 +7184,7 @@
         margin-bottom:16px;
       }
       .striffs-arch-review-panel__section-title{
-        font-size:12px;
+        font-size:13px;
         font-weight:600;
         text-transform:uppercase;
         letter-spacing:.04em;
@@ -7211,7 +7211,7 @@
         display:flex;
         flex-direction:column;
         gap:8px;
-        padding:12px 13px;
+        padding:14px 15px;
         border:1px solid rgba(15,23,42,.08);
         border-radius:10px;
         margin-bottom:10px;
@@ -7243,17 +7243,17 @@
         display:inline-flex;
         align-items:center;
         gap:4px;
-        padding:3px 10px;
+        padding:4px 11px;
         border-radius:999px;
-        font-size:10px;
+        font-size:12px;
         font-weight:800;
         text-transform:uppercase;
         letter-spacing:.05em;
         flex-shrink:0;
       }
       #striff-diagram-view .striffs-arch-review-panel__item-severity-icon{
-        width:10px;
-        height:10px;
+        width:12px;
+        height:12px;
         flex-shrink:0;
       }
       .striffs-arch-review-panel__code{
@@ -7271,7 +7271,7 @@
       .striffs-arch-review-panel__item-severity--LOW{background:rgba(26,127,55,.1);color:#1a7f37;}
       .striffs-arch-review-panel__item-severity--DOC{background:rgba(130,80,223,.1);color:#8250df;}
       .striffs-arch-review-panel__item-docs{
-        font-size:13px;
+        font-size:15px;
         line-height:1.6;
         color:#8250df;
         margin-top:4px;
@@ -7281,19 +7281,19 @@
       }
       .striffs-arch-review-panel__item-title{
         font-weight:700;
-        font-size:14px;
+        font-size:16px;
         line-height:1.35;
         color:var(--fgColor-default,#1f2328);
         min-width:0;
       }
       .striffs-arch-review-panel__item-text{
-        font-size:13px;
+        font-size:15px;
         line-height:1.6;
         color:var(--fgColor-muted,#6e7781);
         margin-top:4px;
       }
       .striffs-arch-review-panel__item-action{
-        font-size:13px;
+        font-size:15px;
         line-height:1.6;
         color:var(--fgColor-accent,#0969da);
         margin-top:4px;
@@ -7304,13 +7304,13 @@
         color:var(--fgColor-muted,#6e7781);
       }
       .striffs-arch-review-panel__good-icon{
-        font-size:32px;
+        font-size:36px;
         margin-bottom:12px;
       }
       .striffs-arch-review-panel__footer{
         padding:10px 16px;
         border-top:1px solid var(--borderColor-muted,#d8dee4);
-        font-size:11px;
+        font-size:13px;
         color:var(--fgColor-muted,#6e7781);
         flex-shrink:0;
       }
