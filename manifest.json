@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Striffs for GitHub",
   "description": "Adds an architectural diff tab to GitHub pull requests.",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "minimum_chrome_version": "111",
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self'"

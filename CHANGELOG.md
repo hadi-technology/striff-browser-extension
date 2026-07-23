@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.4
 
 - Architecture Review panel no longer falls back to rendering raw detector findings when no review
   items surface. The API now treats deterministic facts as the sole origin of user-visible items
