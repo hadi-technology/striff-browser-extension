@@ -9,6 +9,16 @@
   with the GitHub check run on the same PR.
 - Doc conflicts are now shown as such in the panel: their own badge and colour instead of a
   severity tint, the contradicted document names listed, and sorted ahead of other items.
+- Attaching several subdiagrams to one unsubmitted review now stacks clean `image` →
+  `**Context:**` pairs. Previously each attach rebuilt the whole draft around the first image it
+  found, so the second attach detached context #1 from its image and clumped the images together;
+  the layout pass is now local to the image that was just uploaded.
+- The review composer is found on GitHub's new `/changes` UI (Primer `MarkdownEditor`), and the
+  subdiagram uploads there via a full drag-and-drop handshake — that composer has no file input,
+  so the previous single synthetic `drop` never attached anything.
+- "Start review" no longer matches Striffs' own panel button, and reports "Sign in to GitHub to
+  start a review" when the viewer is signed out instead of a misleading "couldn't open the review
+  text box".
 
 ## 1.0.3
 

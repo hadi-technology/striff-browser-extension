@@ -6478,6 +6478,13 @@
     if (!textarea) {
       const reviewBtn = findReviewButton();
       if (!reviewBtn) {
+        if (!isViewerSignedInToGitHub()) {
+          S.toast?.(
+            `Sign in to GitHub to start a review — GitHub only shows the review box to signed-in users.`,
+            "error", { timeoutMs: 8000 }
+          );
+          return;
+        }
         S.toast?.(
           `Could not find GitHub's review controls. Make sure you have write access to this PR.`,
           "error", { timeoutMs: 8000 }
@@ -6514,6 +6521,10 @@
     }
 
     if (!textarea) {
+      if (!isViewerSignedInToGitHub()) {
+        S.toast?.(`Sign in to GitHub to start a review — GitHub only shows the review box to signed-in users.`, "error", { timeoutMs: 8000 });
+        return;
+      }
       S.toast?.(`Could not open GitHub's review text box. Your selection was kept so you can try again.`, "error", { timeoutMs: 8000 });
       return;
     }
@@ -6553,7 +6564,7 @@
     // Step 4: Preserve any draft the reviewer already typed — append the context
     // block after it rather than discarding it (a destroyed in-progress review
     // draft has no undo).
-    const existingDraftText = String(textarea.value || "").trim();
+    const existingDraftText = String(textarea.value || "").replace(/\s+$/, "");
     const commentText = buildReviewDraftTemplate(contextBlock, existingDraftText);
     textarea.focus();
     try {
@@ -6569,11 +6580,13 @@
       initialDraftText: existingDraftText,
       submittedText: commentText
     };
-    // If there was an existing draft, place the cursor right after it (before the
-    // appended context block) so the reviewer continues typing where they left
-    // off. Otherwise, place it at the top as before.
+    // Park the cursor on the blank line reserved between the preserved draft and
+    // the context block we just appended, so GitHub drops the uploaded image
+    // markdown there. Landing it at existingDraftText.length instead glued the
+    // image to the tail of the previous block ("**Context:** A![img]") on every
+    // attach after the first.
     try {
-      const cursorPos = existingDraftText ? existingDraftText.length : 0;
+      const cursorPos = getReviewDraftInsertionOffset(existingDraftText, commentText);
       textarea.setSelectionRange(cursorPos, cursorPos);
     } catch {}
     textarea.dispatchEvent(new Event("input", { bubbles: true }));
@@ -6618,7 +6631,9 @@
   }
 
   function buildReviewDraftTemplate(contextBlock, existingDraftText = "") {
-    const preserved = String(existingDraftText || "").trim();
+    // Right-trim only: everything the reviewer (or a previous attach) already put
+    // in the box is preserved verbatim, including its internal blank lines.
+    const preserved = String(existingDraftText || "").replace(/\s+$/, "");
     if (!contextBlock) {
       return preserved ? `${preserved}\n\n` : "\n\n";
     }
@@ -6626,58 +6641,66 @@
     return `${preserved}\n\n${contextBlock}`;
   }
 
-  function getReviewDraftInsertionOffset(text) {
-    if (typeof text !== "string") return 0;
-    const firstNonNewline = text.search(/[^\n]/);
-    if (firstNonNewline === -1) return Math.min(2, text.length);
-    return Math.min(2, firstNonNewline);
+  // Where the uploaded image markdown should land: immediately before the context
+  // block this attach appended, i.e. just past the preserved draft's separator.
+  function getReviewDraftInsertionOffset(existingDraftText, commentText) {
+    const preservedLength = String(existingDraftText || "").length;
+    const total = String(commentText || "").length;
+    return Math.min(preservedLength + 2, total);
   }
 
+  function extractReviewImageTags(text) {
+    const tags = [];
+    const imageRegex = /!\[[^\]]*\]\([^)]*\)|<img\s[^>]*>/gi;
+    let match;
+    while ((match = imageRegex.exec(String(text || "")))) tags.push(match[0]);
+    return tags;
+  }
+
+  // Place *this* attach's image directly above *this* attach's context block,
+  // leaving every earlier image/context pair untouched. Deliberately local: an
+  // earlier version rebuilt the whole draft around the first image it found, so a
+  // second attach detached context #1 from its image and clumped the images
+  // together instead of stacking clean pairs.
   function normalizeReviewDraftLayout(textarea, draftSnapshot = {}) {
     if (!textarea) return;
     const current = String(textarea.value || "");
     if (!current) return;
     const contextBlock = String(draftSnapshot?.contextBlock || "").trim();
     const submittedText = String(draftSnapshot?.submittedText || "");
-    const initialDraftText = String(draftSnapshot?.initialDraftText || "").trim();
+    const initialDraftText = String(draftSnapshot?.initialDraftText || "").replace(/\s+$/, "");
 
-    // Match both markdown ![alt](url) and HTML <img ...> image tags
-    const markdownImageRegex = /!\[[^\]]*\]\([^)]+\)/i;
-    const htmlImageRegex = /<img\s[^>]*src=["'][^"']+["'][^>]*>/i;
-    const imageMatch = current.match(markdownImageRegex) || current.match(htmlImageRegex);
-    if (!imageMatch) return;
+    // Images present now but not in the text we seeded are the ones GitHub just
+    // uploaded — the only ones we are allowed to move.
+    const priorCounts = new Map();
+    for (const tag of extractReviewImageTags(submittedText)) {
+      priorCounts.set(tag, (priorCounts.get(tag) || 0) + 1);
+    }
+    const addedTags = [];
+    for (const tag of extractReviewImageTags(current)) {
+      const remaining = priorCounts.get(tag) || 0;
+      if (remaining > 0) priorCounts.set(tag, remaining - 1);
+      else addedTags.push(tag);
+    }
+    if (!addedTags.length) return;
 
-    const imageTag = imageMatch[0];
-    let userIntro = current.replace(imageTag, "\n").trim();
+    let head = current;
+    for (const tag of addedTags) head = head.replace(tag, "");
+    // Drop this attach's context block from the head; it is re-appended below the
+    // new image. lastIndexOf keeps the earlier copy when the same component is
+    // attached twice.
     if (contextBlock) {
-      const escapedContext = contextBlock.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      userIntro = userIntro.replace(new RegExp(`\\n*${escapedContext}\\s*`, "g"), "\n").trim();
+      const contextIndex = head.lastIndexOf(contextBlock);
+      if (contextIndex !== -1) head = head.slice(0, contextIndex);
     }
-    if (submittedText) {
-      userIntro = userIntro.replace(submittedText, "\n").trim();
-    }
-    if (!userIntro && initialDraftText) {
-      userIntro = initialDraftText;
-    }
+    head = head.replace(/\s+$/, "");
+    if (!head && initialDraftText) head = initialDraftText;
 
-    const parts = ["", ""];
-    if (userIntro) parts.push(userIntro.trim(), "");
-    parts.push(imageTag);
-    if (contextBlock) parts.push("", "", contextBlock);
-    let normalized = parts.join("\n").replace(/\n{4,}/g, "\n\n\n");
-    // Guarantee exactly one blank line between image and context block (handles both markdown and HTML img)
-    if (contextBlock) {
-      // Handle markdown ![...](...) images
-      normalized = normalized.replace(
-        /(!\[[^\]]*\]\([^)]+\))\n*(\*\*Context:\*\*)/i,
-        "$1\n\n$2"
-      );
-      // Handle HTML <img ...> tags
-      normalized = normalized.replace(
-        /(<img\s[^>]*>)\n*(\*\*Context:\*\*)/i,
-        "$1\n\n$2"
-      );
-    }
+    const parts = [];
+    if (head) parts.push(head, "");
+    parts.push(addedTags.join("\n\n"));
+    if (contextBlock) parts.push("", contextBlock);
+    const normalized = parts.join("\n");
 
     try {
       const nativeSetter = Object.getOwnPropertyDescriptor(
@@ -6712,7 +6735,12 @@
     const direct = document.querySelector("#pull_request_review_body") ||
       document.querySelector('textarea[name="pull_request_review[body]"]') ||
       document.querySelector("textarea.js-review-field") ||
-      document.querySelector('textarea.prc-Textarea-TextArea-snlco[aria-label="Markdown value"]');
+      // New /changes UI: the review composer is a Primer React MarkdownEditor whose
+      // textarea has no stable id/name — only aria-label="Markdown value". The class
+      // hash (prc-Textarea-TextArea-*) rotates on every GitHub build, so match on the
+      // aria-label scoped to the review popover instead.
+      document.querySelector('[class*="ReviewMenu"] textarea[aria-label="Markdown value"], [class*="CommentBox"] textarea[aria-label="Markdown value"]') ||
+      document.querySelector('textarea[aria-label="Markdown value"]');
     if (direct && isReviewTextareaCandidate(direct)) return direct;
     if (!existingTextareas) return null;
     const all = document.querySelectorAll("textarea");
@@ -6771,26 +6799,39 @@
   }
 
   async function attachFileToReviewComposer(reviewForm, textarea, file) {
-    // Try drag-and-drop first — works reliably in both old and new GitHub UI
-    if (reviewForm) {
-      try {
-        const dt = new DataTransfer();
-        dt.items.add(file);
-        const dropEvent = new DragEvent("drop", {
-          bubbles: true,
-          cancelable: true,
-          dataTransfer: dt,
-        });
-        reviewForm.dispatchEvent(dropEvent);
-        return "drop";
-      } catch {}
-    }
-
-    // Fallback: set file input value directly (can trigger X-Digest-Sha256 errors in old UI)
-    const attachWithInput = (input) => {
-      if (!(input instanceof HTMLInputElement) || input.type !== "file") return false;
+    // A fresh DataTransfer per event — some handlers consume/neutralize it.
+    const makeDataTransfer = () => {
       const dt = new DataTransfer();
       dt.items.add(file);
+      return dt;
+    };
+
+    // GitHub inserts a placeholder ("![Uploading striff-subdiagram.svg…]()") the moment
+    // it starts ingesting a file, later swapping it for the asset URL; an upload preview
+    // node may also appear. Either is proof a method "took", so we can stop and avoid
+    // firing the remaining methods (which would upload the image twice).
+    const uploadStarted = () => {
+      const text = String(textarea?.value || "");
+      if (/!\[[^\]]*\]\([^)]*\)/.test(text) || /uploading/i.test(text) ||
+          /githubusercontent\.com|github\.com\/user-attachments\//i.test(text)) return true;
+      const scope = reviewForm || textarea?.closest("form, [class*='CommentBox'], [class*='MarkdownEditor']") || document;
+      return !!scope.querySelector?.(
+        'img[src*="githubusercontent.com"], img[src*="user-attachments"], a[href*="user-attachments"], [class*="upload" i][role], [data-testid*="upload"]'
+      );
+    };
+    const waitBrief = async (ms) => {
+      const end = Date.now() + ms;
+      while (Date.now() < end) {
+        if (uploadStarted()) return true;
+        await new Promise(r => setTimeout(r, 120));
+      }
+      return uploadStarted();
+    };
+
+    // 1) Classic UI (and any dropzone exposing a real hidden file input).
+    const attachWithInput = (input) => {
+      if (!(input instanceof HTMLInputElement) || input.type !== "file") return false;
+      const dt = makeDataTransfer();
       try {
         input.files = dt.files;
       } catch {
@@ -6800,28 +6841,46 @@
       input.dispatchEvent(new Event("change", { bubbles: true }));
       return true;
     };
-
     const scopedInputs = [];
-    if (reviewForm) {
-      scopedInputs.push(...reviewForm.querySelectorAll('input[type="file"]'));
-    }
+    if (reviewForm) scopedInputs.push(...reviewForm.querySelectorAll('input[type="file"]'));
     scopedInputs.push(...document.querySelectorAll('input[type="file"]'));
     for (const input of scopedInputs) {
-      if (attachWithInput(input)) return "input";
+      if (attachWithInput(input) && await waitBrief(3000)) return "input";
     }
 
-    // Last resort: clipboard paste
+    // 2) Full drag-and-drop handshake. The new /changes Primer composer has NO file
+    // input and ignores a lone synthetic "drop" — its onDrop handler lives on the
+    // MarkdownInput wrapper (or the textarea) and only reacts to the full
+    // dragenter → dragover → drop sequence.
+    const dropTargets = [
+      textarea?.closest('[class*="MarkdownInput"]'),
+      textarea,
+      reviewForm,
+      textarea?.closest('[class*="MarkdownEditor"], [class*="CommentBox"]'),
+    ].filter(Boolean);
+    for (const target of dropTargets) {
+      try {
+        for (const type of ["dragenter", "dragover", "drop"]) {
+          target.dispatchEvent(new DragEvent(type, {
+            bubbles: true,
+            cancelable: true,
+            dataTransfer: makeDataTransfer(),
+          }));
+        }
+      } catch {}
+      if (await waitBrief(3000)) return "drop";
+    }
+
+    // 3) Clipboard paste as a last resort.
     try {
-      const dt = new DataTransfer();
-      dt.items.add(file);
-      const pasteEvent = new ClipboardEvent("paste", {
+      textarea.focus();
+      textarea.dispatchEvent(new ClipboardEvent("paste", {
         bubbles: true,
         cancelable: true,
-        clipboardData: dt,
-      });
-      textarea.dispatchEvent(pasteEvent);
-      return "paste";
+        clipboardData: makeDataTransfer(),
+      }));
     } catch {}
+    if (await waitBrief(3000)) return "paste";
 
     return "";
   }
@@ -6860,17 +6919,27 @@
   }
 
   function findReviewButton() {
+    // Never match Striffs' own UI (e.g. the comment panel's "Start review" button,
+    // whose text otherwise satisfies the /review/ text scan below). Without this guard,
+    // when GitHub renders no review control at all — most commonly because the viewer
+    // is signed out — the fallback scan grabs our own button, "clicks" it, and the
+    // caller then reports a misleading "couldn't open the review text box".
+    const isStriffsOwnEl = (el) =>
+      !el || el.closest?.('#striffs-comment-panel, #striffs-content, [id^="striffs-"]') ||
+      /\bstriffs-/.test(String(el.className || ""));
+
     // Specific selectors first — these are unambiguous
     const newUiBtn = document.querySelector('[data-testid="review-changes-button"]') ||
       document.querySelector('[class*="ReviewMenuButton"]');
-    if (newUiBtn) return newUiBtn;
+    if (newUiBtn && !isStriffsOwnEl(newUiBtn)) return newUiBtn;
     const oldUiInline = document.querySelector('.js-review-changes');
     const oldUiInlineButton = oldUiInline?.closest?.('button, summary, a, [role="button"]');
-    if (oldUiInlineButton) return oldUiInlineButton;
+    if (oldUiInlineButton && !isStriffsOwnEl(oldUiInlineButton)) return oldUiInlineButton;
 
     // data-hotkey="r" is shared with "Quote reply" — only accept if the element
     // or its nearby text clearly indicates a review action.
     for (const el of document.querySelectorAll('[data-hotkey="r"]')) {
+      if (isStriffsOwnEl(el)) continue;
       const text = (el.textContent || "").trim().toLowerCase();
       const href = el.getAttribute?.("href") || "";
       const cls = el.className || "";
@@ -6886,6 +6955,7 @@
       'button, summary, a.btn, [role="button"]'
     );
     for (const el of candidates) {
+      if (isStriffsOwnEl(el)) continue;
       const text = (el.textContent || "").trim().toLowerCase();
       if (/review\s*(changes)?/i.test(text) && !/quote/i.test(text)) {
         return el;
@@ -6896,6 +6966,15 @@
       document.querySelector(".js-review-changes-button") ||
       document.querySelector('summary.btn-primary[href*="review"]') ||
       document.querySelector('button[data-octo-click="review_start"]')
+    );
+  }
+
+  // GitHub only renders the review composer for authenticated viewers, so a signed-out
+  // session is a common, actionable reason "start review" has nothing to attach to.
+  function isViewerSignedInToGitHub() {
+    return Boolean(
+      document.querySelector('meta[name="user-login"]')?.content?.trim() ||
+      document.querySelector('meta[name="octolytics-actor-login"]')?.content?.trim()
     );
   }
 

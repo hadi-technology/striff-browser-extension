@@ -4626,6 +4626,58 @@ const setRemoteConfigUrlData = async (jsonObj) => {
               const newUiPreview = await waitForCommentPreview(20000);
               if (newUiPreview?.state === 'ready') {
                 pass('[new-ui] Subdiagram preview renders for the current selection');
+
+                // Start review on the NEW /changes UI: the review composer is a Primer
+                // React MarkdownEditor (no #pull_request_review_body, no file input), so
+                // both textarea detection and the drag-and-drop image upload take a
+                // different path than the classic UI. Assert the composer opens AND the
+                // subdiagram embeds — this is the exact flow that silently broke before.
+                const newUiSubmitDisabled = await page.evaluate(() => {
+                  const btn = document.querySelector('.striffs-comment-panel__submit');
+                  return !btn || btn.disabled;
+                }).catch(() => true);
+                if (newUiSubmitDisabled) {
+                  fail('[new-ui] Submit stayed disabled before review submission');
+                } else {
+                  await instrumentReviewAttachment();
+                  await page.click('.striffs-comment-panel__submit', { timeout: 5000 }).catch((e) => {
+                    fail(`[new-ui] Start review click failed: ${e?.message || e}`);
+                  });
+
+                  const newUiReviewReady = await page.waitForFunction(() => {
+                    const textarea =
+                      document.querySelector('#pull_request_review_body') ||
+                      document.querySelector('textarea[name="pull_request_review[body]"]') ||
+                      document.querySelector('[class*="ReviewMenu"] textarea[aria-label="Markdown value"], [class*="CommentBox"] textarea[aria-label="Markdown value"]') ||
+                      document.querySelector('textarea[aria-label="Markdown value"]');
+                    if (!textarea) return null;
+                    const style = getComputedStyle(textarea);
+                    const visible = textarea.getClientRects().length > 0 &&
+                      textarea.offsetParent !== null &&
+                      style.display !== 'none' && style.visibility !== 'hidden';
+                    if (!visible) return null;
+                    const attach = window.__striffsReviewAttachTest || {};
+                    const value = textarea.value || '';
+                    const hasContext = value.includes('**Context:**');
+                    const hasEmbed = Boolean(attach.embedded) ||
+                      /!\[[^\]]*\]\(([^)]+)\)/.test(value) ||
+                      /githubusercontent\.com|github\.com\/user-attachments\//i.test(value) ||
+                      Number(attach.previewCount || 0) > 0;
+                    return hasContext ? { textareaValue: value, hasEmbed } : null;
+                  }, null, { timeout: 25000 }).catch(() => null);
+
+                  const newUiReviewState = newUiReviewReady ? await newUiReviewReady.jsonValue() : null;
+                  if (newUiReviewState?.textareaValue?.includes('**Context:**')) {
+                    pass('[new-ui] Start review opens the GitHub review composer with context text');
+                  } else {
+                    fail(`[new-ui] Review composer did not open/populate on the new UI (${JSON.stringify(newUiReviewState)})`);
+                  }
+                  if (newUiReviewState?.hasEmbed) {
+                    pass('[new-ui] Start review embeds the subdiagram image in the new-UI review composer');
+                  } else {
+                    fail(`[new-ui] Subdiagram image was not embedded in the new-UI review composer (${JSON.stringify(newUiReviewState)})`);
+                  }
+                }
               } else {
                 fail(`[new-ui] Subdiagram preview did not render (${JSON.stringify(newUiPreview)})`);
               }
