@@ -5119,25 +5119,52 @@
 
   // --- PR refs parsing (robust) ---
   S.extractHeadBaseRefs = () => {
-    let anchors = Array.from(document.querySelectorAll(".commit-ref > a"));
-    if (anchors.length < 2) {
-      anchors = Array.from(document.querySelectorAll('a[data-hovercard-type="repository"].Link--primary, a[data-hovercard-type="repository"].Link--muted'));
-    }
-    if (anchors.length < 2) {
-      anchors = Array.from(document.querySelectorAll('a[href*="/tree/"]'));
-    }
+    const EMPTY_REF = { owner: "", repo: "", branch: "" };
 
+    // Only an anchor carrying a /tree/<branch> segment can name a branch. The old
+    // repository-hovercard fallback matched plain /owner/repo links, which structurally
+    // cannot -- it returned the right owner/repo with branch:"" and callers then built
+    // ".../blob//<path>?raw=1", which GitHub collapses to ".../blob/<path>" and 404s.
+    // The HTML error page then surfaced as an unreadable "autoFetchStriffs error".
+    // Fork PRs hit this hardest: both repos get their own hovercard link, so the
+    // fallback always found its two anchors. Returning nothing beats returning refs
+    // that look complete but address a branch that does not exist.
     const parseRef = (anchor) => {
-      if (!anchor) return { owner: "", repo: "", branch: "" };
+      if (!anchor) return { ...EMPTY_REF };
       const href = anchor.getAttribute("href") || "";
       const parts = href.split("/").filter(Boolean);
+      if (parts[2] !== "tree") return { ...EMPTY_REF };
       const owner = parts[0] || "";
       const repo = parts[1] || "";
       const branch = decodeURIComponent(parts.slice(3).join("/")) || "";
+      if (!owner || !repo || !branch) return { ...EMPTY_REF };
       return { owner, repo, branch };
     };
+    const isComplete = (ref) => Boolean(ref?.owner && ref?.repo && ref?.branch);
 
-    const base = parseRef(anchors[0]), head = parseRef(anchors[1]);
+    // .commit-ref is the PR header's own base/head pair and is authoritative. The
+    // /tree/ sweep is a fallback for layouts that do not render it; it is accepted
+    // only when both ends parse completely, so a stray directory link cannot stand
+    // in for a real ref.
+    const strategies = [
+      () => Array.from(document.querySelectorAll(".commit-ref > a")),
+      () => Array.from(document.querySelectorAll('a[href*="/tree/"]'))
+    ];
+
+    let base = { ...EMPTY_REF };
+    let head = { ...EMPTY_REF };
+    for (const collect of strategies) {
+      const anchors = collect();
+      if (anchors.length < 2) continue;
+      const candidateBase = parseRef(anchors[0]);
+      const candidateHead = parseRef(anchors[1]);
+      if (isComplete(candidateBase) && isComplete(candidateHead)) {
+        base = candidateBase;
+        head = candidateHead;
+        break;
+      }
+    }
+
     const refs = {
       baseOwner: base.owner,
       baseRepo: base.repo,
@@ -8680,6 +8707,20 @@
   }
 
   async function submitArtifactPrefetch(meta, token, prFiles = []) {
+    // Prefetch fires from completeFilesPageBoot on a short timer, so it can beat the
+    // PR header into the DOM and read incomplete refs. It is a warm-up, not a
+    // requirement: skip this round rather than fetch against a branch we could not
+    // identify. The user-initiated request runs later against a settled page.
+    const prefetchRefs = S.extractHeadBaseRefs();
+    if (!prefetchRefs?.headOwner || !prefetchRefs?.headRepo || !prefetchRefs?.headBranch) {
+      S.cinfo?.('Artifact prefetch skipped: PR refs not resolvable yet', {
+        headOwner: prefetchRefs?.headOwner || null,
+        headRepo: prefetchRefs?.headRepo || null,
+        headBranch: prefetchRefs?.headBranch || null
+      });
+      return false;
+    }
+
     const { refs, changedFiles } = await collectZipRequestArtifacts(meta, {
       quiet: true,
       token,
@@ -9188,6 +9229,20 @@
   async function fetchHeadFileContent(refs, path, token) {
     const normalizedPath = normalizeChangedFilePath(path);
     if (!normalizedPath) return null;
+
+    // Every URL below interpolates these three. An empty branch used to yield
+    // ".../blob//<path>", which GitHub answers with a 404 HTML page that then became
+    // the thrown error's message -- a whole rendered document in the console instead
+    // of a cause. Fail with something actionable while the refs are still in scope.
+    if (!refs?.headOwner || !refs?.headRepo || !refs?.headBranch) {
+      const err = new Error(
+        `Cannot fetch head file content: incomplete PR refs ` +
+        `(owner=${refs?.headOwner || "?"}, repo=${refs?.headRepo || "?"}, branch=${refs?.headBranch || "?"}). ` +
+        `The pull request header had not rendered when Striffs read it.`
+      );
+      err.code = "INCOMPLETE_PR_REFS";
+      throw err;
+    }
 
     // When no token, use raw.githubusercontent.com directly to avoid API rate limits
     if (!token) {
