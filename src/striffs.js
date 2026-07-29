@@ -3303,7 +3303,7 @@
           <button id="striffs-download-btn" type="button" class="striffs-ctl-btn" title="Save">
             ${S.octicon('save')}
           </button>
-          <a id="striffs-guide-btn" class="striffs-ctl-btn" href="https://striff.io/#how" target="_blank" rel="noopener noreferrer" title="Guide">
+          <a id="striffs-guide-btn" class="striffs-ctl-btn" href="https://striff.io/blog/afferent-efferent-coupling-explained/" target="_blank" rel="noopener noreferrer" title="Guide">
             ${S.octicon('question')}
           </a>
         </div>
