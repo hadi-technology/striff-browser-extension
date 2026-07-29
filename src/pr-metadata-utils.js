@@ -123,12 +123,110 @@ const resolveCommitCountFromDocument = (document) => {
   return null;
 };
 
+const normalizePrState = (value, { isDraft = false } = {}) => {
+  const text = String(value || '').trim().toLowerCase();
+  if (!text) return null;
+  if (text.includes('merged')) return 'merged';
+  if (text.includes('closed')) return 'closed';
+  if (text.includes('draft')) return 'draft';
+  if (text.includes('open')) return isDraft ? 'draft' : 'open';
+  return null;
+};
+
+const getPrStateFromEmbeddedData = (document) => {
+  const scripts = document?.querySelectorAll?.(EMBEDDED_DATA_SELECTOR) || [];
+  for (const script of scripts) {
+    const text = script?.textContent || script?.innerText || '';
+    if (!text) continue;
+    try {
+      const payload = JSON.parse(text);
+      const pr = payload?.payload?.pullRequest
+        || payload?.data?.pullRequest
+        || payload?.pullRequest
+        || null;
+      if (!pr) continue;
+      const state = normalizePrState(pr.state, { isDraft: pr.isDraft === true });
+      if (state) return state;
+    } catch (e) {
+      // ignore malformed JSON
+    }
+  }
+  return null;
+};
+
+// Badge lookups must stay scoped to the PR's own header. A conversation
+// timeline routinely contains .State--merged / .State--closed badges from
+// cross-referenced PRs and issues ("mentioned in #x"), so any page-wide
+// badge sweep misreads an open PR as merged or closed.
+const PR_STATE_HEADER_BADGE_SELECTORS = [
+  '.gh-header-meta .State',
+  '#partial-discussion-header .State',
+  '[data-testid="header-state"]',
+  '[data-testid="state-label"]',
+];
+
+const prStateFromBadgeNode = (node) => {
+  if (!node) return null;
+  return normalizePrState(node.className) || normalizePrState(node.textContent);
+};
+
+// Returns 'open' | 'draft' | 'merged' | 'closed', or null when no state
+// signal exists in the document (e.g. GitHub changed markup, or the React
+// UI has not rendered the state yet). Callers decide what unknown means.
+const resolvePrStateFromDocument = (document) => {
+  if (!document) return null;
+  try {
+    // React UI: embedded payload carries state + isDraft directly — the
+    // authoritative source, always about this PR and never a timeline badge.
+    const embedded = getPrStateFromEmbeddedData(document);
+    if (embedded) return embedded;
+
+    // Classic UI: reviewable_state attribute on the review form
+    const legacy = document.querySelector?.('[reviewable_state]');
+    if (legacy) {
+      const state = normalizePrState(legacy.getAttribute?.('reviewable_state'));
+      if (state) return state;
+    }
+
+    // Header-scoped state badge (classic .State classes or React label)
+    for (const selector of PR_STATE_HEADER_BADGE_SELECTORS) {
+      const state = prStateFromBadgeNode(document.querySelector?.(selector));
+      if (state) return state;
+    }
+
+    // React UI: pull-specific data-status values ("pullOpened", "pullMerged").
+    // Only trust pull* values — a bare data-status could belong to anything.
+    const statusEl = document.querySelector?.('[data-status]');
+    if (statusEl) {
+      const status = String(statusEl.getAttribute?.('data-status') || '');
+      if (/^pull/i.test(status)) {
+        if (/pullopened/i.test(status)) return 'open';
+        const state = normalizePrState(status);
+        if (state) return state;
+      }
+    }
+
+    return null;
+  } catch (e) {
+    return null;
+  }
+};
+
+// Prefetch is a cheap background warm-up, so an unknown state must not block
+// it — failing closed here silently disabled prefetch whenever GitHub's
+// markup drifted. Only a definitive merged/closed state skips.
+const isPrStatePrefetchEligible = (state) => state !== 'merged' && state !== 'closed';
+
 const api = {
   resolveLatestCommitShaFromDocument,
   normalizeCommit,
   getCommitFromMeta,
   getCommitFromEmbeddedData,
   resolveCommitCountFromDocument,
+  normalizePrState,
+  getPrStateFromEmbeddedData,
+  resolvePrStateFromDocument,
+  isPrStatePrefetchEligible,
 };
 
 if (typeof module !== 'undefined' && module.exports) {

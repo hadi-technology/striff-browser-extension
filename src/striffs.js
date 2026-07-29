@@ -8808,56 +8808,17 @@
 
   const isPRPrefetchEligible = () => {
     try {
-      // Classic GitHub UI
-      const legacyReviewableState = document.querySelector('[reviewable_state]');
-      if (legacyReviewableState) {
-        const state = String(legacyReviewableState.getAttribute('reviewable_state') || '').trim().toLowerCase();
-        if (state === 'open' || state === 'draft') return true;
-        if (state === 'merged' || state === 'closed') return false;
+      const utils = window.StriffsPrMetadataUtils || {};
+      const state = utils.resolvePrStateFromDocument?.(document) ?? null;
+      if (!state) {
+        S.cinfo?.('PR state not detected in DOM; allowing prefetch');
       }
-      const classicStateSelector = [
-        '.State--open',
-        '.State.Color--open',
-        '.State--draft',
-        '.State.Color--draft',
-        '.State--merged',
-        '.State.Color--merged',
-        '.State--closed',
-        '.State.Color--closed'
-      ].join(', ');
-      if (document.querySelector(classicStateSelector)) {
-        return Boolean(document.querySelector([
-          '.State--open',
-          '.State.Color--open',
-          '.State--draft',
-          '.State.Color--draft'
-        ].join(', ')));
-      }
-      const classicStateText = Array.from(document.querySelectorAll('.State'))
-        .map((el) => String(el.textContent || '').trim().toLowerCase())
-        .find(Boolean) || '';
-      if (classicStateText === 'open' || classicStateText === 'draft') return true;
-      if (classicStateText === 'merged' || classicStateText === 'closed') return false;
-      // React-based GitHub UI: data-status="pullOpened" or "draft"
-      const statusEl = document.querySelector('[data-status]');
-      if (statusEl) {
-        const status = statusEl.getAttribute('data-status') || '';
-        if (/open|pullOpened|draft/i.test(status)) return true;
-        if (/merged|closed/i.test(status)) return false;
-      }
-      // Newer GitHub UI with state label text
-      const stateLabel = document.querySelector('[data-testid="state-label"]');
-      if (stateLabel) {
-        const text = (stateLabel.textContent || '').trim().toLowerCase();
-        if (/open|draft/.test(text)) return true;
-        if (/merged|closed/.test(text)) return false;
-      }
-      // Fallback: check the prc-StateLabel component text
-      const stateSpan = document.querySelector('[data-component="Octicon"] ~ *');
-      if (stateSpan && /^open|draft$/i.test(stateSpan.textContent?.trim() || '')) return true;
-      return false;
+      return utils.isPrStatePrefetchEligible
+        ? utils.isPrStatePrefetchEligible(state)
+        : state !== 'merged' && state !== 'closed';
     } catch {
-      return false;
+      // A detection failure must not disable prefetch.
+      return true;
     }
   };
 
@@ -8867,7 +8828,7 @@
       return false;
     }
     if (!isPRPrefetchEligible()) {
-      S.cinfo?.('Prefetch skipped: pull request is not open or draft');
+      S.cinfo?.('Prefetch skipped: pull request is merged or closed');
       return false;
     }
     const meta = S.extractPRMetadata?.() || null;
