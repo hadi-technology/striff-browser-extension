@@ -4019,7 +4019,11 @@
       'details-menu[role="menu"], details-menu, [role="menu"], [data-testid*="menu"]'
     )).filter((host) => {
       if (!isVisibleMenuHost(host)) return false;
-      if (host.querySelector?.(FILE_MENU_OPTION_SELECTOR)) return true;
+      // Deliberately no shortcut for hosts already containing our button:
+      // GitHub renders dropdowns into shared React portals, so a container we
+      // injected into on the files page can later host an unrelated menu (the
+      // button once leaked into the reviewers list this way). The file-menu
+      // heuristics below must pass every time.
 
       const text = String(host.textContent || '');
       const textLower = text.toLowerCase();
@@ -4107,6 +4111,25 @@
     return fallbackHost || globalHost;
   };
 
+  // Remove injected "View Striff" buttons everywhere except exceptHost.
+  // Needed because GitHub's React portals persist across SPA navigation and
+  // get reused by unrelated menus — a button left behind resurfaces inside
+  // whatever menu the portal renders next (e.g. the reviewers list on the
+  // conversation tab).
+  S.removeStrayFileMenuOptions = (exceptHost = null) => {
+    try {
+      document.querySelectorAll(FILE_MENU_OPTION_SELECTOR).forEach((btn) => {
+        if (exceptHost && exceptHost.contains(btn)) return;
+        const wrapper = btn.parentElement;
+        btn.remove();
+        // Drop the empty li wrapper ensureFileMenuOptionButton created
+        if (wrapper && wrapper.tagName === 'LI' && wrapper.classList.contains('ActionListItem') && wrapper.childElementCount === 0) {
+          wrapper.remove();
+        }
+      });
+    } catch {}
+  };
+
   const ensureFileMenuOptionButton = (menuHost) => {
     // Only add menu buttons on /files and /changes pages
     const isPRFilesPage = /\/[^/]+\/[^/]+\/pull\/\d+\/(files|changes)/.test(window.location.pathname);
@@ -4182,6 +4205,8 @@
         });
         return;
       }
+      // Sweep buttons left in other (possibly reused) portal containers.
+      S.removeStrayFileMenuOptions?.(menuHost);
 
       const rawPath = String(
         fileNode.getAttribute('data-path') ||
@@ -10812,6 +10837,10 @@
 
     try {
       S.cancelEnrichmentPolling?.("navigation");
+      // Injected file-menu buttons live in React portals that survive SPA
+      // navigation and get reused by unrelated menus; drop them on every
+      // route change. They re-inject on the next file-menu open.
+      try { S.removeStrayFileMenuOptions?.(); } catch {}
 
       try {
         const nextScope = S.cacheKey?.() || null;
@@ -10933,6 +10962,7 @@
         if (toolbarSlot) toolbarSlot.remove();
         const style = document.getElementById('striffs-style');
         if (style) style.remove();
+        S.removeStrayFileMenuOptions?.();
       } catch {}
     });
 
