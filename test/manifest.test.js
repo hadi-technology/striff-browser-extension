@@ -17,6 +17,7 @@ test('content scripts include shared metadata and config helpers before main bun
     'src/webext-shim.js',
     'src/pr-metadata-utils.js',
     'src/striffs-config-utils.js',
+    'src/plantuml-utils.js',
     'src/striffs.js'
   ]);
 });

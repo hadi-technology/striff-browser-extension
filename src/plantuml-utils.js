@@ -151,7 +151,27 @@
     return encode(source).then(enc => `https://www.plantuml.com/plantuml/${format || 'svg'}/${enc}`);
   }
 
-  const api = { decode, encode, extractEncodedPuml, extractPuml, getRenderURL };
+  // PlantUML output can carry numeric character references for C0 control
+  // characters (e.g. &#8; when a control byte leaks into embedded doc text).
+  // Those are illegal in XML, so a strict SVG parse aborts at the first one
+  // and everything after it is lost. Strips such references and raw control
+  // bytes; tab/LF/CR stay.
+  function stripInvalidXmlChars(text) {
+    return String(text || '')
+      .replace(/&#(x[0-9a-fA-F]+|\d+);/g, (ref, code) => {
+        const n = code[0] === 'x' || code[0] === 'X'
+          ? parseInt(code.slice(1), 16)
+          : parseInt(code, 10);
+        return n < 0x20 && n !== 9 && n !== 10 && n !== 13 ? '' : ref;
+      })
+      .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '');
+  }
+
+  const api = { decode, encode, extractEncodedPuml, extractPuml, getRenderURL, stripInvalidXmlChars };
+
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = api;
+  }
 
   if (typeof globalThis !== 'undefined') {
     globalThis.StriffsPlantUmlUtils = api;

@@ -6124,7 +6124,12 @@
         if (resp?.ok && resp?.svg) {
           const hasContent = resp.svg.includes("<text") || resp.svg.includes("<g ");
           if (hasContent) {
-            svg = resp.svg;
+            // PlantUML can emit numeric references for control characters
+            // (e.g. &#8; from a control byte in embedded doc text). Those are
+            // illegal in XML, so every strict parse downstream — the preview
+            // panel, scaleSvg, and whoever views the attached SVG — dies at
+            // the first one. Strip them once at receipt.
+            svg = globalThis.StriffsPlantUmlUtils?.stripInvalidXmlChars?.(resp.svg) ?? resp.svg;
             S.clog?.('[subdiagram] backend render succeeded', { components: selectedIds.length, cached: resp.cached, pumlLength: resp.pumlSource?.length, componentCount: resp.componentCount });
             if (S.isDebug?.() && resp.pumlSource) {
               S.clog?.('[subdiagram] extracted PUML:\n', resp.pumlSource);
@@ -6417,8 +6422,12 @@
     if (S.__commentState.previewSvg) {
       content.innerHTML = "";
       try {
-        const doc = new DOMParser().parseFromString(S.__commentState.previewSvg, "image/svg+xml");
-        const svg = doc.querySelector("svg");
+        // sanitizeSvgToNode (not a raw DOMParser parse) for two reasons: it
+        // falls back to lenient HTML parsing when strict XML parsing fails
+        // (a raw parse silently rendered whatever partial tree preceded the
+        // error — a bare class rectangle with no members), and it applies the
+        // same XSS sanitization as the main diagram render path.
+        const svg = S.sanitizeSvgToNode?.(S.__commentState.previewSvg);
         if (svg) {
           svg.style.display = "block";
           svg.style.maxWidth = "100%";
@@ -6427,7 +6436,9 @@
           svg.style.height = "auto";
           svg.style.objectFit = "contain";
           svg.style.margin = "0 auto";
-          content.appendChild(svg);
+          content.appendChild(document.adoptNode(svg));
+        } else {
+          content.innerHTML = '<div class="striffs-comment-panel__preview-empty">Preview could not be displayed</div>';
         }
       } catch {
         content.innerHTML = '<div class="striffs-comment-panel__preview-empty">Preview could not be displayed</div>';
