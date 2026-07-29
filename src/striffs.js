@@ -106,7 +106,11 @@
     previewSvg: null,
     previewError: null,
     requestSeq: 0,
-    completedSeq: 0
+    completedSeq: 0,
+    // In-flight guard for the "Start review" submit flow. Not cleared in
+    // resetCommentState — only the submit's own finally releases it, so a
+    // mid-flight panel close can't re-arm the button early.
+    submitting: false
   };
   S.__commentDebounceTimer = null;
   S.resetCommentState = function resetCommentState() {
@@ -6426,7 +6430,9 @@
     if (!btn) return;
     const hasPreview = Boolean(S.__commentState.previewSvg);
     const hasError = Boolean(S.__commentState.previewError);
-    btn.disabled = !hasPreview || hasError;
+    const submitting = Boolean(S.__commentState.submitting);
+    btn.disabled = submitting || !hasPreview || hasError;
+    btn.textContent = submitting ? "Opening review…" : "Start review";
   }
 
   // ---------- Submit flow ----------
@@ -6434,13 +6440,24 @@
   S.submitComment = async function submitComment() {
     const { previewSvg, selectedIds } = S.__commentState;
     if (!previewSvg || !selectedIds.length) return;
+    // fillComposer runs for seconds (clicking GitHub's review button, polling
+    // for the textarea, waiting on the attachment upload) — each extra click
+    // during that window would append another context block into the draft.
+    if (S.__commentState.submitting) return;
+    S.__commentState.submitting = true;
+    updateSubmitState(document.getElementById(PANEL_ID));
 
     S.emitEngagementEvent?.("comment_submitted", {
       componentCount: selectedIds.length,
       componentIds: selectedIds.slice(0, 10)
     });
 
-    await fillComposer(previewSvg);
+    try {
+      await fillComposer(previewSvg);
+    } finally {
+      S.__commentState.submitting = false;
+      updateSubmitState(document.getElementById(PANEL_ID));
+    }
   };
 
   // (tryRestorePendingComment removed — clipboard approach no longer navigates)
