@@ -5331,11 +5331,17 @@
     try { S.cancelEnrichmentPolling?.(`pr-scope-change:${reason}`); } catch {}
     try { S.exitCommentMode?.(); } catch {}
 
-    // Do NOT clear __striffsReady, __striffsSvg, or the path/component maps here.
-    // The diagram remains valid when navigating within the same PR (e.g. switching
-    // tabs or submitting a review). These are only invalid for a different PR,
-    // which is handled by the full teardown in the clear-local-cache path.
+    // This only runs when the PR scope actually changed (its sole callers are the
+    // cross-PR branches of the navigation handler), so the in-memory diagram and
+    // component maps belong to a different PR and must go — otherwise the Striffs
+    // tab's ready fast path re-attaches the previous PR's SVG on the new PR.
+    // Same-PR navigation never reaches here, so tab switches keep their diagram.
+    S.__striffsReady = false;
+    S.__striffsSvg = null;
     S.__striffsNoChanges = false;
+    // The saved button state is also PR-scoped: restoreStriffButtonState replays
+    // it on remount, so a lingering success state shows the old PR's green check.
+    try { S.updateStriffButton?.({ tooltip: "Click to generate Striffs" }); } catch {}
     S.__lastFetchedUpdatedAt = null;
     S.__lastPrefetchRequestKey = null;
     S.__prefetchPromise = null;
@@ -5363,12 +5369,22 @@
       S.__engagementCtx = { sessionId, operationId: null, engagementWriteToken: null };
     } catch {}
 
+    S.__lastEnrichmentResult = null;
+
     try { S.clearReviewNoteFeedback?.(); } catch {}
+    try { S.__striffsPathToComponentId?.clear?.(); } catch {}
+    try { S.__striffsComponentIdToFile?.clear?.(); } catch {}
+    try { S.__striffsComponentIdToDiffId?.clear?.(); } catch {}
+    try { S.__striffsComponentIdToSvgElement?.clear?.(); } catch {}
+    try { S.__stablePathToComponentId?.clear?.(); } catch {}
     try { S.__stableComponentIdToFile?.clear?.(); } catch {}
     try { S.__stableComponentIdToDiffId?.clear?.(); } catch {}
     try { S.__stableFilePathToDiffId?.clear?.(); } catch {}
     try { S.__filePathToDiffId?.clear?.(); } catch {}
     try { S.__lastPanState = null; } catch {}
+    try { S.state?.resetPanState?.(); } catch {}
+    try { S.state?.resetInitialFit?.(); } catch {}
+    try { S.state?.resetTooLarge?.(); } catch {}
 
     try { S.resetFileTreeAvailability?.(); } catch {}
 
