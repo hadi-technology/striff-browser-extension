@@ -26,6 +26,19 @@ test('stripInvalidXmlChars removes raw control bytes but keeps tab/LF/CR', () =>
   assert.equal(stripInvalidXmlChars('a\tb\nc\rd'), 'a\tb\nc\rd');
 });
 
+test('stripInvalidXmlChars removes DEL, C1 controls, and XML noncharacters', () => {
+  assert.equal(stripInvalidXmlChars('a\u007Fb\u0085c\u009Fd'), 'abcd');
+  assert.equal(stripInvalidXmlChars('a\uFFFEb\uFFFFc'), 'abc');
+  assert.equal(stripInvalidXmlChars('a&#x7F;b&#x9F;c&#xFFFE;d&#xFFFF;e'), 'abcde');
+});
+
+test('stripInvalidXmlChars removes lone surrogates but keeps valid pairs', () => {
+  assert.equal(stripInvalidXmlChars('a\uD800b\uDC00c'), 'abc');
+  assert.equal(stripInvalidXmlChars('a&#xD800;b&#xDFFF;c'), 'abc');
+  const emoji = 'doc 😀 text';
+  assert.equal(stripInvalidXmlChars(emoji), emoji);
+});
+
 test('stripInvalidXmlChars leaves ordinary SVG markup untouched', () => {
   const svg = '<svg xmlns="http://www.w3.org/2000/svg"><text x="1" y="2">getName() : String</text></svg>';
   assert.equal(stripInvalidXmlChars(svg), svg);
