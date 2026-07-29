@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.0.5
+
+- The comment panel's "Start review" button is guarded for the whole submit flow — spam-clicking
+  while GitHub's review dialog was being opened appended a duplicate context block and diagram to
+  the draft for every extra click. The button now disables and shows "Opening review…" until the
+  flow finishes or fails.
+- Soft-navigating between PRs no longer carries the previous PR's state along: the in-memory
+  diagram, component maps, and the toolbar button's green success check are all cleared on a PR
+  change, so a newly opened PR primes from its own cache instead of flashing the old PR's diagram.
+- Prefetch no longer skips silently when GitHub's PR-state markup isn't recognized. State
+  detection moved to the shared metadata module, reads the embedded React payload first, scopes
+  badge lookups to the PR header (timeline badges from cross-referenced merged PRs previously
+  misclassified an open PR as merged), and an unknown state now allows prefetch — only a
+  definitive merged/closed skips.
+- Subdiagram previews survive XML-illegal characters in the rendered SVG (control bytes leaking
+  from doc text became `&#8;`-style references that truncated the strict parse to a bare green
+  class box). SVGs are sanitized at receipt, and the preview renders through the same
+  parse-fallback and XSS sanitizer as the main diagram. Server-side companion fix in
+  striff-api#64.
+- "View Striff" no longer resurfaces inside unrelated menus (e.g. the reviewers list on the
+  conversation tab): GitHub reuses dropdown portals across SPA navigation, so injected buttons
+  are now swept on route changes and re-injected only into verified file menus.
+- Generation status words no longer reference code internals ("Parsing AST" → "Analyzing
+  Changes", etc.), and the diagram guide button links to the coupling-metrics explainer.
+
 ## 1.0.4
 
 - Architecture Review panel no longer falls back to rendering raw detector findings when no review
