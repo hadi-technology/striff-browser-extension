@@ -27,6 +27,15 @@ async function rewriteFile(relPath, transform, { description = relPath, mustChan
   await fs.writeFile(target, next, 'utf8');
 }
 
+function stripDevHostPermissions(manifestJson) {
+  // The localhost host permission exists only for local API development; the
+  // Chrome Web Store rejects manifests containing it ("invalid url").
+  const manifest = JSON.parse(manifestJson);
+  manifest.host_permissions = (manifest.host_permissions || [])
+    .filter((entry) => !/localhost|127\.0\.0\.1/.test(entry));
+  return JSON.stringify(manifest, null, 2) + '\n';
+}
+
 function stripPopupDebugSection(html) {
   return html.replace(/\n\s*<div class="section">\s*<label class="debug-label"[^>]*for="debugToggle"[^>]*>[\s\S]*?<\/div>\s*/m, '\n');
 }
@@ -88,6 +97,10 @@ for (const relPath of ['manifest.json', 'html', 'icons', 'lib', 'src']) {
 }
 
 await rmIfExists(path.join(stageDir, 'html', 'config-local-test.json'));
+await rewriteFile('manifest.json', stripDevHostPermissions, {
+  description: 'dev-only host permissions',
+  mustNotContain: ['localhost', '127.0.0.1']
+});
 await rewriteFile('html/popup.html', stripPopupDebugSection, {
   description: 'popup debug section',
   mustNotContain: ['id="debugToggle"']
