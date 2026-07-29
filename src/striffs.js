@@ -2394,21 +2394,21 @@
             const phaseMessages = {
                 "Analyzing": "Analyzing",
                 "Fetching": "Fetching",
-                "Generating": "Parsing AST",
+                "Generating": "Analyzing Changes",
                 "Enriching": "Analyzing",
                 "Loading": "Loading",
                 "default": "Loading"
             };
 
-            // Striffs-specific progress words for the generating phase
+            // Rotating progress words for the generating phase
             const generatingWords = [
-                "Parsing AST",
-                "Resolving Imports",
+                "Analyzing Changes",
+                "Mapping Structure",
                 "Linking Components",
-                "Tracing Changes",
-                "Scoping Symbols",
+                "Organizing Layout",
                 "Building Diagram",
                 "Checking Context",
+                "Refining Details",
                 "Preparing Review"
             ];
 
