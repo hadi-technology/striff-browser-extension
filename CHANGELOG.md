@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Attaching a subdiagram to a review that already contained one no longer duplicates the
+  `**Context:**` line. The attach-confirmation checks matched *any* image markdown, asset URL, or
+  upload node in the draft/form — all left behind by the first attach (and the classic UI's
+  dropzone carries `.js-upload-markdown-image` permanently) — so the second attach was "confirmed"
+  instantly, before its upload landed, and the layout pass appended a context line with no diagram
+  above it. All signals are now deltas against the pre-attach state. A retry after a genuinely
+  failed attach also reuses the orphaned context line instead of stacking a twin.
+
 ## 1.0.5
 
 - The comment panel's "Start review" button is guarded for the whole submit flow — spam-clicking

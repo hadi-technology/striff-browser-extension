@@ -6674,7 +6674,10 @@
     const reviewDraftSnapshot = {
       contextBlock,
       initialDraftText: existingDraftText,
-      submittedText: commentText
+      submittedText: commentText,
+      // Counted before the attach fires so confirmation can insist on a NEW
+      // preview node rather than any preview node.
+      uploadNodeBaseline: countReviewUploadPreviewNodes(reviewForm, textarea)
     };
     // Park the cursor on the blank line reserved between the preserved draft and
     // the context block we just appended, so GitHub drops the uploaded image
@@ -6734,6 +6737,17 @@
       return preserved ? `${preserved}\n\n` : "\n\n";
     }
     if (!preserved) return `\n\n${contextBlock}`;
+    // A draft ending in this exact context block with more context lines than
+    // images is the orphan a failed/interrupted attach left behind (a delivered
+    // attach always has its image above its context line). Reuse the orphan —
+    // the retry's image lands above it via normalizeReviewDraftLayout — instead
+    // of stacking a duplicate context line. When counts balance, the trailing
+    // block belongs to an earlier image pair, so a fresh block is appended.
+    if (preserved.endsWith(contextBlock)) {
+      const imageCount = extractReviewImageTags(preserved).length;
+      const contextCount = (preserved.match(/\*\*Context:\*\*/g) || []).length;
+      if (contextCount > imageCount) return `${preserved}\n\n`;
+    }
     return `${preserved}\n\n${contextBlock}`;
   }
 
@@ -6906,14 +6920,25 @@
     // it starts ingesting a file, later swapping it for the asset URL; an upload preview
     // node may also appear. Either is proof a method "took", so we can stop and avoid
     // firing the remaining methods (which would upload the image twice).
+    // Every signal is a delta against the pre-attach state: a draft that already
+    // holds an earlier attach (image markdown, asset URLs, preview nodes) satisfies
+    // the absolute checks before this upload even begins, which confirmed the second
+    // attach instantly against the first attach's leftovers.
+    const countImageTags = (t) => (String(t || "").match(/!\[[^\]]*\]\([^)]*\)/g) || []).length;
+    const countAssetUrls = (t) =>
+      (String(t || "").match(/githubusercontent\.com|github\.com\/user-attachments\//gi) || []).length;
+    const getScope = () => reviewForm || textarea?.closest("form, [class*='CommentBox'], [class*='MarkdownEditor']") || document;
+    const uploadNodeSelector =
+      'img[src*="githubusercontent.com"], img[src*="user-attachments"], a[href*="user-attachments"], [class*="upload" i][role], [data-testid*="upload"]';
+    const countUploadNodes = () => getScope()?.querySelectorAll?.(uploadNodeSelector).length || 0;
+    const baselineTagCount = countImageTags(textarea?.value);
+    const baselineUrlCount = countAssetUrls(textarea?.value);
+    const baselineNodeCount = countUploadNodes();
     const uploadStarted = () => {
       const text = String(textarea?.value || "");
-      if (/!\[[^\]]*\]\([^)]*\)/.test(text) || /uploading/i.test(text) ||
-          /githubusercontent\.com|github\.com\/user-attachments\//i.test(text)) return true;
-      const scope = reviewForm || textarea?.closest("form, [class*='CommentBox'], [class*='MarkdownEditor']") || document;
-      return !!scope.querySelector?.(
-        'img[src*="githubusercontent.com"], img[src*="user-attachments"], a[href*="user-attachments"], [class*="upload" i][role], [data-testid*="upload"]'
-      );
+      return countImageTags(text) > baselineTagCount ||
+        countAssetUrls(text) > baselineUrlCount ||
+        countUploadNodes() > baselineNodeCount;
     };
     const waitBrief = async (ms) => {
       const end = Date.now() + ms;
@@ -6995,21 +7020,37 @@
     return false;
   }
 
+  // Preview-node selector shared between the confirmation snapshot and the
+  // baseline captured before attaching. Counts (not existence) matter: prior
+  // attaches leave matching nodes behind, and the classic UI's file-attachment
+  // dropzone carries .js-upload-markdown-image statically.
+  const REVIEW_UPLOAD_PREVIEW_SELECTOR =
+    'img[src*="githubusercontent.com"], img[src*="user-attachments"], a[href*="user-attachments"], a[href*="githubusercontent.com"], .js-upload-markdown-image, .js-uploaded-markdown-image';
+
+  function countReviewUploadPreviewNodes(reviewForm, textarea) {
+    const previewRoot = reviewForm || textarea?.closest("form") || document;
+    return previewRoot?.querySelectorAll?.(REVIEW_UPLOAD_PREVIEW_SELECTOR).length || 0;
+  }
+
   function getReviewAttachmentSnapshot(reviewForm, textarea, draftSnapshot = {}) {
     const text = String(textarea?.value || "");
     const initialText = String(draftSnapshot?.submittedText || "");
     const markdownMatches = text.match(/!\[[^\]]*\]\(([^)]+)\)/g) || [];
     const initialMarkdownMatches = initialText.match(/!\[[^\]]*\]\(([^)]+)\)/g) || [];
     const hasNewMarkdownEmbed = markdownMatches.length > initialMarkdownMatches.length;
-    const hasAttachmentUrl = /githubusercontent\.com|github\.com\/user-attachments\//i.test(text);
-    const previewRoot = reviewForm || textarea?.closest("form") || document;
-    const uploadPreview = previewRoot?.querySelector?.(
-      'img[src*="githubusercontent.com"], img[src*="user-attachments"], a[href*="user-attachments"], a[href*="githubusercontent.com"], .js-upload-markdown-image, .js-uploaded-markdown-image'
-    );
+    // Deltas against the seeded draft / pre-attach DOM: an earlier attach's asset
+    // URL or preview node otherwise confirms this attach the moment polling
+    // starts, before the new image markdown exists — fillComposer then appended
+    // the context block with no diagram above it.
+    const countAssetUrls = (t) =>
+      (String(t || "").match(/githubusercontent\.com|github\.com\/user-attachments\//gi) || []).length;
+    const hasNewAttachmentUrl = countAssetUrls(text) > countAssetUrls(initialText);
+    const uploadNodeBaseline = Number(draftSnapshot?.uploadNodeBaseline) || 0;
+    const hasNewUploadPreview = countReviewUploadPreviewNodes(reviewForm, textarea) > uploadNodeBaseline;
     return {
-      embedded: Boolean(hasNewMarkdownEmbed || hasAttachmentUrl || uploadPreview),
+      embedded: Boolean(hasNewMarkdownEmbed || hasNewAttachmentUrl || hasNewUploadPreview),
       hasMarkdownEmbed: hasNewMarkdownEmbed,
-      hasUploadPreview: Boolean(uploadPreview),
+      hasUploadPreview: hasNewUploadPreview,
       textLength: text.length
     };
   }
