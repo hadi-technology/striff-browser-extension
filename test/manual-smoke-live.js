@@ -420,7 +420,14 @@ async function exportLoginProfileCookies() {
   let _cachedSw = null;
   const getServiceWorker = async () => {
     if (_cachedSw) {
-      try { await _cachedSw.evaluate(() => true); return _cachedSw; } catch { _cachedSw = null; }
+      // A hung worker never rejects this evaluate over CDP — without a timeout
+      // every later helper stalls here until MAX_TEST_RUNTIME_MS force-kills the run.
+      const alive = await Promise.race([
+        _cachedSw.evaluate(() => true).then(() => true).catch(() => false),
+        new Promise((resolve) => setTimeout(() => resolve(false), 2000))
+      ]);
+      if (alive) return _cachedSw;
+      _cachedSw = null;
     }
     const findMatchingWorker = async () => {
       for (const worker of context.serviceWorkers()) {
@@ -491,6 +498,7 @@ async function exportLoginProfileCookies() {
 
   // Service worker calls can hang indefinitely if the worker is unhealthy.
   // Keep tests progressing by timing out SW evaluates and treating them as soft failures.
+  let swEvalTimeouts = 0;
   const swEvaluateSoft = async (label, sw, fn, arg, timeoutMs = 5000) => {
     if (!sw) return null;
     let timedOut = false;
@@ -504,7 +512,10 @@ async function exportLoginProfileCookies() {
       warn(`${label}: service worker evaluate failed (${e?.message || e})`);
       return null;
     });
-    if (timedOut) warn(`${label}: service worker evaluate timed out after ${timeoutMs}ms`);
+    if (timedOut) {
+      swEvalTimeouts += 1;
+      warn(`${label}: service worker evaluate timed out after ${timeoutMs}ms`);
+    }
     return result;
   };
 
@@ -1359,6 +1370,23 @@ const setRemoteConfigUrlData = async (jsonObj) => {
     log('clearStriffsExtensionState: done');
   } catch (e) {
     warn(`clearStriffsExtensionState: continuing after failure (${e?.message || e})`);
+  }
+
+  // A worker that timed out during the setup calls above is usually hung for good;
+  // probe it once and exit fast so a scheduled retry starts now, not after the
+  // MAX_TEST_RUNTIME_MS force-kill.
+  if (swEvalTimeouts > 0) {
+    const sw = await getServiceWorker();
+    const alive = sw && await Promise.race([
+      sw.evaluate(() => true).then(() => true).catch(() => false),
+      new Promise((resolve) => setTimeout(() => resolve(false), 3000))
+    ]);
+    if (!alive) {
+      fail('Extension service worker unresponsive during initial setup; bailing fast');
+      ensureCleanup();
+      process.exit(1);
+    }
+    log(`Service worker recovered after ${swEvalTimeouts} evaluate timeout(s); continuing`);
   }
 
   await setApiBaseOverride(PRODUCTION_API_BASE);
