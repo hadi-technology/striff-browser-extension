@@ -1,5 +1,46 @@
 # Changelog
 
+## Unreleased
+
+- Documented rules render from the status the server actually sends. The panel had been splitting
+  rows on a `tier` the API stopped sending and checking for a `RAISED` status it stopped producing,
+  so every row — violations included — displayed as "nothing stood out". One list now, matching the
+  server's single vocabulary: violated, maintained, unclear. Unclear keeps its own rendering rather
+  than folding into maintained, because an abstention shown as a clean bill of health is the failure
+  this section can least afford.
+
+- The enrichment poll waits 5 minutes instead of 2 before giving up. striff-api raised its review
+  budgets (`augmentation-timeout-seconds` 300 → 900, agent timeout 120 → 300) and now runs the
+  review call at high reasoning effort, so the old ceiling fired on reviews that were merely slow
+  rather than broken. Giving up is also no longer reported as a failure: the server keeps working
+  past the point we stop watching, so the message now says the review is still running and to
+  reload to pick it up. The duration is derived from the constant instead of written into the
+  message, which is how it drifted out of sync in the first place.
+- The review panel shows the deterministic check roster it was previously only summarising. All 12
+  structural checks render with their outcome — flagged, observed, or clean — so "nothing surfaced"
+  is legible as the result of twelve checks rather than an unexplained verdict. Findings held below
+  the surfacing gate appear as observation rows, matching what the GitHub check run says about the
+  same finding, and are still never promoted into review items.
+- The panel renders the Documented Rules section: statements extracted from the repository's own
+  docs, with pass/fail on the deterministically checked ones and deliberately no pass/fail on the
+  advisory ones. An advisory row is the model's reading of something nothing verified, so a green
+  tick against one would tell a reviewer their invariant was checked when nothing checked it. The
+  section is absent entirely when no statements were checked. Requires the striff-api change that
+  puts `docFactVerdicts` on the review-status response.
+- The review panel no longer claims a clean pass it cannot support. Detectors that fired but were
+  held below the surfacing gate are still evidence, and "No architectural concerns were found"
+  asserts the detectors found nothing — a different claim from "nothing met the bar to show you".
+  When findings exist but none surfaced, the panel now says so and gives the count. Those findings
+  are still not rendered as items; counting them is what keeps the panel from contradicting the
+  GitHub check run, which draws the same distinction (striff-api `AIReviewResultMapper`). A result
+  where no review ran at all now says so instead of reporting a clean pass.
+- The Architecture Review panel has automated coverage for the first time (`npm run test:panel`).
+  It loads the real content script into a browser DOM and asserts what the panel *claims* for each
+  payload shape, since the failure mode that matters is stating something the analysis did not
+  establish, not a broken layout. Needs a browser but no network and no GitHub login. The live
+  smoke test additionally asserts the overview and both tables against a real API response,
+  including that the overview is a model-written account rather than the old counts placeholder.
+
 ## 1.0.6
 
 - The packaged manifest no longer includes the dev-only `http://localhost:*/*` host permission —

@@ -240,6 +240,14 @@ if (KEEP_PROFILE_FLAG && fs.existsSync(PROFILE)) {
       fs.rmSync(path.join(TEMP_PROFILE, 'SingletonLock'), { force: true });
       fs.rmSync(path.join(TEMP_PROFILE, 'SingletonSocket'), { force: true });
     } catch {}
+    // A profile that carries a service worker registration starts the extension
+    // SW at browser launch, before Playwright attaches to targets — and every
+    // worker.evaluate on such a pre-attach worker hangs forever (raw CDP against
+    // the same worker responds fine). Drop the registrations so the SW registers
+    // after attach; GitHub's own SW re-registers harmlessly on first visit.
+    try {
+      fs.rmSync(path.join(TEMP_PROFILE, 'Default', 'Service Worker'), { recursive: true, force: true });
+    } catch {}
     log('Copied saved profile to isolated temp profile', TEMP_PROFILE);
   } catch (e) {
     warn('Could not copy saved profile; using fresh profile', e);
@@ -2205,6 +2213,41 @@ const setRemoteConfigUrlData = async (jsonObj) => {
     fail(`Live AI review check failed (${JSON.stringify(liveAiReviewResult)})`);
   } else {
     pass('Live AI review returns a changed SVG with at least one AI review note');
+
+    // These assert against the real API response rather than a fixture, so they are the only
+    // check that the server is still sending what the panel is built to render.
+    if (!liveAiReviewResult.overviewRendered) {
+      fail(`Live AI review returned no overview to render (length ${liveAiReviewResult.overviewLength})`);
+    } else if (liveAiReviewResult.overviewIsCountsPlaceholder) {
+      // striff-api replaced this placeholder with a model-written architecturalImpact. Seeing it
+      // again means the model returned nothing and the server fell back to counts the reviewer
+      // can already see — the review is technically present but says nothing.
+      fail(`Live AI review overview is the counts placeholder, not a model account: "${liveAiReviewResult.overview}"`);
+    } else {
+      pass(`Live AI review returns a model-written overview (${liveAiReviewResult.overviewLength} chars)`);
+    }
+
+    // The roster is fixed and renders whenever the review ran, so unlike findings it does not
+    // depend on this PR happening to trip a detector.
+    if (!liveAiReviewResult.panelHasStructuralChecks || liveAiReviewResult.panelCheckRowCount < 12) {
+      fail(`Live AI review panel missing the structural checks table (${JSON.stringify({
+        hasTable: liveAiReviewResult.panelHasStructuralChecks,
+        rows: liveAiReviewResult.panelCheckRowCount,
+        findings: liveAiReviewResult.findingsCount
+      })})`);
+    } else {
+      pass(`Live AI review panel renders the structural checks table (${liveAiReviewResult.panelCheckRowCount} rows, ${liveAiReviewResult.findingsCount} findings)`);
+    }
+
+    // Documented rules depend on the repo having docs stating rules the change reached, so their
+    // absence is a legitimate outcome and only a shape mismatch is worth failing on.
+    if (liveAiReviewResult.docVerdictCount > 0 && !liveAiReviewResult.panelHasDocumentedRules) {
+      fail(`Live AI review returned ${liveAiReviewResult.docVerdictCount} doc verdicts but the panel rendered no table`);
+    } else if (liveAiReviewResult.docVerdictCount > 0) {
+      pass(`Live AI review panel renders documented rules (${liveAiReviewResult.panelRuleRowCount} rows)`);
+    } else {
+      warn('Live AI review returned no documented-rule verdicts for this PR (expected when the repo states no reachable rules)');
+    }
   }
 
   let aiReviewManualOk = true;
@@ -2715,6 +2758,40 @@ const setRemoteConfigUrlData = async (jsonObj) => {
       return false;
     }
     pass('AI Review results panel auto-opens on READY');
+
+    if (!result.readyOutcome?.panelHasOverview) {
+      fail(`Review panel missing the model's overview (${JSON.stringify(result.readyOutcome)})`);
+      return false;
+    }
+    pass('Review panel renders the overview section with the review text');
+
+    // All 12 structural rows render once the review ran. A short roster means clean rows were
+    // dropped, which would turn "checked, clean" back into silence.
+    if (!result.readyOutcome?.panelHasStructuralChecks || result.readyOutcome?.panelCheckRowCount < 12) {
+      fail(`Structural checks table missing or short (${JSON.stringify(result.readyOutcome)})`);
+      return false;
+    }
+    pass(`Review panel renders the structural checks table (${result.readyOutcome.panelCheckRowCount} rows)`);
+
+    if (result.readyOutcome?.panelFlaggedRowCount < 1 || result.readyOutcome?.panelObservedRowCount < 1) {
+      fail(`Structural checks table missing flagged/observation rows (${JSON.stringify(result.readyOutcome)})`);
+      return false;
+    }
+    pass('Structural checks table distinguishes flagged findings from observations');
+
+    if (!result.readyOutcome?.panelHasDocumentedRules || result.readyOutcome?.panelRuleRowCount < 2) {
+      fail(`Documented rules table missing or short (${JSON.stringify(result.readyOutcome)})`);
+      return false;
+    }
+    pass(`Review panel renders the documented rules table (${result.readyOutcome.panelRuleRowCount} rows)`);
+
+    // An advisory row is the model's reading of something nothing verified. A pass/fail tick
+    // against one would tell a reviewer their invariant was checked when nothing checked it.
+    if (result.readyOutcome?.panelAdvisoryHasVerdict) {
+      fail(`Advisory documented rule rendered a pass/fail verdict (${JSON.stringify(result.readyOutcome)})`);
+      return false;
+    }
+    pass('Advisory documented rules carry no pass/fail verdict');
 
     if (!result.failedOutcome?.ok || result.failedOutcome?.enrichedStillPresent || result.failedOutcome?.status !== 'FAILED') {
       fail(`Manual AI review FAILED polling path failed (${JSON.stringify(result.failedOutcome)})`);
