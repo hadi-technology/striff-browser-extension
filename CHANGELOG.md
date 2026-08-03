@@ -1,7 +1,10 @@
 # Changelog
 
-## Unreleased
+## 1.0.6
 
+- The packaged manifest no longer includes the dev-only `http://localhost:*/*` host permission —
+  it existed only for local API development, and the Chrome Web Store rejects manifests that
+  contain it.
 - Attaching a subdiagram to a review that already contained one no longer duplicates the
   `**Context:**` line. The attach-confirmation checks matched *any* image markdown, asset URL, or
   upload node in the draft/form — all left behind by the first attach (and the classic UI's

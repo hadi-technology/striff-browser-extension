@@ -12,7 +12,23 @@
   // ---------- Constants / State ----------
   S.MAX_UNAUTH_ZIP_SIZE_MB = 50;
   S.CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
-  S.ENRICHMENT_POLL_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
+  // Deliberately shorter than the server's own bound on a review
+  // (striff.ai.review.augmentation-timeout-seconds=900): a reviewer watching an indeterminate
+  // spinner for fifteen minutes is a worse outcome than an early "gave up" message, and the
+  // review is not lost when we stop waiting -- it completes server-side and the next load of the
+  // PR picks it up as READY. The old 2-minute ceiling predates the docs-aware path (three
+  // sequential model calls) and the review call moving to high reasoning effort, so it fired on
+  // reviews that were merely slow rather than broken.
+  S.ENRICHMENT_POLL_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+
+  // Derived from the constant rather than written out, so raising the budget to follow the server
+  // cannot leave the message quoting a number that stopped being true.
+  S.formatPollTimeout = function formatPollTimeout(ms = S.ENRICHMENT_POLL_TIMEOUT_MS) {
+    const totalSeconds = Math.round(Number(ms) / 1000);
+    if (totalSeconds < 60) return `${totalSeconds} second${totalSeconds === 1 ? "" : "s"}`;
+    const minutes = Math.round(totalSeconds / 60);
+    return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+  };
   S.TIMEOUTS = Object.freeze({
     message: 7000,
     ping: 1000,
@@ -7444,6 +7460,107 @@
         font-size:36px;
         margin-bottom:12px;
       }
+      .striffs-arch-review-panel__section-note{
+        font-size:12px;
+        line-height:1.45;
+        color:var(--fgColor-muted,#6e7781);
+        margin-bottom:10px;
+      }
+      /* --- Documented rules --- */
+      .striffs-arch-review-panel__rule{
+        padding:10px 12px;
+        border:1px solid rgba(15,23,42,.08);
+        border-left-width:3px;
+        border-radius:8px;
+        margin-bottom:8px;
+        background:#f8fafc;
+      }
+      .striffs-arch-review-panel__rule--fail{
+        border-left-color:rgba(207,34,46,.55);
+        background:rgba(255,235,233,.5);
+      }
+      .striffs-arch-review-panel__rule--pass{ border-left-color:rgba(26,127,55,.45); }
+      /* Advisory rows are deliberately colourless: any pass/fail palette would read as a verdict,
+         and nothing verified these. */
+      .striffs-arch-review-panel__rule--advisory{ border-left-color:rgba(110,118,129,.35); }
+      .striffs-arch-review-panel__rule-head{
+        display:flex;
+        align-items:baseline;
+        justify-content:space-between;
+        gap:8px;
+        margin-bottom:5px;
+      }
+      .striffs-arch-review-panel__rule-verdict{
+        font-size:12px;
+        font-weight:600;
+        white-space:nowrap;
+      }
+      .striffs-arch-review-panel__rule-source{
+        font-size:11px;
+        color:var(--fgColor-muted,#6e7781);
+        font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",Menlo,monospace;
+        overflow:hidden;
+        text-overflow:ellipsis;
+        white-space:nowrap;
+      }
+      .striffs-arch-review-panel__rule-statement{
+        font-size:13px;
+        line-height:1.45;
+        color:var(--fgColor-default,#1f2328);
+      }
+      .striffs-arch-review-panel__rule-detail{
+        margin-top:5px;
+        font-size:12px;
+        line-height:1.45;
+        color:var(--fgColor-muted,#6e7781);
+        overflow-wrap:anywhere;
+      }
+      .striffs-arch-review-panel__advisory-note{
+        font-size:12px;
+        line-height:1.45;
+        color:var(--fgColor-muted,#6e7781);
+        margin:12px 0 8px;
+        padding-top:10px;
+        border-top:1px dashed var(--borderColor-muted,#d8dee4);
+      }
+      /* --- Structural checks --- */
+      .striffs-arch-review-panel__check{
+        padding:7px 10px;
+        border-radius:6px;
+        margin-bottom:4px;
+        background:#f8fafc;
+      }
+      .striffs-arch-review-panel__check--clean{ background:transparent; }
+      .striffs-arch-review-panel__check--flagged{ background:rgba(255,235,233,.5); }
+      .striffs-arch-review-panel__check-head{
+        display:flex;
+        align-items:baseline;
+        justify-content:space-between;
+        gap:8px;
+      }
+      .striffs-arch-review-panel__check-name{
+        font-size:13px;
+        color:var(--fgColor-default,#1f2328);
+      }
+      .striffs-arch-review-panel__check--clean .striffs-arch-review-panel__check-name{
+        color:var(--fgColor-muted,#6e7781);
+      }
+      .striffs-arch-review-panel__check-verdict{
+        font-size:12px;
+        white-space:nowrap;
+        color:var(--fgColor-muted,#6e7781);
+      }
+      .striffs-arch-review-panel__check--flagged .striffs-arch-review-panel__check-verdict{
+        font-weight:600;
+        color:var(--fgColor-default,#1f2328);
+      }
+      .striffs-arch-review-panel__check-detail{
+        margin-top:4px;
+        font-size:12px;
+        line-height:1.4;
+        color:var(--fgColor-muted,#6e7781);
+        overflow-wrap:anywhere;
+      }
       .striffs-arch-review-panel__footer{
         padding:10px 16px;
         border-top:1px solid var(--borderColor-muted,#d8dee4);
@@ -8362,6 +8479,178 @@
     return escHtml(s).replace(/`([^`]+)`/g, '<code class="striffs-arch-review-panel__code">$1</code>');
   }
 
+  // Reviewer-facing names for the fixed detector roster, mirroring
+  // CheckRunFormatter.STRUCTURAL_CHECK_NAMES / DOC_CHECK_NAMES so the panel and the check run
+  // name the same check the same way on the same PR. Order matters: it is the order clean rows
+  // render in. A detector absent from this map is absent from the API's roster too -- an
+  // unrecognized id is skipped rather than shown under its raw enum name.
+  const STRUCTURAL_CHECK_NAMES = [
+    ["NEW_PACKAGE_CYCLE", "Package cycles"],
+    ["CYCLIC_DEPENDENCY_SEED", "Cycle seeds"],
+    ["NEW_DIRECTIONAL_BOUNDARY_CROSSING", "Boundary crossings"],
+    ["MODULE_BOUNDARY_VIOLATION", "Module boundaries"],
+    ["LAYER_SKIP", "Layer integrity"],
+    ["PRODUCTION_DEPENDS_ON_TEST", "Production → test edges"],
+    ["STABLE_CONTRACT_CHANGE", "Public contract stability"],
+    ["INTERFACE_TO_CONCRETE_DOWNGRADE", "Interface downgrades"],
+    ["ENCAPSULATION_DROP", "Encapsulation"],
+    ["HUB_FORMATION", "Hub formation"],
+    ["WMC_GROWTH", "Complexity growth"],
+    ["INSTABILITY_SPIKE", "Coupling stability"]
+  ];
+  // Doc-tier checks render above the structural roster -- a rule the team wrote down outranks a
+  // generic heuristic -- and never render a clean row: the evaluator records violations only, so
+  // "held" cannot be derived from the absence of one.
+  const DOC_CHECK_NAMES = [
+    ["DOC_DEPENDENCY_RULE", "Documented dependency rules"],
+    ["DOC_ARCHITECTURE_ADVISORY", "Documented intentions"]
+  ];
+
+  /**
+   * Whether the deterministic detectors actually ran for this result. Mirrors
+   * CheckRunFormatter.reviewRan: a populated review summary is only ever written by a completed
+   * pass, and findings can only come from live detectors. Absent both, rendering the roster would
+   * present "didn't check" as "checked, clean" -- the one claim this panel must never make.
+   */
+  function reviewRan(result) {
+    if (result?.reviewSummary && Object.keys(result.reviewSummary).length > 0) return true;
+    return Array.isArray(result?.findings) && result.findings.length > 0;
+  }
+
+  function shortDocPath(path) {
+    const s = String(path || "");
+    const slash = s.lastIndexOf("/");
+    return slash < 0 ? s : s.slice(slash + 1);
+  }
+
+  function simpleName(fqn) {
+    const s = String(fqn || "");
+    const dot = s.lastIndexOf(".");
+    return dot < 0 ? s : s.slice(dot + 1);
+  }
+
+  /**
+   * The repository's own documentation, and how this change fared against it.
+   *
+   * One list, because there is now one kind of row: every rule here was quoted out of the docs and
+   * judged by the model against this change. An earlier design split these into a deterministically
+   * checked tier and a judged tier; the server collapsed them, and the split left behind here went
+   * on filtering for a `tier` and a `RAISED` status that no longer arrive -- so every row, including
+   * violations, rendered as "nothing stood out".
+   *
+   * "Couldn't tell" must stay distinct from "not broken". Folding the two would turn an abstention
+   * into a clean bill of health, in the one place a reader would most trust it.
+   *
+   * Absent entirely when no statements were checked -- an empty section implies the docs were
+   * consulted and found silent, which is a different claim from not having consulted them.
+   */
+  function buildDocumentedRulesHtml(result) {
+    const verdicts = Array.isArray(result?.docFactVerdicts) ? result.docFactVerdicts.filter(Boolean) : [];
+    if (verdicts.length === 0) return "";
+
+    // Violations first: the reason anyone reads this.
+    const sorted = verdicts.slice().sort((a, b) =>
+      Number(b.status === "VIOLATED") - Number(a.status === "VIOLATED"));
+
+    const html = sorted.map(v => {
+      const violated = v.status === "VIOLATED";
+      const held = v.status === "MAINTAINED";
+      const modifier = violated ? "fail" : (held ? "pass" : "advisory");
+      const verdict = violated
+        ? "❌ broken by this change"
+        : (held ? "✅ not broken by this change" : "💭 couldn't tell");
+      const detail = violated && Array.isArray(v.evidence) && v.evidence.length > 0
+        ? v.evidence[0]
+        : v.quote;
+      return `<div class="striffs-arch-review-panel__rule striffs-arch-review-panel__rule--${modifier}">
+          <div class="striffs-arch-review-panel__rule-head">
+            <span class="striffs-arch-review-panel__rule-verdict">${verdict}</span>
+            <span class="striffs-arch-review-panel__rule-source">${escHtml(shortDocPath(v.sourceDocPath))}</span>
+          </div>
+          <div class="striffs-arch-review-panel__rule-statement">${escHtmlWithCode(v.statement || "")}</div>
+          ${detail ? `<div class="striffs-arch-review-panel__rule-detail">${escHtmlWithCode(detail)}</div>` : ""}
+        </div>`;
+    }).join("");
+
+    return `<div class="striffs-arch-review-panel__section">
+      <div class="striffs-arch-review-panel__section-title">Documented Rules</div>
+      <div class="striffs-arch-review-panel__section-note">Rules quoted from this repository's own docs, judged against what this PR changes. This is striff's reading, not a proof — and it only sees the change, so a rule shown as held here may already be broken elsewhere.</div>
+      ${html}
+    </div>`;
+  }
+
+  /**
+   * The deterministic check roster and how each fared. Showing which checks ran is what makes the
+   * empty result legible: "nothing surfaced" is a much weaker statement on its own than beside the
+   * twelve checks that produced it.
+   *
+   * Findings held below the surfacing gate appear as observations rather than items, which is not
+   * the same as routing around the server's surfacing decision -- an observation row states that a
+   * detector saw something and that it was not judged worth raising, which is exactly what the
+   * check run says about the same finding.
+   */
+  function buildStructuralChecksHtml(result) {
+    if (!reviewRan(result)) return "";
+    const findings = Array.isArray(result?.findings) ? result.findings.filter(Boolean) : [];
+    const surfacedIds = new Set(
+      (Array.isArray(result?.surfacedItems) ? result.surfacedItems : [])
+        .map(i => i?.itemId).filter(Boolean));
+
+    const byDetector = new Map();
+    findings.forEach(f => {
+      const id = String(f.detectorId || "");
+      if (!id) return;
+      if (!byDetector.has(id)) byDetector.set(id, []);
+      byDetector.get(id).push(f);
+    });
+
+    const strongestExample = (observations) => {
+      const first = observations[0];
+      if (!first) return "";
+      const components = Array.isArray(first.affectedComponents)
+        ? first.affectedComponents
+        : (first.affectedComponents ? Object.values(first.affectedComponents) : []);
+      const component = components.filter(Boolean).slice().sort()[0];
+      const title = first.title || "";
+      return component ? `\`${simpleName(component)}\`: ${title}` : title;
+    };
+
+    const checkRow = (name, verdict, detail, state) => `<div class="striffs-arch-review-panel__check striffs-arch-review-panel__check--${state}">
+      <div class="striffs-arch-review-panel__check-head">
+        <span class="striffs-arch-review-panel__check-name">${escHtml(name)}</span>
+        <span class="striffs-arch-review-panel__check-verdict">${verdict}</span>
+      </div>
+      ${detail ? `<div class="striffs-arch-review-panel__check-detail">${escHtmlWithCode(detail)}</div>` : ""}
+    </div>`;
+
+    const rows = (roster, skipCleanRows) => {
+      const flagged = [], observed = [], clean = [];
+      roster.forEach(([detectorId, name]) => {
+        const checkFindings = byDetector.get(detectorId) || [];
+        const flaggedCount = checkFindings.filter(f => surfacedIds.has(f.findingId)).length;
+        const observations = checkFindings.filter(f => !surfacedIds.has(f.findingId));
+        if (flaggedCount > 0) {
+          const extra = observations.length > 0
+            ? ` · 👀 ${observations.length} observation${observations.length === 1 ? "" : "s"}`
+            : "";
+          flagged.push(checkRow(name, `❗ ${flaggedCount} flagged${extra}`, "see Review Items above", "flagged"));
+        } else if (observations.length > 0) {
+          observed.push(checkRow(name, `👀 ${observations.length} observation${observations.length === 1 ? "" : "s"}`,
+            strongestExample(observations), "observed"));
+        } else if (!skipCleanRows) {
+          clean.push(checkRow(name, "✅ clean", "", "clean"));
+        }
+      });
+      return flagged.join("") + observed.join("") + clean.join("");
+    };
+
+    return `<div class="striffs-arch-review-panel__section">
+      <div class="striffs-arch-review-panel__section-title">Structural Checks</div>
+      <div class="striffs-arch-review-panel__section-note">Deterministic checks run against the changed scope of this PR. Observations are context, not violations.</div>
+      ${rows(DOC_CHECK_NAMES, true)}${rows(STRUCTURAL_CHECK_NAMES, false)}
+    </div>`;
+  }
+
   function buildArchReviewPanelHtml(result) {
     const summary = result?.reviewSummary || {};
     const surfacedItems = Array.isArray(result?.surfacedItems) ? result.surfacedItems : [];
@@ -8428,12 +8717,45 @@
       // whose precision has not been measured yet. Rendering them would route around the
       // server's surfacing decision and make this panel contradict the check run on the same
       // PR -- which is the credibility the fact-first model exists to protect.
-      bodyHtml += `<div class="striffs-arch-review-panel__good">
+      //
+      // Counting them is not rendering them, though, and the count is what keeps this honest.
+      // "No architectural concerns were found" asserts the detectors found nothing, which is a
+      // different claim from "nothing met the bar to show you" -- and the wrong one whenever
+      // evidence exists. striff-api draws exactly this distinction in its own headline
+      // (AIReviewResultMapper), so stating the stronger claim here would have the panel
+      // contradict the check run on the same PR.
+      const heldBack = Array.isArray(result?.findings) ? result.findings.length : 0;
+      if (!reviewRan(result)) {
+        // Nothing was checked, so no cleanliness claim is available to make. This is the same
+        // distinction the Structural Checks roster is suppressed on just below, and the stronger
+        // of the two errors: "we found nothing" against an analysis that never ran is a green
+        // tick nobody earned, in the one place a reviewer would most trust it.
+        bodyHtml += `<div class="striffs-arch-review-panel__good">
+        <div class="striffs-arch-review-panel__good-icon">–</div>
+        <div style="font-size:15px;font-weight:600;margin-bottom:6px;">No review recorded</div>
+        <div>No structural analysis is available for this changeset, so there is nothing to report either way.</div>
+      </div>`;
+      } else if (heldBack > 0) {
+        bodyHtml += `<div class="striffs-arch-review-panel__good">
+        <div class="striffs-arch-review-panel__good-icon">✓</div>
+        <div style="font-size:15px;font-weight:600;margin-bottom:6px;">Nothing surfaced for review</div>
+        <div>${heldBack === 1
+          ? "1 evidence-only finding was recorded as context, but it did not meet the bar to raise here."
+          : `${heldBack} evidence-only findings were recorded as context, but none met the bar to raise here.`}</div>
+      </div>`;
+      } else {
+        bodyHtml += `<div class="striffs-arch-review-panel__good">
         <div class="striffs-arch-review-panel__good-icon">✓</div>
         <div style="font-size:15px;font-weight:600;margin-bottom:6px;">Everything looks good</div>
         <div>No architectural concerns were found in this changeset.</div>
       </div>`;
+      }
     }
+
+    // Documented rules above structural checks, and both below the items: the same order the
+    // check run uses, so a reviewer moving between the two surfaces reads the same PR the same way.
+    bodyHtml += buildDocumentedRulesHtml(result);
+    bodyHtml += buildStructuralChecksHtml(result);
 
     // Footer stats
     const changed = summary.changedComponents || 0;
@@ -8653,9 +8975,13 @@
       if (S.__aiReviewPollStartedAt && (Date.now() - S.__aiReviewPollStartedAt) > S.ENRICHMENT_POLL_TIMEOUT_MS) {
         S.cancelEnrichmentPolling?.("timeout");
         S.__aiReviewStatus = "FAILED";
-        S.updateStriffButton?.({ success: true, tooltip: "AI review timed out. Base diagram is still available." });
+        // We stopped waiting; the server did not stop working. Its own bound on a review is
+        // longer than ours, so the likely state here is "still running", not "failed" -- and it
+        // finishes into the operation record, which the next load of this PR reads back as READY.
+        // Saying "failed" would send the reviewer looking for a problem that does not exist.
+        S.updateStriffButton?.({ success: true, tooltip: "AI review is taking longer than usual. Reload the page to check for it. Base diagram is still available." });
         S.updateArchReviewButton?.();
-        S.toast?.("AI enrichment timed out after 2 minutes.", "neutral", { timeoutMs: 5000 });
+        S.toast?.(`AI review is still running after ${S.formatPollTimeout?.() || "a while"} — reload the page to pick it up once it finishes.`, "neutral", { timeoutMs: 6000 });
         return;
       }
 
@@ -10165,7 +10491,12 @@
               totalComponents: 1
             } : undefined),
             surfacedItems: extras.surfacedItems || [],
+            // Findings and doc verdicts drive the Structural Checks and Documented Rules sections.
+            // They are fixtures rather than live data on purpose: a real PR may legitimately
+            // produce neither, so asserting against the live payload alone could never tell an
+            // empty result apart from a section that stopped rendering.
             findings: extras.findings || [],
+            docFactVerdicts: extras.docFactVerdicts || [],
             striffs: [{
               svgCode: svgText,
               size: 1,
@@ -10175,7 +10506,56 @@
           });
 
           const enrichedSvg = originalSvg.replace('<svg', '<svg data-manual-enriched="1"');
-          const readyResult = makeResult('READY', enrichedSvg, { aiReviewId: 'manual-ready' });
+          const readyResult = makeResult('READY', enrichedSvg, {
+            aiReviewId: 'manual-ready',
+            // One surfaced finding and one held below the gate, so the checks section has to
+            // render a flagged row and an observation row rather than an all-clean roster.
+            surfacedItems: [{
+              itemId: 'manual-f1',
+              priority: 'STRUCTURAL_REGRESSION',
+              title: 'Manual smoke surfaced item',
+              whyShown: 'Manual smoke why',
+              reviewAction: 'Manual smoke action',
+              docConflict: false
+            }],
+            findings: [
+              {
+                findingId: 'manual-f1',
+                detectorId: 'NEW_PACKAGE_CYCLE',
+                title: 'Manual smoke cycle',
+                summary: 'Manual smoke summary',
+                affectedComponents: ['com.manual.smoke.Alpha']
+              },
+              {
+                findingId: 'manual-f2',
+                detectorId: 'WMC_GROWTH',
+                title: 'Manual smoke complexity',
+                summary: 'Manual smoke complexity summary',
+                affectedComponents: ['com.manual.smoke.Beta']
+              }
+            ],
+            // One of each outcome, so the smoke test would catch an abstention rendering as held.
+            docFactVerdicts: [
+              {
+                factId: 'manual-d1',
+                subject: 'com.manual.smoke',
+                statement: 'manual smoke rule',
+                sourceDocPath: 'docs/manual-smoke.md',
+                quote: 'Manual smoke quote.',
+                status: 'VIOLATED',
+                evidence: ['com.manual.smoke.Alpha -> com.manual.smoke.Beta']
+              },
+              {
+                factId: 'manual-d2',
+                subject: 'com.manual.smoke',
+                statement: 'manual smoke intention',
+                sourceDocPath: 'docs/manual-smoke.md',
+                quote: 'Manual smoke intention quote.',
+                status: 'UNCLEAR',
+                evidence: []
+              }
+            ]
+          });
           const failedResult = makeResult('FAILED', originalSvg, {
             aiReviewId: 'manual-failed',
             aiReviewErrorCode: 'MANUAL_FAIL',
@@ -10232,6 +10612,8 @@
                   statusReady
                 ));
                 if (enrichedNode && buttonLooksReady && statusReady) {
+                  const panelNode = document.getElementById('striffs-arch-review-panel');
+                  const panelText = String(panelNode?.innerText || '');
                   resolve({
                     ok: true,
                     calls: readyCalls,
@@ -10241,7 +10623,30 @@
                     pollTimerActive: Boolean(S.__aiReviewPollTimer),
                     archBtnDisabled: archBtnNow?.disabled,
                     archBtnText: String(archBtnNow?.textContent || '').trim(),
-                    panelOpen
+                    panelOpen,
+                    panelHasOverview: panelText.includes('OVERVIEW')
+                      && panelText.includes('This is a manual smoke test review.'),
+                    panelHasStructuralChecks: panelText.includes('STRUCTURAL CHECKS'),
+                    panelHasDocumentedRules: panelText.includes('DOCUMENTED RULES'),
+                    // The full 12-check structural roster renders whenever the review ran. The
+                    // doc-tier rows are violation-only, and no doc-tier detector fires in this
+                    // fixture, so they contribute nothing here.
+                    panelCheckRowCount: panelNode
+                      ? panelNode.querySelectorAll('.striffs-arch-review-panel__check').length
+                      : 0,
+                    panelRuleRowCount: panelNode
+                      ? panelNode.querySelectorAll('.striffs-arch-review-panel__rule').length
+                      : 0,
+                    panelFlaggedRowCount: panelNode
+                      ? panelNode.querySelectorAll('.striffs-arch-review-panel__check--flagged').length
+                      : 0,
+                    panelObservedRowCount: panelNode
+                      ? panelNode.querySelectorAll('.striffs-arch-review-panel__check--observed').length
+                      : 0,
+                    // Advisory rows must never carry a pass/fail verdict.
+                    panelAdvisoryHasVerdict: /✅|❌/.test(String(
+                      panelNode?.querySelector('.striffs-arch-review-panel__rule--advisory')?.innerText || ''
+                    ))
                   });
                   return;
                 }
@@ -10423,6 +10828,13 @@
                   finalLength: finalSvg.length
                 };
               }
+              // Render the panel from the live payload so the report below describes what a
+              // reviewer would actually see, not just what the response contained.
+              S.__lastEnrichmentResult = result;
+              S.openArchReviewPanel?.(result);
+              const panel = document.getElementById('striffs-arch-review-panel');
+              const panelText = String(panel?.innerText || '');
+              const overview = String(result?.reviewSummary?.overview || '').trim();
               return {
                 ok: Boolean(hasNote && finalSvg && finalSvg !== baseSvg),
                 status,
@@ -10430,7 +10842,26 @@
                 changed: Boolean(finalSvg && finalSvg !== baseSvg),
                 hasNote,
                 baseLength: baseSvg.length,
-                finalLength: finalSvg.length
+                finalLength: finalSvg.length,
+                // The model's account of the change. Before striff-api's architecturalImpact work
+                // this was a placeholder restating two counts already on screen, so a non-empty
+                // overview is not enough on its own — the placeholder shape has to be excluded or
+                // the assertion passes on exactly the content that made the field worthless.
+                overview,
+                overviewLength: overview.length,
+                overviewIsCountsPlaceholder: /^Reviewed \d+ components? and \d+ relationships?/i.test(overview),
+                overviewRendered: overview.length > 0 && panelText.includes('OVERVIEW'),
+                findingsCount: Array.isArray(result?.findings) ? result.findings.length : 0,
+                surfacedCount: Array.isArray(result?.surfacedItems) ? result.surfacedItems.length : 0,
+                docVerdictCount: Array.isArray(result?.docFactVerdicts) ? result.docFactVerdicts.length : 0,
+                panelHasStructuralChecks: panelText.includes('STRUCTURAL CHECKS'),
+                panelHasDocumentedRules: panelText.includes('DOCUMENTED RULES'),
+                panelCheckRowCount: panel
+                  ? panel.querySelectorAll('.striffs-arch-review-panel__check').length
+                  : 0,
+                panelRuleRowCount: panel
+                  ? panel.querySelectorAll('.striffs-arch-review-panel__rule').length
+                  : 0
               };
             }
             if (status === 'FAILED') {
