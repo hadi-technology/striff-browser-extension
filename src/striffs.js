@@ -7480,6 +7480,12 @@
         background:rgba(255,235,233,.5);
       }
       .striffs-arch-review-panel__rule--pass{ border-left-color:rgba(26,127,55,.45); }
+      /* Already broken before this PR. Amber rather than red: the rule is genuinely broken, so it
+         must not read as a pass, but nothing here is this author's doing. */
+      .striffs-arch-review-panel__rule--stale{
+        border-left-color:rgba(154,103,0,.5);
+        background:rgba(255,248,197,.35);
+      }
       /* Advisory rows are deliberately colourless: any pass/fail palette would read as a verdict,
          and nothing verified these. */
       .striffs-arch-review-panel__rule--advisory{ border-left-color:rgba(110,118,129,.35); }
@@ -8538,8 +8544,16 @@
    * on filtering for a `tier` and a `RAISED` status that no longer arrive -- so every row, including
    * violations, rendered as "nothing stood out".
    *
-   * "Couldn't tell" must stay distinct from "not broken". Folding the two would turn an abstention
-   * into a clean bill of health, in the one place a reader would most trust it.
+   * Four states, because the server sends four. An earlier revision here collapsed this to a binary
+   * on the premise that "the server drops rules that govern nothing in the change before they reach
+   * a verdict". That premise is wrong: `touchesChange` is a FIELD on the verdict, and only the
+   * GitHub check-run formatter filters on it -- `AIReviewController` and `StriffResponseAssembler`
+   * both hand this payload the complete record. A scrapy review sends 15 UNCLEAR rows out of 20, and
+   * under the binary every one of them rendered "not broken by this change".
+   *
+   * "Couldn't tell" must stay distinct from "not broken", and "already broken" from both. Folding
+   * any of them into the pass state turns an abstention, or a live violation, into a clean bill of
+   * health in the one place a reader would most trust it.
    *
    * Absent entirely when no statements were checked -- an empty section implies the docs were
    * consulted and found silent, which is a different claim from not having consulted them.
@@ -8548,19 +8562,27 @@
     const verdicts = Array.isArray(result?.docFactVerdicts) ? result.docFactVerdicts.filter(Boolean) : [];
     if (verdicts.length === 0) return "";
 
-    // Violations first: the reason anyone reads this.
-    const sorted = verdicts.slice().sort((a, b) =>
-      Number(b.status === "VIOLATED") - Number(a.status === "VIOLATED"));
+    // Most actionable first: what this PR broke, then what was already broken, then what holds,
+    // then what could not be checked.
+    const ORDER = { VIOLATED: 0, PRE_EXISTING: 1, MAINTAINED: 2, UNCLEAR: 3 };
+    const rank = v => (v.status in ORDER ? ORDER[v.status] : ORDER.UNCLEAR);
+    const sorted = verdicts.slice().sort((a, b) => rank(a) - rank(b));
 
     const html = sorted.map(v => {
       const violated = v.status === "VIOLATED";
+      const alreadyBroken = v.status === "PRE_EXISTING";
       const held = v.status === "MAINTAINED";
-      const modifier = violated ? "fail" : (held ? "pass" : "advisory");
-      const verdict = violated
-        ? "❌ broken by this change"
-        : (held ? "✅ not broken by this change" : "💭 couldn't tell");
-      const detail = violated && Array.isArray(v.evidence) && v.evidence.length > 0
-        ? v.evidence[0]
+      // An unrecognised status falls in with "couldn't tell" rather than with "holds": a server
+      // that grows a fifth outcome must not have it render as a pass here.
+      const modifier = violated ? "fail" : alreadyBroken ? "stale" : held ? "pass" : "advisory";
+      const verdict = violated ? "❌ broken by this change"
+        : alreadyBroken ? "⚠️ already broken, not by this PR"
+        : held ? "✅ holds"
+        : "💭 couldn't check";
+      // A pre-existing violation carries its witnessing edges too -- they are the whole value of
+      // the row. The last entry is the edge; the first is the explanatory note.
+      const detail = (violated || alreadyBroken) && Array.isArray(v.evidence) && v.evidence.length > 0
+        ? v.evidence[v.evidence.length - 1]
         : v.quote;
       return `<div class="striffs-arch-review-panel__rule striffs-arch-review-panel__rule--${modifier}">
           <div class="striffs-arch-review-panel__rule-head">
@@ -8574,7 +8596,7 @@
 
     return `<div class="striffs-arch-review-panel__section">
       <div class="striffs-arch-review-panel__section-title">Documented Rules</div>
-      <div class="striffs-arch-review-panel__section-note">Rules quoted from this repository's own docs, judged against what this PR changes. This is striff's reading, not a proof — and it only sees the change, so a rule shown as held here may already be broken elsewhere.</div>
+      <div class="striffs-arch-review-panel__section-note">Rules quoted from this repository's own docs and checked against the dependency graph this PR produces. A rule shown as holding was not broken anywhere in that graph; one shown as already broken was broken before this PR too.</div>
       ${html}
     </div>`;
   }
@@ -10553,6 +10575,16 @@
                 quote: 'Manual smoke intention quote.',
                 status: 'UNCLEAR',
                 evidence: []
+              },
+              {
+                factId: 'manual-d3',
+                subject: 'com.manual.smoke.legacy',
+                statement: 'manual smoke pre-existing drift',
+                sourceDocPath: 'docs/manual-smoke.md',
+                quote: 'Manual smoke pre-existing quote.',
+                status: 'PRE_EXISTING',
+                evidence: ['already broken before this change; this change did not add to it',
+                  'com.manual.smoke.legacy.Old -> com.manual.smoke.Beta']
               }
             ]
           });

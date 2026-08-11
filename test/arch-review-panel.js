@@ -65,7 +65,7 @@ const FLAGGED_WITH_DOCS = {
     { factId: 'd1', subject: 'com.app.domain', statement: 'domain must not depend on infrastructure', sourceDocPath: 'docs/architecture/adr-001-layering.md', quote: 'The domain layer must not depend on infrastructure.', status: 'MAINTAINED', evidence: [] },
     { factId: 'd2', subject: 'com.app.web', statement: 'web must not reach the persistence layer directly', sourceDocPath: 'docs/architecture.md', quote: 'Controllers talk to services, never to repositories.', status: 'VIOLATED', evidence: ['com.app.web.OrderController -> com.app.persistence.OrderRepository'] },
     { factId: 'd3', subject: 'com.app.billing', statement: 'billing owns all money arithmetic', sourceDocPath: 'docs/invariants.md', quote: 'All money arithmetic lives in billing.', status: 'UNCLEAR', evidence: [] },
-    { factId: 'd4', subject: 'com.app.audit', statement: 'every mutation writes an audit record', sourceDocPath: 'docs/invariants.md', quote: 'Every mutation writes an audit record.', status: 'UNCLEAR', evidence: [] }
+    { factId: 'd4', subject: 'com.app.audit', statement: 'every mutation writes an audit record', sourceDocPath: 'docs/invariants.md', quote: 'Every mutation writes an audit record.', status: 'PRE_EXISTING', evidence: ['already broken before this change; this change did not add to it', 'com.app.audit.Writer -> com.app.web.Session'] }
   ]
 };
 
@@ -140,15 +140,23 @@ const XSS = {
     const { text } = await render(FLAGGED_WITH_DOCS);
     check('renders the surfaced item', text.includes('New package cycle'));
     check('renders a documented-rule violation', text.includes('❌ broken by this change'));
-    check('renders a rule the change did not break', text.includes('✅ not broken by this change'));
+    check('renders a rule the change did not break', text.includes('✅ holds'));
     check('violations sort above the rules that held',
-      text.indexOf('❌ broken by this change') < text.indexOf('✅ not broken by this change'));
-    // The row that would be cheapest to fold away and most expensive to get wrong: an abstention
-    // shown as a clean bill of health is the failure this section can least afford.
-    check("an unclear verdict is not rendered as held", text.includes("💭 couldn't tell"));
-    check('the section says it is a reading, not a proof', text.includes('not a proof'));
-    check('the section says it only saw the change',
-      text.includes('may already be broken elsewhere'));
+      text.indexOf('❌ broken by this change') < text.indexOf('✅ holds'));
+    // The two rows that are cheapest to fold into the pass state and most expensive to get wrong.
+    // An abstention or a live violation shown as a clean bill of health is the failure this
+    // section can least afford -- and a previous revision made exactly that trade, on the false
+    // premise that the server filters these out before they arrive. It does not: a scrapy review
+    // sends 15 UNCLEAR rows out of 20.
+    check("an unclear verdict is not rendered as held", text.includes("💭 couldn't check"));
+    check('a pre-existing violation is not rendered as held',
+      text.includes('⚠️ already broken, not by this PR'));
+    check('a pre-existing violation names the edge that breaks it',
+      text.includes('com.app.audit.Writer -> com.app.web.Session'));
+    check('already-broken sorts above the rules that held',
+      text.indexOf('⚠️ already broken') < text.indexOf('✅ holds'));
+    check('the section says it checked the dependency graph',
+      text.includes('dependency graph this PR produces'));
     check('flagged check counts both buckets', text.includes('❗ 1 flagged · 👀 1 observation'));
     check('doc rules render above structural checks', text.indexOf('DOCUMENTED RULES') < text.indexOf('STRUCTURAL CHECKS'));
     check('source doc shown as basename only', text.includes('adr-001-layering.md') && !text.includes('docs/architecture/adr-001'));
