@@ -65,7 +65,8 @@ const FLAGGED_WITH_DOCS = {
     { factId: 'd1', subject: 'com.app.domain', statement: 'domain must not depend on infrastructure', sourceDocPath: 'docs/architecture/adr-001-layering.md', quote: 'The domain layer must not depend on infrastructure.', status: 'MAINTAINED', evidence: [] },
     { factId: 'd2', subject: 'com.app.web', statement: 'web must not reach the persistence layer directly', sourceDocPath: 'docs/architecture.md', quote: 'Controllers talk to services, never to repositories.', status: 'VIOLATED', evidence: ['com.app.web.OrderController -> com.app.persistence.OrderRepository'] },
     { factId: 'd3', subject: 'com.app.billing', statement: 'billing owns all money arithmetic', sourceDocPath: 'docs/invariants.md', quote: 'All money arithmetic lives in billing.', status: 'UNCLEAR', evidence: [] },
-    { factId: 'd4', subject: 'com.app.audit', statement: 'every mutation writes an audit record', sourceDocPath: 'docs/invariants.md', quote: 'Every mutation writes an audit record.', status: 'PRE_EXISTING', evidence: ['already broken before this change; this change did not add to it', 'com.app.audit.Writer -> com.app.web.Session'] }
+    { factId: 'd4', subject: 'com.app.audit', statement: 'every mutation writes an audit record', sourceDocPath: 'docs/invariants.md', quote: 'Every mutation writes an audit record.', status: 'PRE_EXISTING', evidence: ['already broken before this change; this change did not add to it', 'com.app.audit.Writer -> com.app.web.Session'] },
+    { factId: 'd5', subject: 'com.app.report', statement: 'reporting reads through the query service', sourceDocPath: 'docs/invariants.md', quote: 'Reporting reads through the query service.', status: 'RESTORED', evidence: ['broken at base, satisfied at head', 'com.app.report.Builder -> com.app.query.QueryService'] }
   ]
 };
 
@@ -155,6 +156,17 @@ const XSS = {
       text.includes('com.app.audit.Writer -> com.app.web.Session'));
     check('already-broken sorts above the rules that held',
       text.indexOf('⚠️ already broken') < text.indexOf('✅ holds'));
+    // The fifth status. It used to fall through the unrecognised-status guard and render as
+    // "couldn't check", which is the opposite of what it means: the docs and the code disagreed
+    // and this change closed the gap. Safe, since the guard refuses to call an unknown status a
+    // pass, but wrong -- and wrong in the one place a reader would have been pleased.
+    check('a restored rule is not rendered as unchecked',
+      text.includes('✨ restored by this change'));
+    check('a restored rule names the edge that now satisfies it',
+      text.includes('com.app.report.Builder -> com.app.query.QueryService'));
+    check('restored sorts below violations and above what merely holds',
+      text.indexOf('❌ broken by this change') < text.indexOf('✨ restored by this change')
+        && text.indexOf('✨ restored by this change') < text.indexOf('✅ holds'));
     check('the section says it checked the dependency graph',
       text.includes('dependency graph this PR produces'));
     check('flagged check counts both buckets', text.includes('❗ 1 flagged · 👀 1 observation'));
