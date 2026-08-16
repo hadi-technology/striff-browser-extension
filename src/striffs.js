@@ -7480,6 +7480,13 @@
         background:rgba(255,235,233,.5);
       }
       .striffs-arch-review-panel__rule--pass{ border-left-color:rgba(26,127,55,.45); }
+      /* Fixed by this PR. A stronger green than "holds", and tinted, because it is the one row
+         reporting that the docs and the code moved back into agreement -- the only outcome here
+         worth drawing a reader towards rather than merely reassuring them about. */
+      .striffs-arch-review-panel__rule--restored{
+        border-left-color:rgba(26,127,55,.75);
+        background:rgba(218,251,225,.45);
+      }
       /* Already broken before this PR. Amber rather than red: the rule is genuinely broken, so it
          must not read as a pass, but nothing here is this author's doing. */
       .striffs-arch-review-panel__rule--stale{
@@ -8562,9 +8569,10 @@
     const verdicts = Array.isArray(result?.docFactVerdicts) ? result.docFactVerdicts.filter(Boolean) : [];
     if (verdicts.length === 0) return "";
 
-    // Most actionable first: what this PR broke, then what was already broken, then what holds,
-    // then what could not be checked.
-    const ORDER = { VIOLATED: 0, PRE_EXISTING: 1, MAINTAINED: 2, UNCLEAR: 3 };
+    // What this PR did, together: what it broke, then what it fixed. Then the debt it inherited,
+    // then what it left standing, then what could not be checked. Mirrors CheckRunFormatter's row
+    // order so the panel and the check run do not disagree about what matters.
+    const ORDER = { VIOLATED: 0, RESTORED: 1, PRE_EXISTING: 2, MAINTAINED: 3, UNCLEAR: 4 };
     const rank = v => (v.status in ORDER ? ORDER[v.status] : ORDER.UNCLEAR);
     const sorted = verdicts.slice().sort((a, b) => rank(a) - rank(b));
 
@@ -8572,16 +8580,23 @@
       const violated = v.status === "VIOLATED";
       const alreadyBroken = v.status === "PRE_EXISTING";
       const held = v.status === "MAINTAINED";
-      // An unrecognised status falls in with "couldn't tell" rather than with "holds": a server
-      // that grows a fifth outcome must not have it render as a pass here.
-      const modifier = violated ? "fail" : alreadyBroken ? "stale" : held ? "pass" : "advisory";
+      // The fifth outcome this fallback was written for. RESTORED means the document asserted
+      // something the code lacked and this change supplied it, so rendering it as "couldn't check"
+      // -- which is what an unrecognised status gets -- said the opposite of the truth about the
+      // one row worth congratulating.
+      const restored = v.status === "RESTORED";
+      // An unrecognised status still falls in with "couldn't tell" rather than with "holds": a
+      // server that grows a sixth outcome must not have it render as a pass here.
+      const modifier = violated ? "fail" : restored ? "restored"
+        : alreadyBroken ? "stale" : held ? "pass" : "advisory";
       const verdict = violated ? "❌ broken by this change"
+        : restored ? "✨ restored by this change"
         : alreadyBroken ? "⚠️ already broken, not by this PR"
         : held ? "✅ holds"
         : "💭 couldn't check";
       // A pre-existing violation carries its witnessing edges too -- they are the whole value of
       // the row. The last entry is the edge; the first is the explanatory note.
-      const detail = (violated || alreadyBroken) && Array.isArray(v.evidence) && v.evidence.length > 0
+      const detail = (violated || alreadyBroken || restored) && Array.isArray(v.evidence) && v.evidence.length > 0
         ? v.evidence[v.evidence.length - 1]
         : v.quote;
       return `<div class="striffs-arch-review-panel__rule striffs-arch-review-panel__rule--${modifier}">
@@ -8596,7 +8611,7 @@
 
     return `<div class="striffs-arch-review-panel__section">
       <div class="striffs-arch-review-panel__section-title">Documented Rules</div>
-      <div class="striffs-arch-review-panel__section-note">Rules quoted from this repository's own docs and checked against the dependency graph this PR produces. A rule shown as holding was not broken anywhere in that graph; one shown as already broken was broken before this PR too.</div>
+      <div class="striffs-arch-review-panel__section-note">Rules quoted from this repository's own docs and checked against the dependency graph this PR produces. A rule shown as holding was not broken anywhere in that graph; one shown as already broken was broken before this PR too; one shown as restored was broken before and is not now.</div>
       ${html}
     </div>`;
   }
