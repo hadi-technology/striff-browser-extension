@@ -1,6 +1,8 @@
 // Ensure chrome-style callbacks exist when only browser.* is available (Firefox/Safari).
 try { importScripts('./webext-shim.js'); } catch (_) {}
 try { importScripts('./background-utils.js'); } catch (_) {}
+try { importScripts('../lib/fflate.min.js'); } catch (_) {}
+try { importScripts('./zip-filter-utils.js'); } catch (_) {}
 
 // background.js (MV3 service worker) — robust onMessage router + timeouts
 
@@ -212,10 +214,49 @@ const readApiErrorResponse = BgUtils.readApiErrorResponse || (async (res) => {
   };
 });
 
+// Trims a repository archive to the files the API actually reads, using the rules the API serves.
+//
+// Falls back to the original buffer on any failure. That is the right direction here: an unfiltered
+// upload is slow and may be refused for size, but a wrongly filtered one would silently remove
+// source the analysis needed and produce a confident, smaller, wrong answer.
+async function filterZipForUpload(apiUrl, beforeAB) {
+  const utils = globalThis.StriffsZipFilterUtils;
+  if (!utils || !beforeAB) return beforeAB;
+  try {
+    const apiBase = String(apiUrl).split('/api/v1/')[0];
+    const { manifest, source } = await utils.loadManifest(apiBase);
+    const result = utils.filterZip(beforeAB, manifest);
+    if (!result.ok) {
+      warn('zip filter skipped, uploading unfiltered archive:', result.reason);
+      return beforeAB;
+    }
+    debugLog('zip filtered', { manifestSource: source, kept: result.keptCount,
+      total: result.totalCount, bytesBefore: result.bytesBefore, bytesAfter: result.bytesAfter });
+    if (manifest.maxUploadBytes && result.bytesAfter > manifest.maxUploadBytes) {
+      // Uploading anyway would spend the transfer to be told 413. Sending it regardless is still
+      // better than inventing a client-side refusal: the server owns that answer and its message
+      // names the remedy.
+      warn('filtered archive still exceeds the API ceiling:',
+        result.bytesAfter, '>', manifest.maxUploadBytes);
+    }
+    return result.buffer;
+  } catch (e) {
+    warn('zip filter failed, uploading unfiltered archive:', e);
+    return beforeAB;
+  }
+}
+
 async function postIncrementalToLocal(apiUrl, beforeAB, changedFiles = [], { timeoutMs = 120000 } = {}) {
   const sanitizedChangedFiles = sanitizeChangedFilesPayload(changedFiles);
+
+  // Both upload paths funnel through here, so this is the only place the archive has to be
+  // trimmed. Most of a repository is never read -- see zip-filter-utils.js -- and the API refuses
+  // an archive above the ceiling it publishes, so sending the raw codeload ZIP is both slow and,
+  // past a certain repository size, guaranteed to fail.
+  const uploadAB = await filterZipForUpload(apiUrl, beforeAB);
+
   const fd = new FormData();
-  fd.append('before', new Blob([beforeAB], { type: 'application/zip' }), 'before.zip');
+  fd.append('before', new Blob([uploadAB], { type: 'application/zip' }), 'before.zip');
   fd.append('changed_files', new Blob([JSON.stringify(sanitizedChangedFiles)], { type: 'application/json' }));
 
   const t = abortableTimeout(timeoutMs);
