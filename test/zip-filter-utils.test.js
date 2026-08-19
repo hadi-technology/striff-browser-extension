@@ -133,3 +133,73 @@ test('the built-in fallback matches the extensions the API serves today', () => 
   assert.deepEqual(MANIFEST.docExtensions, ['adoc', 'md', 'mdx', 'rst']);
   assert.equal(MANIFEST.maxUploadBytes, 15 * 1024 * 1024);
 });
+
+// --- streaming ------------------------------------------------------------------------------
+
+const { Readable } = require('node:stream');
+
+function streamOf(bytes, chunkSize = 4096) {
+  const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  return Readable.toWeb(Readable.from((function* () {
+    for (let i = 0; i < u8.length; i += chunkSize) yield u8.subarray(i, i + chunkSize);
+  })()));
+}
+
+function sampleArchive() {
+  return fflate.zipSync({
+    'repo/src/A.java': fflate.strToU8('class A {}'),
+    'repo/docs/adr.md': fflate.strToU8('# ADR'),
+    'repo/package.json': fflate.strToU8('{}'),
+    'repo/docs/img/big.png': new Uint8Array(300000),
+    'repo/web/node_modules/x/i.ts': fflate.strToU8('export const x = 1;')
+  });
+}
+
+test('filterZipStream keeps the same entries as the buffered path', async () => {
+  const zipped = sampleArchive();
+  const streamed = await utils.filterZipStream(streamOf(zipped), MANIFEST, { fflateImpl: fflate });
+  const buffered = utils.filterZip(zipped.buffer, MANIFEST, { fflateImpl: fflate });
+
+  assert.equal(streamed.ok, true);
+  assert.equal(streamed.keptCount, buffered.keptCount);
+  assert.equal(streamed.totalCount, buffered.totalCount);
+
+  const back = fflate.unzipSync(new Uint8Array(streamed.buffer));
+  assert.deepEqual(Object.keys(back).sort(),
+    ['repo/docs/adr.md', 'repo/package.json', 'repo/src/A.java']);
+  assert.equal(fflate.strFromU8(back['repo/src/A.java']), 'class A {}');
+});
+
+test('filterZipStream refuses an archive too large to hold while filtering', async () => {
+  // fflate's streaming Unzip retains what it is handed, so this is not O(1) in the archive and
+  // needs its own backstop -- without it a huge repository kills the worker instead of being
+  // refused. Distinct from the upload ceiling, which is about the filtered result.
+  const result = await utils.filterZipStream(streamOf(sampleArchive()), MANIFEST, {
+    fflateImpl: fflate, maxRawBytes: 10
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'archive-too-large-to-filter');
+});
+
+test('filterZipStream refuses a stream that is not an archive instead of returning an empty one', async () => {
+  // fflate does not throw here the way the buffered path does -- it finds no entries and reports
+  // success. An empty ZIP would upload as a repository containing no files, and be analysed and
+  // found to contain nothing.
+  const result = await utils.filterZipStream(streamOf(new Uint8Array(64)), MANIFEST, { fflateImpl: fflate });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'no-entries-found');
+});
+
+test('filterZipStream rejects a non-stream instead of guessing', async () => {
+  const result = await utils.filterZipStream(null, MANIFEST, { fflateImpl: fflate });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'not-a-stream');
+});
+
+test('filterZipStream survives an archive split across many small chunks', async () => {
+  // Chunk boundaries fall in the middle of headers and deflate streams; the buffered path never
+  // sees this and it is the failure mode a streaming parser actually has.
+  const result = await utils.filterZipStream(streamOf(sampleArchive(), 7), MANIFEST, { fflateImpl: fflate });
+  assert.equal(result.ok, true);
+  assert.equal(result.keptCount, 3);
+});

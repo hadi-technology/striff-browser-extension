@@ -154,12 +154,125 @@
     }
   }
 
+  /**
+   * Filter a repository archive as it arrives, without ever holding the whole thing.
+   *
+   * The buffered `filterZip` above needs the complete archive in memory first, which is exactly
+   * what a large repository cannot afford: abp's zipball is 937MiB, and materialising that as one
+   * ArrayBuffer inside a service worker is the failure this is meant to prevent, not survive.
+   * Reading the response as a stream means peak memory is the kept content plus one chunk.
+   *
+   * fflate's streaming Unzip skips an entry entirely unless `file.start()` is called, so the
+   * screenshots are never inflated -- they are walked past.
+   *
+   * @param stream a WHATWG ReadableStream of the archive bytes
+   * @returns { ok, buffer, keptCount, totalCount, bytesBefore, bytesAfter } or { ok:false, reason }
+   */
+  async function filterZipStream(stream, manifest, { fflateImpl, maxKeptBytes, maxRawBytes } = {}) {
+    const lib = fflateImpl || (typeof root !== 'undefined' ? root.fflate : null);
+    if (!lib || typeof lib.Unzip !== 'function' || typeof lib.zipSync !== 'function') {
+      return { ok: false, reason: 'fflate-unavailable' };
+    }
+    if (!stream || typeof stream.getReader !== 'function') {
+      return { ok: false, reason: 'not-a-stream' };
+    }
+
+    const keep = compile(manifest);
+    const ceiling = maxKeptBytes || Infinity;
+    const rawCeiling = maxRawBytes || Infinity;
+    const kept = Object.create(null);
+    const pending = new Map();
+    let total = 0;
+    let keptBytes = 0;
+    let bytesBefore = 0;
+    let failure = null;
+
+    const unzipper = new lib.Unzip();
+    unzipper.register(lib.UnzipInflate);
+    unzipper.onfile = (file) => {
+      total += 1;
+      if (!keep(file.name)) return;
+      const chunks = [];
+      pending.set(file.name, chunks);
+      file.ondata = (err, chunk, final) => {
+        if (err) { failure = failure || err; return; }
+        if (chunk && chunk.length) {
+          chunks.push(chunk);
+          keptBytes += chunk.length;
+        }
+        if (final) {
+          let size = 0;
+          for (const c of chunks) size += c.length;
+          const joined = new Uint8Array(size);
+          let at = 0;
+          for (const c of chunks) { joined.set(c, at); at += c.length; }
+          kept[file.name] = joined;
+          pending.delete(file.name);
+        }
+      };
+      file.start();
+    };
+
+    const reader = stream.getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) { unzipper.push(new Uint8Array(0), true); break; }
+        const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+        bytesBefore += chunk.length;
+        // fflate's Unzip retains the stream it has been handed -- measured peak tracks archive
+        // size at roughly 1x on a 937MiB input -- so this is not O(1) in the archive and needs its
+        // own backstop. Checked before pushing, and it abandons the download rather than
+        // discovering the problem after paying for all of it.
+        if (bytesBefore > rawCeiling) {
+          return { ok: false, reason: 'archive-too-large-to-filter', bytesBefore };
+        }
+        unzipper.push(chunk, false);
+        if (failure) return { ok: false, reason: String(failure.message || failure) };
+        // A kept payload far past the ceiling cannot become a valid upload, and continuing to
+        // inflate it is how a zip bomb turns a refusal into a dead worker.
+        if (keptBytes > ceiling * 4) {
+          return { ok: false, reason: 'kept-content-exceeds-ceiling' };
+        }
+      }
+    } catch (e) {
+      return { ok: false, reason: String((e && e.message) || e) };
+    } finally {
+      try { reader.releaseLock(); } catch (_) { /* best effort */ }
+    }
+
+    if (failure) return { ok: false, reason: String(failure.message || failure) };
+
+    // A stream that is not an archive does not throw here the way the buffered path does -- fflate
+    // simply finds no entries and reports success. Uploading the empty ZIP that results would be a
+    // repository with no files in it, analysed and found to contain nothing: the exact shape of
+    // failure this whole pipeline refuses. A repository always has at least one entry.
+    if (total === 0) {
+      return { ok: false, reason: 'no-entries-found' };
+    }
+
+    try {
+      const out = lib.zipSync(kept, { level: 6 });
+      return {
+        ok: true,
+        buffer: out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength),
+        keptCount: Object.keys(kept).length,
+        totalCount: total,
+        bytesBefore,
+        bytesAfter: out.byteLength
+      };
+    } catch (e) {
+      return { ok: false, reason: String((e && e.message) || e) };
+    }
+  }
+
   const api = {
     DEFAULT_MANIFEST,
     MANIFEST_TTL_MS,
     compile,
     loadManifest,
     filterZip,
+    filterZipStream,
     globToRegExp,
     normalizePath,
     extensionOf
