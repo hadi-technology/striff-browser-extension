@@ -10446,6 +10446,30 @@
         } }, '*');
         return;
       }
+      if (data.fn === 'updateFileTreeAvailability') {
+        // The suite needs to re-apply this after the file tree lazily renders. It used to try
+        // window.Striffs.updateFileTreeAvailability() from page.evaluate, which is a no-op across
+        // the isolated-world boundary, so the annotation was never refreshed and the check that
+        // reads data-striffs-mapped could only pass while the mapping was still empty.
+        try {
+          S.updateFileTreeAvailability?.();
+          const applied = document.querySelectorAll('[data-striffs-mapped="1"]').length;
+          // Report the two conditions updateFileTreeAvailability returns early on, so an
+          // applied-zero result says which one it was instead of leaving it to be guessed.
+          window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: {
+            ok: true,
+            applied,
+            mapSize: Number(S.__striffsPathToComponentId?.size || 0),
+            view: String(S.getCurrentView?.() || ''),
+            candidateItems: document.querySelectorAll(
+              "li[id^='file-tree-item-diff-'], li[data-tree-entry-type='file'], [data-testid='file-tree'] li, [role='treeitem']"
+            ).length
+          } }, '*');
+        } catch (e) {
+          window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: { ok: false, reason: String(e?.message || e) } }, '*');
+        }
+        return;
+      }
       if (data.fn === 'getCommentState') {
         const state = S.__commentState || {};
         const selectedIds = Array.isArray(state.selectedIds) ? [...state.selectedIds] : [];

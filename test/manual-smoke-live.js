@@ -3346,24 +3346,29 @@ const setRemoteConfigUrlData = async (jsonObj) => {
 
   // Ensure file tree availability is applied.
   // Force striffs view first (other tests may have changed the view state).
-  await page.evaluate(() => {
-    try {
-      const S = window.Striffs;
-      if (S?.getCurrentView?.() !== 'striffs') S?.showStriffView?.();
-    } catch {}
-  });
+  // This went through window.Striffs and so never ran. The preceding check leaves the page in
+  // Diffs view, updateFileTreeAvailability returns early unless the view is striffs, and the
+  // annotation this section asserts on is therefore never applied -- measured as
+  // {applied: 0, mapSize: 8, view: "diffs"}. Click the button and wait on the dataset the
+  // extension publishes, both of which are world-independent.
+  await page.click('#striffs-btn', { timeout: 5000 }).catch(() => {});
+  await page.waitForFunction(
+    () => (document.documentElement?.dataset?.striffsCurrentView || '') === 'striffs',
+    null,
+    { timeout: 10000, polling: 200 }
+  ).catch(() => null);
   await page.waitForTimeout(300);
-  await page.evaluate(() => {
-    try { window.Striffs?.updateFileTreeAvailability?.(); } catch {}
-  });
+  // Re-apply through the hook: window.Striffs is not reachable from page.evaluate, so the call
+  // that used to sit here never ran and the annotation was never refreshed.
+  log(`File tree availability re-applied: ${JSON.stringify(await runStriffsTestHook('updateFileTreeAvailability', {}, 8000))}`);
   // Wait for at least one data-striffs-mapped attribute to appear
   await page.waitForFunction(() => {
     return document.querySelectorAll('[data-striffs-mapped]').length > 0;
   }, { timeout: 5000, polling: 200 }).catch(() => null);
   // Re-apply after wait in case the tree was lazily rendered
-  await page.evaluate(() => {
-    try { window.Striffs?.updateFileTreeAvailability?.(); } catch {}
-  });
+  // Re-apply through the hook: window.Striffs is not reachable from page.evaluate, so the call
+  // that used to sit here never ran and the annotation was never refreshed.
+  log(`File tree availability re-applied: ${JSON.stringify(await runStriffsTestHook('updateFileTreeAvailability', {}, 8000))}`);
   await page.waitForTimeout(300);
 
   // Verify file tree availability state in Striffs view (unmapped files disabled).
