@@ -3912,9 +3912,10 @@ const setRemoteConfigUrlData = async (jsonObj) => {
     const componentIds = await page.evaluate(() =>
       Array.from((window.Striffs?.getPrimaryDiagramSvg?.() || document.querySelector('#striffs-content svg'))?.querySelectorAll?.('g.entity[data-qualified-name]') || [])
         .map((node) => node.getAttribute('data-qualified-name'))
-        .filter((id) => Boolean(id) && !String(id).startsWith('AI_REVIEW_NOTE_'))
+        .filter((id) => Boolean(id) && !(String(id).includes('AI_REVIEW') || /^(?:AI_REVIEW_NOTE_|surfaced_note_)\d/i.test(String(id))))
     );
     const componentCount = componentIds.length;
+    log(`Selectable diagram entities: ${componentCount} (${componentIds.join(', ')})`);
     if (componentCount < 2) {
       warn('Not enough diagram entities found to test selection flow');
     } else {
@@ -4710,7 +4711,7 @@ const setRemoteConfigUrlData = async (jsonObj) => {
           const newUiComponentIds = await page.evaluate(() =>
             Array.from(document.querySelectorAll('g.entity[data-qualified-name]'))
               .map(n => n.getAttribute('data-qualified-name'))
-              .filter(id => Boolean(id) && !String(id).startsWith('AI_REVIEW_NOTE_'))
+              .filter(id => Boolean(id) && !(String(id).includes('AI_REVIEW') || /^(?:AI_REVIEW_NOTE_|surfaced_note_)\d/i.test(String(id))))
           );
           if (newUiComponentIds.length >= 1) {
             // Click first component
