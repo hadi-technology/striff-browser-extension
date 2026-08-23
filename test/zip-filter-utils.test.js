@@ -203,3 +203,32 @@ test('filterZipStream survives an archive split across many small chunks', async
   assert.equal(result.ok, true);
   assert.equal(result.keptCount, 3);
 });
+
+test('filterZipStream survives an archive whose entries arrive in one large chunk', async () => {
+  // fflate's Unzip recurses once per entry it completes inside a single push(), so recursion depth
+  // follows how many entries a chunk contains. spring-boot#50785 arrived from a reader handing over
+  // megabytes at a time and died at roughly entry 3,200 with "Maximum call stack size exceeded" --
+  // reported as a size problem, though that archive filters to 12.82MiB against a 15MiB ceiling and
+  // the buffered path handled it. The whole failure is in how the bytes are fed.
+  //
+  // 6,000 entries in one chunk: comfortably past the observed ceiling, and it must not reach fflate
+  // as a single push. The entries are tiny, which is the point -- it is the count that breaks it,
+  // not the size, and this archive is well under every byte bound in the filter.
+  const many = {};
+  for (let i = 0; i < 6000; i += 1) many[`src/main/java/pkg/C${i}.java`] = new TextEncoder().encode(`class C${i}{}`);
+  const zipped = fflate.zipSync(many, { level: 0 });
+
+  // The whole archive in ONE chunk. streamOf defaults to 4096 bytes, which never reproduces
+  // this -- an earlier version of this test used the default, passed with the fix reverted,
+  // and so proved nothing.
+  const result = await utils.filterZipStream(streamOf(zipped, zipped.length), MANIFEST, { fflateImpl: fflate });
+  assert.equal(result.ok, true, `expected success, got ${result.reason}`);
+  assert.equal(result.keptCount, 6000);
+
+  // And the streamed answer still matches the buffered one, which is the property the slicing
+  // must not have changed.
+  const buffered = utils.filterZip(zipped.buffer.slice(zipped.byteOffset, zipped.byteOffset + zipped.byteLength),
+                                   MANIFEST, { fflateImpl: fflate });
+  assert.equal(buffered.ok, true);
+  assert.equal(result.keptCount, buffered.keptCount);
+});
