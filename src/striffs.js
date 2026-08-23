@@ -2623,7 +2623,9 @@
         closeBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
         closeBtn.addEventListener('click', (e) => {
             e.stopPropagation();
-            clearTimeout(removeTimeout);
+            // `pending` rather than `removeTimeout`: a hover restarts the timer, so the original
+            // handle is stale by then and clearing it would leave a live timer behind.
+            clearTimeout(pending);
             remove();
         });
         el.appendChild(closeBtn);
@@ -2635,7 +2637,22 @@
             setTimeout(() => el.remove(), 250);
         };
         const removeTimeout = setTimeout(remove, actualTimeout);
-        el.addEventListener('click', () => { clearTimeout(removeTimeout); remove(); }, { passive: true });
+        // Dismissal is the close button's job, and it used to be any click's job as well. That is
+        // wrong for the toasts that matter most: an error naming a size limit is something the
+        // reader has to finish reading, and selecting the text to copy it, or clicking the link
+        // inside an HTML toast, removed it mid-sentence. Reported as "the toast only stays about
+        // one second", which is what an accidental dismissal looks like from the outside.
+        // ({ passive: true } was also a no-op here -- it only affects preventDefault for touch and
+        // wheel events, never click.)
+        //
+        // Hovering holds it open. A long error is not readable inside a fixed timeout that started
+        // before the reader's eyes arrived, and the pointer is the one signal that says they are
+        // still on it.
+        let pending = removeTimeout;
+        el.addEventListener('mouseenter', () => { clearTimeout(pending); pending = null; });
+        el.addEventListener('mouseleave', () => {
+            if (pending == null) pending = setTimeout(remove, Math.min(actualTimeout, 4000));
+        });
     };
 
     // Compute and set #striff-diagram-view height (~80% viewport)
