@@ -3,6 +3,7 @@ try { importScripts('./webext-shim.js'); } catch (_) {}
 try { importScripts('./background-utils.js'); } catch (_) {}
 try { importScripts('../lib/fflate.min.js'); } catch (_) {}
 try { importScripts('./zip-filter-utils.js'); } catch (_) {}
+try { importScripts('./analysis-job-client.js'); } catch (_) {}
 
 // background.js (MV3 service worker) — robust onMessage router + timeouts
 
@@ -270,7 +271,7 @@ const readApiErrorResponse = BgUtils.readApiErrorResponse || (async (res) => {
   };
 });
 
-async function postIncrementalToLocal(apiUrl, beforeAB, changedFiles = [], { timeoutMs = 120000 } = {}) {
+async function postIncrementalToLocal(apiUrl, beforeAB, changedFiles = [], { timeoutMs = 120000, apiBase = '' } = {}) {
   const sanitizedChangedFiles = sanitizeChangedFilesPayload(changedFiles);
 
   // The archive arrives already filtered -- downloadRepoZipAsArrayBuffer is the only source of it
@@ -294,7 +295,18 @@ async function postIncrementalToLocal(apiUrl, beforeAB, changedFiles = [], { tim
       };
     }
     const json = await res.json();
-    return { ok: true, json };
+
+    // 200 means this analysis already existed and the server had it to hand -- the common case,
+    // since most views of a pull request are repeat views. 202 means it has been queued, and the
+    // wait moves from a held-open socket to a poll the user can see and abandon.
+    if (res.status !== 202) {
+      return { ok: true, json };
+    }
+    const client = globalThis.StriffsAnalysisJobClient;
+    if (!client) {
+      return { ok: false, error: 'Cannot wait for a queued analysis: the job client failed to load.' };
+    }
+    return client.awaitAnalysisJob(json, apiBase, { abortableTimeout });
   } catch (e) {
     return { ok: false, error: String(e?.message || e) };
   } finally {
@@ -909,7 +921,9 @@ const handlers = {
       `${apiBase}/api/v1/github/striffs`,
       before.arrayBuffer,
       effectiveChangedFiles,
-      { timeoutMs: 180000 }
+      // The submit itself is fast now -- it uploads and returns. The long wait is the poll that
+      // follows, which carries its own budget, so this timeout covers the upload alone.
+      { timeoutMs: 180000, apiBase }
     );
     const postDurationMs = Date.now() - postStart;
     const totalDurationMs = Date.now() - overallStart;
