@@ -1,6 +1,8 @@
 // Ensure chrome-style callbacks exist when only browser.* is available (Firefox/Safari).
 try { importScripts('./webext-shim.js'); } catch (_) {}
 try { importScripts('./background-utils.js'); } catch (_) {}
+try { importScripts('../lib/fflate.min.js'); } catch (_) {}
+try { importScripts('./zip-filter-utils.js'); } catch (_) {}
 
 // background.js (MV3 service worker) — robust onMessage router + timeouts
 
@@ -85,24 +87,6 @@ async function getApiBase(defaultBase = DEV_DEFAULT_API_BASE) {
   return normalizeApiBase(defaultBase);
 }
 
-async function fetchArrayBuffer(url, { timeoutMs = 45000, init = {} } = {}) {
-  const t = abortableTimeout(timeoutMs);
-  try {
-    const res = await fetch(url, { ...init, signal: t.signal, cache: 'no-cache' });
-    if (!res.ok) return { ok: false, status: res.status, error: `HTTP ${res.status}` };
-    const ab = await res.arrayBuffer();
-    return { ok: true, status: res.status, arrayBuffer: ab };
-  } catch (e) {
-    // AbortError.name === 'AbortError' means timeout, not user abort
-    if (e?.name === 'AbortError') {
-      return { ok: false, error: `Timeout (${timeoutMs / 1000}s)` };
-    }
-    return { ok: false, error: String(e?.message || e) };
-  } finally {
-    t.cancel();
-  }
-}
-
 const STATIC_PROXY_HOSTS = BgUtils.STATIC_PROXY_HOSTS || new Set([
   'api.github.com',
   'codeload.github.com',
@@ -132,7 +116,16 @@ async function isAllowedProxyUrl(rawUrl) {
 }
 
 const ZIP_CACHE_MAX_PER_REPO = 5;
+// The cache now holds FILTERED archives, which are a fraction of what it used to hold -- so this is
+// a cache budget, not the upload limit. The upload limit is whatever the API publishes as
+// maxUploadBytes (15MiB today) and is applied to the filtered result in downloadRepoZipAsArrayBuffer.
 const ZIP_CACHE_MAX_BYTES = 50 * 1024 * 1024; // 50 MB
+// An OOM backstop on the RAW stream, which the filter is not free of: fflate's streaming Unzip
+// retains what it is handed, measured at ~1x the archive on a 937MiB input. Peak stays near this
+// number, so it is set by what a service worker can survive rather than by what is worth analysing.
+// It is 6x the 50MB whole-archive limit it replaces, so it admits far more than it refuses.
+const ZIP_RAW_STREAM_MAX_BYTES = 300 * 1024 * 1024; // 300 MB
+const ZIP_UPLOAD_FALLBACK_MAX_BYTES = 15 * 1024 * 1024;
 
 const zipCache = {
   _store: new Map(),
@@ -172,7 +165,16 @@ const zipCache = {
   }
 };
 
-async function downloadRepoZipAsArrayBuffer(owner, repo, ref) {
+// Downloads a repository archive and keeps only the files the API reads.
+//
+// The size limit is applied to the FILTERED result, which is the number that decides whether an
+// upload can succeed. Applying it to the raw archive -- as this did, at 50MB -- refused
+// repositories whose analysable content is a few megabytes: elsa-core is 47.1MiB of archive
+// carrying 4.8MiB of source and documentation, and abp is 936.9MiB carrying 11.4MiB.
+//
+// Filtering here rather than at upload time is what makes the limit meaningful, and it also means
+// the in-memory cache holds filtered archives.
+async function downloadRepoZipAsArrayBuffer(owner, repo, ref, apiBase) {
   const cached = zipCache.get(owner, repo, ref);
   if (cached) {
     debugLog('zip cache hit', { owner, repo, ref, bytes: cached.byteLength });
@@ -180,20 +182,76 @@ async function downloadRepoZipAsArrayBuffer(owner, repo, ref) {
   }
   const url = `https://codeload.github.com/${owner}/${repo}/zip/${encodeURIComponent(ref)}`;
   debugLog('zip download start', { owner, repo, ref, url });
-  const r = await fetchArrayBuffer(url, { timeoutMs: 60000 });
-  if (!r.ok) return { ok: false, error: r.error || `Failed to download zip: ${r.status}` };
-  const ab = r.arrayBuffer;
-  debugLog('zip download complete', { owner, repo, ref, bytes: ab.byteLength, mb: Math.round(ab.byteLength / 1024 / 1024) });
-  if (ab.byteLength > ZIP_CACHE_MAX_BYTES) {
+
+  const utils = globalThis.StriffsZipFilterUtils;
+  const manifest = utils
+    ? (await utils.loadManifest(apiBase || (await getApiBase()))).manifest
+    : null;
+  const ceiling = (manifest && manifest.maxUploadBytes) || ZIP_UPLOAD_FALLBACK_MAX_BYTES;
+
+  const t = abortableTimeout(60000);
+  let filtered = null;
+  try {
+    // no-cache because `ref` is usually a branch and therefore moves. A stale archive would be
+    // analysed and reported as the current revision, which is wrong rather than merely old.
+    const res = await fetch(url, { signal: t.signal, cache: 'no-cache' });
+    if (!res.ok) return { ok: false, error: `Failed to download zip: ${res.status}` };
+    if (utils && res.body && typeof utils.filterZipStream === 'function') {
+      filtered = await utils.filterZipStream(res.body, manifest, {
+        maxKeptBytes: ceiling,
+        maxRawBytes: ZIP_RAW_STREAM_MAX_BYTES
+      });
+    } else {
+      // No streaming filter available: fall back to the whole archive, bounded by the raw
+      // backstop so an unfiltered path cannot be the one that kills the worker.
+      const ab = await res.arrayBuffer();
+      if (ab.byteLength > ZIP_RAW_STREAM_MAX_BYTES) {
+        return {
+          ok: false,
+          tooLarge: true,
+          bytes: ab.byteLength,
+          error: `Repository zip is too large (${Math.round(ab.byteLength / 1024 / 1024)} MB) to process in the browser.`
+        };
+      }
+      filtered = { ok: true, buffer: ab, bytesBefore: ab.byteLength, bytesAfter: ab.byteLength };
+    }
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e) };
+  } finally {
+    t.cancel();
+  }
+
+  if (!filtered.ok) {
+    if (filtered.reason === 'archive-too-large-to-filter') {
+      return {
+        ok: false,
+        tooLarge: true,
+        bytes: filtered.bytesBefore,
+        error: `Repository zip is too large (over ${Math.round(ZIP_RAW_STREAM_MAX_BYTES / 1024 / 1024)} MB) to process in the browser. Try token-based generation.`
+      };
+    }
+    return { ok: false, error: `Failed reading repository zip: ${filtered.reason}` };
+  }
+
+  debugLog('zip filtered', {
+    owner, repo, ref,
+    kept: filtered.keptCount, total: filtered.totalCount,
+    bytesBefore: filtered.bytesBefore, bytesAfter: filtered.bytesAfter
+  });
+
+  if (filtered.bytesAfter > ceiling) {
+    // The API publishes this number and enforces it, so uploading would spend the transfer to be
+    // told 413. Refused here with the same shape as any other too-large repository.
     return {
       ok: false,
-      error: `Repository zip is too large (${Math.round(ab.byteLength / 1024 / 1024)} MB) for the ZIP generation path. Reduce the PR scope or try token-based generation.`,
       tooLarge: true,
-      bytes: ab.byteLength
+      bytes: filtered.bytesAfter,
+      error: `This repository has ${Math.round(filtered.bytesAfter / 1024 / 1024)} MB of analysable source and documentation, above the ${Math.round(ceiling / 1024 / 1024)} MB limit. Try token-based generation.`
     };
   }
-  zipCache.set(owner, repo, ref, ab);
-  return { ok: true, arrayBuffer: ab, fromCache: false };
+
+  zipCache.set(owner, repo, ref, filtered.buffer);
+  return { ok: true, arrayBuffer: filtered.buffer, fromCache: false };
 }
 
 const readApiErrorResponse = BgUtils.readApiErrorResponse || (async (res) => {
@@ -214,6 +272,10 @@ const readApiErrorResponse = BgUtils.readApiErrorResponse || (async (res) => {
 
 async function postIncrementalToLocal(apiUrl, beforeAB, changedFiles = [], { timeoutMs = 120000 } = {}) {
   const sanitizedChangedFiles = sanitizeChangedFilesPayload(changedFiles);
+
+  // The archive arrives already filtered -- downloadRepoZipAsArrayBuffer is the only source of it
+  // and trims there, so the ceiling can be applied to the size that decides whether an upload
+  // succeeds. Filtering again here would re-inflate and re-zip for nothing.
   const fd = new FormData();
   fd.append('before', new Blob([beforeAB], { type: 'application/zip' }), 'before.zip');
   fd.append('changed_files', new Blob([JSON.stringify(sanitizedChangedFiles)], { type: 'application/json' }));
@@ -705,7 +767,8 @@ const handlers = {
     }
 
     const overallStart = Date.now();
-    const before = await downloadRepoZipAsArrayBuffer(baseOwner, baseRepo, baseBranch);
+    const apiBaseForZip = await getApiBase();
+    const before = await downloadRepoZipAsArrayBuffer(baseOwner, baseRepo, baseBranch, apiBaseForZip);
     if (!before.ok) {
       safeReply({
         ok: false,
@@ -812,7 +875,8 @@ const handlers = {
     const overallStart = Date.now();
     const downloadStart = Date.now();
     const beforeStarted = Date.now();
-    const before = await downloadRepoZipAsArrayBuffer(baseOwner, baseRepo, baseBranch);
+    const apiBaseForZip = await getApiBase();
+    const before = await downloadRepoZipAsArrayBuffer(baseOwner, baseRepo, baseBranch, apiBaseForZip);
     before.durationMs = Date.now() - beforeStarted;
     const downloadDurationMs = Date.now() - downloadStart;
 
