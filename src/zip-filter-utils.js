@@ -178,6 +178,25 @@
     }
 
     const keep = compile(manifest);
+    // fflate's Unzip recurses once per entry it finishes inside a single push(), so the depth of
+    // that recursion is set by how many entries one chunk happens to contain -- not by its size.
+    // Measured on spring-boot's 18MiB zipball (21,146 entries): a 4MiB push dies at entry ~3,212
+    // with "Maximum call stack size exceeded", 2MiB completes with a worst push of 3,115 entries,
+    // and 1MiB completes at 2,054. The ceiling is therefore around 3,200 frames, and which side of
+    // it a chunk lands on is a property of the archive rather than of the request.
+    //
+    // A network body normally arrives in small pieces, which is why this went unseen; a fast or
+    // cached response coalesces them. It surfaced on spring-boot#50785 as "Failed reading
+    // repository zip: Maximum call stack size exceeded", which reads like a corrupt archive rather
+    // than anything to do with size -- the same archive filters correctly to 12.82MiB through the
+    // buffered path, comfortably inside the 15MiB ceiling.
+    //
+    // 64KiB rather than the 1MiB that merely passed here: bytes are a proxy for entries and the
+    // ratio belongs to the repository. A minimal local header plus a short name is about 60 bytes,
+    // so a pathological tree of tiny files puts roughly 1,100 entries in 64KiB against the ~3,200
+    // that breaks -- a margin that survives an archive quite unlike this one. The cost is more
+    // push() calls over the same bytes, which is not where the time goes.
+    const PUSH_SLICE_BYTES = 64 * 1024;
     const ceiling = maxKeptBytes || Infinity;
     const rawCeiling = maxRawBytes || Infinity;
     const kept = Object.create(null);
@@ -227,7 +246,11 @@
         if (bytesBefore > rawCeiling) {
           return { ok: false, reason: 'archive-too-large-to-filter', bytesBefore };
         }
-        unzipper.push(chunk, false);
+        // Sliced, never pushed whole -- see PUSH_SLICE_BYTES above.
+        for (let off = 0; off < chunk.length; off += PUSH_SLICE_BYTES) {
+          unzipper.push(chunk.subarray(off, Math.min(off + PUSH_SLICE_BYTES, chunk.length)), false);
+          if (failure) return { ok: false, reason: String(failure.message || failure) };
+        }
         if (failure) return { ok: false, reason: String(failure.message || failure) };
         // A kept payload far past the ceiling cannot become a valid upload, and continuing to
         // inflate it is how a zip bomb turns a refusal into a dead worker.
