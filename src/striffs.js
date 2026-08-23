@@ -1404,6 +1404,15 @@
     const preserveClearFlag = !!opts.preserveClearFlag;
     const resetLiveDiagram = !!opts.resetLiveDiagram;
     const DEBUG_KEY_LOWER = "striffsdebug";
+    // striffsTest is harness configuration, not a cache entry, and it is only spared by name.
+    // The sweeps below remove every key beginning with "striffs", so clearing the diagram caches
+    // used to delete the test-mode flag too; the storage.onChanged listener then set
+    // __testModeEnabled = false and the postMessage test bridge stopped answering for the rest of
+    // the session. Every hook after the first cache clear timed out, and each caller degraded
+    // quietly to a DOM guess or to its own default, so the live smoke suite reported passes for
+    // assertions it was no longer able to make. Exempted beside striffsdebug, which is the same
+    // category of key and was already spared for the same reason.
+    const TEST_MODE_KEY_LOWER = "striffstest";
     const prefixes = [
       ...(BgUtils.CACHE_PREFIXES || ["striffs:", "striffscache:", "striffscachemeta:"]),
       ...((BgUtils.LEGACY_CACHE_PREFIXES || []).map((value) => String(value || '').toLowerCase()))
@@ -1426,7 +1435,7 @@
         const key = store.key(i);
         if (!key) continue;
         const lower = key.toLowerCase();
-        if (lower === DEBUG_KEY_LOWER) continue;
+        if (lower === DEBUG_KEY_LOWER || lower === TEST_MODE_KEY_LOWER) continue;
         if (prefixes.some(p => lower.startsWith(p)) || lower.startsWith("striffs")) {
           toRemove.push(key);
         }
@@ -1456,6 +1465,7 @@
           if (!k) return false;
           if (k === "ghToken") return false;
           if (String(k).toLowerCase() === DEBUG_KEY_LOWER) return false;
+          if (String(k).toLowerCase() === TEST_MODE_KEY_LOWER) return false;
           if (preserveClearFlag && k === S.CACHE_CLEAR_FLAG_KEY) return false;
           if (k === S.CACHE_CLEAR_SEEN_KEY) return false;
           const lower = k.toLowerCase();
@@ -10434,6 +10444,30 @@
           commentModeAvailable: Boolean(S.isCommentModeAvailable?.()),
           lastError: S.__lastEngagementContextError || null
         } }, '*');
+        return;
+      }
+      if (data.fn === 'updateFileTreeAvailability') {
+        // The suite needs to re-apply this after the file tree lazily renders. It used to try
+        // window.Striffs.updateFileTreeAvailability() from page.evaluate, which is a no-op across
+        // the isolated-world boundary, so the annotation was never refreshed and the check that
+        // reads data-striffs-mapped could only pass while the mapping was still empty.
+        try {
+          S.updateFileTreeAvailability?.();
+          const applied = document.querySelectorAll('[data-striffs-mapped="1"]').length;
+          // Report the two conditions updateFileTreeAvailability returns early on, so an
+          // applied-zero result says which one it was instead of leaving it to be guessed.
+          window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: {
+            ok: true,
+            applied,
+            mapSize: Number(S.__striffsPathToComponentId?.size || 0),
+            view: String(S.getCurrentView?.() || ''),
+            candidateItems: document.querySelectorAll(
+              "li[id^='file-tree-item-diff-'], li[data-tree-entry-type='file'], [data-testid='file-tree'] li, [role='treeitem']"
+            ).length
+          } }, '*');
+        } catch (e) {
+          window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: { ok: false, reason: String(e?.message || e) } }, '*');
+        }
         return;
       }
       if (data.fn === 'getCommentState') {

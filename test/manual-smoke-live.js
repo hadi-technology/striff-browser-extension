@@ -3262,31 +3262,37 @@ const setRemoteConfigUrlData = async (jsonObj) => {
       }
     }, null, { timeout: 5000 }).catch(() => null);
   }
-  const cacheAfterSettled = await page.evaluate(async () => {
-    try {
-      const key = window.Striffs?.cacheKey?.();
-      const local = key ? !!localStorage.getItem(key) : false;
-      const meta = key ? !!localStorage.getItem(`striffsCacheMeta:${key}`) : false;
-      const tooLarge = !!window.__striffsCacheTooLarge;
-      const dataset = document.documentElement?.dataset || {};
-      const datasetSaved = !!dataset.striffsCacheSavedAt;
-      const datasetTooLarge = dataset.striffsCacheTooLarge === "1";
-      const datasetStorage = dataset.striffsCacheStorage || '';
-      let chrome = false;
-      if (typeof window.Striffs?.readCacheFromChromeStorage === 'function') {
-        const parsed = await window.Striffs.readCacheFromChromeStorage();
-        chrome = !!parsed;
+    // Four of the six signals this used to collect were read off window.Striffs -- cacheKey(),
+    // readCacheFromChromeStorage(), readCacheFromIndexedDb() -- which the main world cannot see,
+    // so `local`, `meta`, `chrome` and `indexedDb` were false on every run whether or not a cache
+    // had been written. The assertion below was carried entirely by the dataset flag, and the
+    // diagnostic printed four zeros that looked like real negative evidence. The snapshot hook
+    // answers from inside the content script, where the keys actually exist.
+    const cacheSnapshot = await runStriffsTestHook('getCacheSnapshot', {}, 10000);
+    const cacheAfterSettled = await page.evaluate(({ snapshot }) => {
+      try {
+        const key = snapshot?.key || '';
+        const localKeys = Array.isArray(snapshot?.localKeys) ? snapshot.localKeys : [];
+        const chromeKeys = Array.isArray(snapshot?.chromeKeys) ? snapshot.chromeKeys : [];
+        const local = !!key && localKeys.includes(key);
+        const meta = !!key && localKeys.includes(`striffsCacheMeta:${key}`);
+        const chrome = !!snapshot?.chromeKey && chromeKeys.includes(snapshot.chromeKey);
+        const dataset = document.documentElement?.dataset || {};
+        return {
+          local,
+          chrome,
+          indexedDb: dataset.striffsCacheStorage === 'indexeddb',
+          meta,
+          tooLarge: !!window.__striffsCacheTooLarge,
+          datasetSaved: !!dataset.striffsCacheSavedAt,
+          datasetTooLarge: dataset.striffsCacheTooLarge === "1",
+          datasetStorage: dataset.striffsCacheStorage || '',
+          snapshotOk: !!snapshot?.ok
+        };
+      } catch {
+        return { local: false, chrome: false, indexedDb: false, meta: false, tooLarge: false, datasetSaved: false, datasetTooLarge: false, datasetStorage: '', snapshotOk: false };
       }
-      let indexedDb = false;
-      if (typeof window.Striffs?.readCacheFromIndexedDb === 'function') {
-        const parsed = await window.Striffs.readCacheFromIndexedDb();
-        indexedDb = !!parsed;
-      }
-      return { local, chrome, indexedDb, meta, tooLarge, datasetSaved, datasetTooLarge, datasetStorage };
-    } catch {
-      return { local: false, chrome: false, indexedDb: false, meta: false, tooLarge: false, datasetSaved: false, datasetTooLarge: false, datasetStorage: '' };
-    }
-  }).catch(() => cacheAfter);
+    }, { snapshot: cacheSnapshot }).catch(() => cacheAfter);
   log(`Cache state after render ${JSON.stringify(cacheAfterSettled)}`);
   if (cacheAfterSettled?.tooLarge || cacheAfterSettled?.datasetTooLarge) {
     warn('Cache skipped (payload too large for storage)');
@@ -3340,24 +3346,29 @@ const setRemoteConfigUrlData = async (jsonObj) => {
 
   // Ensure file tree availability is applied.
   // Force striffs view first (other tests may have changed the view state).
-  await page.evaluate(() => {
-    try {
-      const S = window.Striffs;
-      if (S?.getCurrentView?.() !== 'striffs') S?.showStriffView?.();
-    } catch {}
-  });
+  // This went through window.Striffs and so never ran. The preceding check leaves the page in
+  // Diffs view, updateFileTreeAvailability returns early unless the view is striffs, and the
+  // annotation this section asserts on is therefore never applied -- measured as
+  // {applied: 0, mapSize: 8, view: "diffs"}. Click the button and wait on the dataset the
+  // extension publishes, both of which are world-independent.
+  await page.click('#striffs-btn', { timeout: 5000 }).catch(() => {});
+  await page.waitForFunction(
+    () => (document.documentElement?.dataset?.striffsCurrentView || '') === 'striffs',
+    null,
+    { timeout: 10000, polling: 200 }
+  ).catch(() => null);
   await page.waitForTimeout(300);
-  await page.evaluate(() => {
-    try { window.Striffs?.updateFileTreeAvailability?.(); } catch {}
-  });
+  // Re-apply through the hook: window.Striffs is not reachable from page.evaluate, so the call
+  // that used to sit here never ran and the annotation was never refreshed.
+  log(`File tree availability re-applied: ${JSON.stringify(await runStriffsTestHook('updateFileTreeAvailability', {}, 8000))}`);
   // Wait for at least one data-striffs-mapped attribute to appear
   await page.waitForFunction(() => {
     return document.querySelectorAll('[data-striffs-mapped]').length > 0;
   }, { timeout: 5000, polling: 200 }).catch(() => null);
   // Re-apply after wait in case the tree was lazily rendered
-  await page.evaluate(() => {
-    try { window.Striffs?.updateFileTreeAvailability?.(); } catch {}
-  });
+  // Re-apply through the hook: window.Striffs is not reachable from page.evaluate, so the call
+  // that used to sit here never ran and the annotation was never refreshed.
+  log(`File tree availability re-applied: ${JSON.stringify(await runStriffsTestHook('updateFileTreeAvailability', {}, 8000))}`);
   await page.waitForTimeout(300);
 
   // Verify file tree availability state in Striffs view (unmapped files disabled).
@@ -3912,9 +3923,10 @@ const setRemoteConfigUrlData = async (jsonObj) => {
     const componentIds = await page.evaluate(() =>
       Array.from((window.Striffs?.getPrimaryDiagramSvg?.() || document.querySelector('#striffs-content svg'))?.querySelectorAll?.('g.entity[data-qualified-name]') || [])
         .map((node) => node.getAttribute('data-qualified-name'))
-        .filter((id) => Boolean(id) && !String(id).startsWith('AI_REVIEW_NOTE_'))
+        .filter((id) => Boolean(id) && !(String(id).includes('AI_REVIEW') || /^(?:AI_REVIEW_NOTE_|surfaced_note_)\d/i.test(String(id))))
     );
     const componentCount = componentIds.length;
+    log(`Selectable diagram entities: ${componentCount} (${componentIds.join(', ')})`);
     if (componentCount < 2) {
       warn('Not enough diagram entities found to test selection flow');
     } else {
@@ -4020,25 +4032,18 @@ const setRemoteConfigUrlData = async (jsonObj) => {
       await clickCommentComponent(componentIds[0]);
       await page.waitForTimeout(200);
 
-      const capTest = await page.evaluate(() => {
-        const S = window.Striffs;
-        const cap = Number(S?.COMMENT_MAX_SELECTION || 10);
-        const state = S?.__commentState || {};
-        const previous = Array.isArray(state.selectedIds) ? [...state.selectedIds] : [];
-        try {
-          state.selectedIds = Array.from({ length: cap }, (_, index) => `__test_fake_${index}`);
-          S?.toggleComponentSelection?.('__test_overflow');
-          const blocked = Array.isArray(state.selectedIds) && state.selectedIds.length === cap;
-          return { ok: true, blocked, cap };
-        } catch (e) {
-          return { ok: false, reason: String(e?.message || e), cap };
-        } finally {
-          state.selectedIds = previous;
-          try { S?.updateCommentPanelSelection?.(); } catch {}
-          try { S?.reapplySelectionHighlights?.(); } catch {}
-        }
-      }).catch((e) => ({ ok: false, reason: String(e?.message || e) }));
-      if (capTest?.blocked) {
+      // Run the cap check inside the content script. The previous version ran this same logic
+      // in the main world, where window.Striffs is undefined: `cap` fell back to the literal 10
+      // it declares itself, `state` became a fresh plain object, the toggle was a no-op, and
+      // `blocked` compared the ten-element array it had just built against the default it had
+      // just chosen. It returned true with the extension absent entirely.
+      // runCommentSelectionCapTest is the extension's own hook for this and restores the prior
+      // selection in a finally block.
+      log(`Comment state before cap test: ${JSON.stringify(await runStriffsTestHook('getCommentState', {}, 5000))}`);
+      const capTest = await runStriffsTestHook('runCommentSelectionCapTest', {}, 15000);
+      if (!capTest?.ok) {
+        fail(`Selection cap test could not run in the content script (${JSON.stringify(capTest)})`);
+      } else if (capTest?.blocked) {
         pass(`Selection cap enforced at ${capTest.cap} components`);
       } else {
         fail(`Selection cap did not block overflow selection (${JSON.stringify(capTest)})`);
@@ -4572,16 +4577,21 @@ const setRemoteConfigUrlData = async (jsonObj) => {
 
     // Verify engagement context was restored after reload
     // Read engagement context AFTER the Striffs view is shown (not from pre-click state)
-    const postReloadEngagement = await page.evaluate(async () => {
-      // Wait for engagement context to be populated (async refresh may be in flight)
-      for (let i = 0; i < 30; i++) {
-        const ctx = window.Striffs?.__engagementCtx;
-        if (ctx && ctx.operationId && ctx.engagementWriteToken) break;
-        await new Promise(r => setTimeout(r, 500));
-      }
+    // Ask the content script for its engagement context rather than reading __engagementCtx
+    // from the main world, where it is always undefined. The poll that used to sit here spent
+    // fifteen seconds waiting for a value that could not arrive, and the stronger of the two
+    // assertions below could therefore never be the one that fired -- every run fell through
+    // to the weaker localStorage branch and reported it as a pass.
+    let hookEngagement = null;
+    for (let i = 0; i < 30; i += 1) {
+      hookEngagement = await runStriffsTestHook('getEngagementState', {}, 3000);
+      if (hookEngagement?.hasOperationId && hookEngagement?.hasToken) break;
+      await page.waitForTimeout(500);
+    }
+    const postReloadEngagement = await page.evaluate(({ hookCtx }) => {
       return {
-        operationId: window.Striffs?.__engagementCtx?.operationId || null,
-        engagementWriteToken: window.Striffs?.__engagementCtx?.engagementWriteToken || null,
+        operationId: hookCtx?.operationId || null,
+        engagementWriteToken: hookCtx?.engagementWriteToken || null,
         cachedEngagementContext: (() => {
           try {
             const cacheKey = document.documentElement?.dataset?.striffsCacheKey || '';
@@ -4598,7 +4608,7 @@ const setRemoteConfigUrlData = async (jsonObj) => {
           }
         })()
       };
-    }).catch(() => ({ operationId: null, engagementWriteToken: null, cachedEngagementContext: null }));
+    }, { hookCtx: hookEngagement }).catch(() => ({ operationId: null, engagementWriteToken: null, cachedEngagementContext: null }));
     const engToken = postReloadEngagement?.engagementWriteToken;
     if (engToken) {
       pass('Engagement context restored from cache (no fresh API call needed)');
@@ -4710,7 +4720,7 @@ const setRemoteConfigUrlData = async (jsonObj) => {
           const newUiComponentIds = await page.evaluate(() =>
             Array.from(document.querySelectorAll('g.entity[data-qualified-name]'))
               .map(n => n.getAttribute('data-qualified-name'))
-              .filter(id => Boolean(id) && !String(id).startsWith('AI_REVIEW_NOTE_'))
+              .filter(id => Boolean(id) && !(String(id).includes('AI_REVIEW') || /^(?:AI_REVIEW_NOTE_|surfaced_note_)\d/i.test(String(id))))
           );
           if (newUiComponentIds.length >= 1) {
             // Click first component
