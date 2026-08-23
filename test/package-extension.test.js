@@ -29,6 +29,15 @@ test('package script stages a production-shaped extension without popup debug ui
   const sourceBackground = fs.readFileSync(path.join(root, 'src', 'background.js'), 'utf8');
 
   assert.equal(fs.existsSync(path.join(stageDir, 'test')), false);
+  // background.js loads these with importScripts inside a try/catch that swallows a miss, so a file
+  // left out of the package fails neither the build nor the worker -- it just quietly stops
+  // filtering archives, or stops waiting for queued analyses. Checked here instead.
+  for (const required of ['src/zip-filter-utils.js', 'src/analysis-job-client.js', 'lib/fflate.min.js']) {
+    assert.equal(fs.existsSync(path.join(stageDir, required)), true, `${required} must be packaged`);
+  }
+  for (const imported of ['./zip-filter-utils.js', './analysis-job-client.js', '../lib/fflate.min.js']) {
+    assert.equal(stagedBackground.includes(imported), true, `${imported} must still be imported`);
+  }
   assert.equal(stagedPopup.includes('debugToggle'), false);
   assert.equal(stagedPopup.includes('target="_blank" class="note-link"'), false);
   assert.equal(stagedBundle.includes('stored?.striffsTest === true'), false);
