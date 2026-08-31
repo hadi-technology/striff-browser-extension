@@ -88,17 +88,30 @@
       }
       consecutiveTransportErrors = 0;
 
-      if (res.status === 429) {
+      if (res.status === 429 || res.status === 502 || res.status === 503 || res.status === 504) {
         // Backing off rather than failing: the analysis is still running, and giving up here
         // would abandon work that is nearly done.
+        //
+        // The gateway 5xx codes belong here with the 429 rather than in the failure below. The
+        // server runs one analysis per pod, so while a large repository is being analysed the
+        // gateway in front of it has nothing to route to and answers 502 or 503 -- both were
+        // observed from api.striff.io during a single twelve-minute run of apache/seatunnel.
+        // They report on the gateway, not on the job, and the job they say nothing about is
+        // precisely the one this loop is waiting for.
         interval = clampInterval(interval * 2);
         continue;
       }
       if (!res.ok) {
         // 404 means the job is gone -- expired, or never existed. Retrying cannot bring it back.
+        //
+        // Both carry an errorCode of their own because the caller classifies by code and a
+        // bare 404 from here used to fall into the content script's "pull request not found"
+        // catch-all: a lost job, or a gateway with no upstream, told the user their pull request
+        // did not exist and sent them to re-check a URL that was fine.
         return {
           ok: false,
           status: res.status,
+          errorCode: res.status === 404 ? 'ANALYSIS_JOB_GONE' : 'ANALYSIS_STATUS_UNAVAILABLE',
           error: res.status === 404
             ? 'The analysis is no longer available on the server. Try again.'
             : `The server could not report on the analysis (HTTP ${res.status}).`

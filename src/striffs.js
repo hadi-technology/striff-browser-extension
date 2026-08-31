@@ -29,12 +29,22 @@
     const minutes = Math.round(totalSeconds / 60);
     return `${minutes} minute${minutes === 1 ? "" : "s"}`;
   };
+  // bgGenerate/bgToken must outlast everything the background does for one request, or the content
+  // script abandons work that is still running and then has to guess at why. The budget it has to
+  // cover: a 60s zip download, a 180s upload, and the analysis poll -- DEFAULT_TOTAL_WAIT_MS in
+  // analysis-job-client.js, currently 900s. That is 1140s, and this was left at 180s when the API
+  // moved from analysing on the request thread to a job you poll, so any analysis over three
+  // minutes timed out here, was retried once (re-uploading the whole archive), and was reported to
+  // the user as "could not reach the Striffs service" while the service was answering fine.
+  //
+  // Kept as one number rather than derived because the job client is a service-worker script and
+  // is not in the content script's bundle. If DEFAULT_TOTAL_WAIT_MS changes, change this too.
   S.TIMEOUTS = Object.freeze({
     message: 7000,
     ping: 1000,
     waitForToolbar: 8000,
-    bgGenerate: 180000,
-    bgToken: 180000,
+    bgGenerate: 1200000,
+    bgToken: 1200000,
     bgPrefetch: 30000,
     bgArtifactPrefetch: 180000,
   });
@@ -62,6 +72,7 @@
   S.__striffsZoom = 1;
   S.__recentPanAt = 0;
   S.__aiReviewStatus = null;
+  S.__aiReviewWarmupRequired = null;
   S.__aiReviewId = null;
   S.__aiReviewPollTimer = null;
   S.__aiReviewPollInFlight = false;
@@ -1607,7 +1618,12 @@
       const t = setTimeout(() => {
         if (!settled) {
           settled = true;
-          reject(new Error(`timeout after ${timeoutMs}ms`));
+          // Coded, because this is the client giving up rather than anything failing. Untagged it
+          // reads as a transport error to the message classifier -- and "could not reach the
+          // service" is a different problem with a different fix than "we stopped waiting".
+          const err = new Error(`timeout after ${timeoutMs}ms`);
+          err.errorCode = 'CLIENT_WAIT_EXPIRED';
+          reject(err);
         }
       }, timeoutMs);
 
@@ -1656,7 +1672,7 @@
     return false;
   };
 
-  S.bgRequest = async function bgRequest(msg, timeoutMs) {
+  S.bgRequest = async function bgRequest(msg, timeoutMs, { retryOnWaitExpiry = true } = {}) {
     const retryable = (errMsg) =>
       /timeout|port closed|Receiving end does not exist|No service worker/i.test(String(errMsg || ''));
 
@@ -1670,6 +1686,12 @@
       return await send();
     } catch (err) {
       const errMsg = err?.message || err;
+      // The retry is for a service worker that died and lost the message -- cheap to repeat for a
+      // ping or a token read. It is not cheap for a generate: that re-downloads the archive and
+      // re-uploads megabytes, and the server deduplicates the submission onto the analysis already
+      // running, so the second attempt buys nothing and doubles the wait before the user is told
+      // anything. Callers doing real work opt out and let the expiry surface.
+      if (err?.errorCode === 'CLIENT_WAIT_EXPIRED' && !retryOnWaitExpiry) throw err;
       if (retryable(errMsg)) {
         await S.waitForBackgroundReady({ attempts: 8, delayMs: 200 });
         return await send();
@@ -5284,6 +5306,11 @@
         const engagement = S.extractEngagementContextFromPayload?.(result) || {};
         const status = cachedStatus || S.getAiReviewStatusFromResult?.(result) || null;
         S.__aiReviewStatus = status;
+        // Only the striffs payload carries this; a poll response says nothing about
+        // it, so leave what we know standing rather than clearing it on every tick.
+        if (typeof result?.aiReviewWarmupRequired === "boolean") {
+            S.__aiReviewWarmupRequired = result.aiReviewWarmupRequired;
+        }
         S.__aiReviewId = String(
             result?.aiReviewId || result?.ai_review_id || ""
         ).trim() || null;
@@ -5417,6 +5444,7 @@
     S.__debugLastApiResponse = null;
 
     S.__aiReviewStatus = null;
+    S.__aiReviewWarmupRequired = null;
     S.__aiReviewId = null;
     S.__aiReviewOperationId = null;
     S.__aiReviewPollInFlight = false;
@@ -6464,6 +6492,29 @@
     }
   };
 
+  // PlantUML draws every relationship with a 1px stroke, sized for a diagram
+  // shown at its natural width. The preview shrinks a full-size subdiagram to
+  // fit the panel, and at that scale the stroke lands well under one device
+  // pixel -- the added/deleted (green/red) arrows the selection exists to show
+  // are the first thing to disappear. non-scaling-stroke keeps the line a real
+  // pixel wide however far the diagram is scaled down; the arrowheads are
+  // filled polygons, so an outline of their own fill color is what keeps them
+  // from thinning away with the geometry.
+  function keepPreviewLinksVisible(svg) {
+    try {
+      for (const el of svg.querySelectorAll("g.link path, g.link polygon, g.link line")) {
+        el.setAttribute("vector-effect", "non-scaling-stroke");
+        if (el.tagName.toLowerCase() === "polygon") {
+          const fill = el.getAttribute("fill");
+          if (fill && fill !== "none") el.style.stroke = fill;
+        }
+        el.style.strokeWidth = "1.5";
+      }
+    } catch (e) {
+      cwarn?.("keepPreviewLinksVisible failed", e);
+    }
+  }
+
   S.updateCommentPanelPreview = function updateCommentPanelPreview(opts = {}) {
     const panel = document.getElementById(PANEL_ID);
     if (!panel) return;
@@ -6499,11 +6550,11 @@
         if (svg) {
           svg.style.display = "block";
           svg.style.maxWidth = "100%";
-          svg.style.maxHeight = "220px";
           svg.style.width = "auto";
           svg.style.height = "auto";
           svg.style.objectFit = "contain";
           svg.style.margin = "0 auto";
+          keepPreviewLinksVisible(svg);
           content.appendChild(document.adoptNode(svg));
         } else {
           content.innerHTML = '<div class="striffs-comment-panel__preview-empty">Preview could not be displayed</div>';
@@ -7272,7 +7323,7 @@
         color:var(--fgColor-muted,#57606a);margin-bottom:6px;
       }
       .striffs-comment-panel__preview-content svg{
-        display:block;max-width:100%;max-height:220px;
+        display:block;max-width:100%;
         width:auto;height:auto;margin:0 auto;
       }
       .striffs-comment-panel__preview-empty,
@@ -8958,7 +9009,18 @@
       if (btn) btn.disabled = false;
       return;
     }
-    S.toast?.("Executing architecture review...", "info", { timeoutMs: 4000 });
+    // The first review a repository ever gets does setup work that every later
+    // review reuses, so it runs minutes longer. Saying so beats a spinner that
+    // looks stuck.
+    if (S.__aiReviewWarmupRequired === true) {
+      S.toast?.(
+        "Setting up the first architecture review for this repository — this one takes a few minutes. Later reviews are much faster.",
+        "info",
+        { timeoutMs: 10000 }
+      );
+    } else {
+      S.toast?.("Executing architecture review...", "info", { timeoutMs: 4000 });
+    }
     S.__aiReviewStatus = "PENDING";
     S.__aiReviewPollStartedAt = Date.now();
     S.updateStriffButton?.({ enriching: true, tooltip: "Analyzing" });
@@ -9160,7 +9222,7 @@
       pull_number,
       updated_at,
       token,
-    }, timeoutFor("bgToken", timeoutFor("message", 7000)));
+    }, timeoutFor("bgToken", timeoutFor("message", 7000)), { retryOnWaitExpiry: false });
 
     if (!resp?.ok) {
       const error = new Error(resp?.error || 'API request failed');
@@ -9520,6 +9582,70 @@
     }
   }
 
+  // The 2026 "changes" experience renders diffs from React state and puts no data-path attribute
+  // anywhere in the document, so parsePrFilesFromDom below -- which only knows how to read the old
+  // server-rendered markup -- finds nothing on it and the caller falls back to treating every file
+  // as modified. That fallback is what sent a deleted file to be fetched from the head tree, where
+  // it is gone: GitHub answered with a rendered 404 page, whose HTML became the error message and
+  // was then reported to the user as a missing pull request.
+  //
+  // The same page ships the real answer. payload.pullRequestsChangesRoute.diffSummaries lists every
+  // file with an exact changeType, in the embedded blob the updated-at reader above already parses.
+  // Measured against apache/seatunnel#11960 it returns all 38 entries as 24 MODIFIED / 12 ADDED /
+  // 1 RENAMED / 1 REMOVED -- identical to what the REST API reports for the same pull request.
+  //
+  // It carries no previous path for a rename, so a renamed file is reported at its new path only.
+  // That is what the old-UI parse produces when the header does not spell out the rename too, and
+  // it is the honest shape: naming a previous path we did not read would be a guess.
+  const CHANGE_TYPE_TO_STATUS = Object.freeze({
+    ADDED: 'added',
+    REMOVED: 'removed',
+    DELETED: 'removed',
+    RENAMED: 'renamed',
+    MODIFIED: 'modified',
+    CHANGED: 'modified'
+  });
+
+  function parsePrFilesFromEmbeddedPayload(filterFiles = []) {
+    const wanted = new Set((filterFiles || []).map((f) => normalizeChangedFilePath(f)).filter(Boolean));
+    const out = [];
+    const seen = new Set();
+    const scripts = document.querySelectorAll('script[data-target="react-app.embeddedData"]');
+
+    for (const script of scripts) {
+      const text = script?.textContent || script?.innerText || '';
+      if (!text) continue;
+      let json;
+      try {
+        json = JSON.parse(text);
+      } catch {
+        continue; // a malformed blob is not a reason to fail the whole read
+      }
+      const payload = json?.payload || json?.data || json;
+      const summaries = payload?.pullRequestsChangesRoute?.diffSummaries
+        || payload?.diffSummaries;
+      if (!Array.isArray(summaries) || !summaries.length) continue;
+
+      for (const entry of summaries) {
+        const path = normalizeChangedFilePath(entry?.path);
+        if (!path || seen.has(path)) continue;
+        if (wanted.size && !wanted.has(path)) continue;
+        // An unrecognised changeType is treated as a modification: it still gets its head content
+        // fetched, which is the safe direction. Calling an unknown a removal would silently drop
+        // a file from the diagram.
+        const raw = String(entry?.changeType || entry?.status || '').trim().toUpperCase();
+        seen.add(path);
+        out.push({
+          filename: path,
+          status: CHANGE_TYPE_TO_STATUS[raw] || 'modified',
+          previous_filename: normalizeChangedFilePath(entry?.previousPath || entry?.previous_filename) || null
+        });
+      }
+    }
+
+    return out;
+  }
+
   function parsePrFilesFromDom(filterFiles = []) {
     const wanted = new Set((filterFiles || []).map((f) => normalizeChangedFilePath(f)).filter(Boolean));
     const seen = new Map();
@@ -9609,6 +9735,13 @@
 
   async function resolvePrFilesMetadata(meta, filterFiles, token) {
     if (!token) {
+      // Ahead of the DOM parse because it is the same data the DOM is rendered from, with the
+      // statuses attached. On the new changes UI it is the only source that has them at all.
+      const embedded = parsePrFilesFromEmbeddedPayload(filterFiles);
+      if (embedded.length) {
+        S.cinfo?.('PR files resolved from embedded page payload', { count: embedded.length });
+        return embedded;
+      }
       const domFirst = parsePrFilesFromDom(filterFiles);
       if (Array.isArray(domFirst) && domFirst.length) {
         return domFirst;
@@ -9748,8 +9881,15 @@
       credentials: 'include'
     });
     if (!rawResp.ok) {
-      const err = new Error(rawResp.text || `Failed fetching file content: ${rawResp.status}`);
+      // Deliberately NOT rawResp.text. GitHub answers a missing blob with a rendered 404 page, so
+      // using the body as the message put an entire HTML document where the reason should be --
+      // it reached the user as a toast full of markup, and before that it was swallowed by the
+      // 404 handler and reported as a missing pull request. Name the file and the ref instead.
+      const err = new Error(
+        `Could not read ${normalizedPath} at ${refs.headOwner}/${refs.headRepo}@${refs.headBranch} (HTTP ${rawResp.status}).`
+      );
       err.status = rawResp.status;
+      err.code = rawResp.status === 404 ? 'HEAD_FILE_NOT_FOUND' : 'HEAD_FILE_UNREADABLE';
       throw err;
     }
     if (/text\/html/i.test(rawResp.contentType) || /^<!doctype html/i.test(rawResp.text.trim())) {
@@ -9789,7 +9929,27 @@
       }
 
       const normalizedStatus = status === 'added' ? 'added' : 'modified';
-      const content = await fetchHeadFileContent(refs, path, effectiveToken);
+      let content;
+      try {
+        content = await fetchHeadFileContent(refs, path, effectiveToken);
+      } catch (e) {
+        // Only a 404 is treated this way, and only because it answers the question the fetch was
+        // asking: the file is not in the head tree. It reaches here when the status came from the
+        // DOM rather than the API -- buildPrFilesFromVisibleList has no status to report and calls
+        // everything 'modified', so a file the pull request deletes is looked for at head, where it
+        // is by definition gone. That is exactly a removal, so record one. Anything else (a
+        // timeout, a 403, an unreadable response) is a failure to find out and must still be
+        // raised: quietly calling those deletions would ship a diagram that is wrong in a way the
+        // user cannot see.
+        if (e?.status !== 404) throw e;
+        S.cinfo?.('Head file absent; treating as removed', {
+          path,
+          headRef: `${refs.headOwner}/${refs.headRepo}@${refs.headBranch}`,
+          reportedStatus: status
+        });
+        changedFiles.push({ path, status: 'removed' });
+        continue;
+      }
       if (typeof content !== 'string' || !content.length) continue;
       changedFiles.push({ path, status: normalizedStatus, content });
     }
@@ -9833,7 +9993,7 @@
       baseOwner: refs.baseOwner, baseRepo: refs.baseRepo, baseBranch: refs.baseBranch,
       changedFilesStorageKey,
       updated_at,
-    }, timeoutFor("bgGenerate", timeoutFor("message", 7000)));
+    }, timeoutFor("bgGenerate", timeoutFor("message", 7000)), { retryOnWaitExpiry: false });
 
     if (!resp?.ok) {
       const error = new Error(resp?.error || 'API request failed');
@@ -9905,6 +10065,12 @@
   const extractHumanMessage = (raw) => {
     const s = String(raw || '').trim();
     if (!s) return s;
+    // Last line of defence. Anything that reaches a toast is shown to a user, and a fetch body
+    // used as an error message can be a whole HTML page -- which is what a GitHub 404 is. The
+    // callers above no longer do that, but this is the single point every message passes through.
+    if (/^<!doctype html/i.test(s) || /^<html[\s>]/i.test(s)) {
+      return 'The server returned a web page instead of an answer.';
+    }
     // Try parsing as JSON to extract errorMessage
     try {
       const json = JSON.parse(s);
@@ -9924,11 +10090,32 @@
   const describeApiError = ({ token, status, errorCode, message }) => {
     const code = String(errorCode || '').trim().toUpperCase();
     const text = extractHumanMessage(String(message || '').trim() || `API request failed${status ? ` (${status})` : ''}`);
+    // 'timeout' is deliberately absent from this list. It matched our own "timeout after 180000ms"
+    // -- the content script's own deadline expiring while the background was still working -- and
+    // announced a connection failure against a service that was reachable the whole time. A real
+    // transport failure names itself; CLIENT_WAIT_EXPIRED is handled on its own below.
     const isTransportFailure =
       !status &&
-      /failed to fetch|networkerror|network error|timeout|background request failed|port closed|receiving end does not exist/i.test(text);
+      code !== 'CLIENT_WAIT_EXPIRED' &&
+      /failed to fetch|networkerror|network error|background request failed|port closed|receiving end does not exist/i.test(text);
 
-    if ((status === 404 && code === 'NOT_FOUND') || (status === 404 && !code)) {
+    if (code === 'CLIENT_WAIT_EXPIRED') {
+      return {
+        tooltip: "Striffs stopped waiting for this analysis. It is still running -- try again shortly.",
+        toast: "<strong>Still analysing.</strong> This pull request is taking longer than Striffs waits for. The analysis keeps running on the server, so trying again shortly picks it up rather than starting over.",
+        tone: 'neutral',
+        disabled: false,
+        htmlToast: true
+      };
+    }
+
+    // Narrow on purpose: only a 404 the server itself labelled NOT_FOUND is the pull-request
+    // lookup failing. This used to catch every uncoded 404 as well, and none of those are about
+    // the pull request -- a file the PR deletes, fetched from head where it no longer is; an
+    // analysis job that expired; the gateway answering while the single analysis pod is busy.
+    // All three told the user to check the URL of a public pull request that was there the whole
+    // time. An uncoded 404 now falls through to the default branch and says what the server said.
+    if (status === 404 && code === 'NOT_FOUND') {
       return {
         tooltip: "Pull request not found. Check the URL or verify access.",
         toast: token

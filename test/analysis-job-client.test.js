@@ -137,7 +137,44 @@ test('a job the server no longer has is reported as gone rather than retried', a
 
   assert.equal(result.ok, false);
   assert.equal(result.status, 404);
+  // Coded, because the caller classifies by code: an uncoded 404 from here is indistinguishable
+  // from the pull-request lookup 404ing, and got reported to the user as a missing pull request.
+  assert.equal(result.errorCode, 'ANALYSIS_JOB_GONE');
 });
+
+test('a status the server could not give is coded so it cannot read as a missing pull request', async () => {
+  const clock = fakeClock();
+  const { fetchImpl } = respondingWith({ ok: false, status: 500, json: async () => ({}) });
+
+  const result = await client.awaitAnalysisJob(ACCEPTED, 'https://api.striff.io', {
+    fetchImpl, sleepImpl: clock.sleep, nowImpl: clock.now
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.errorCode, 'ANALYSIS_STATUS_UNAVAILABLE');
+});
+
+for (const status of [502, 503, 504]) {
+  test(`a gateway ${status} while the analysis runs backs off instead of failing`, async () => {
+    const clock = fakeClock();
+    let call = 0;
+    const fetchImpl = async () => {
+      call += 1;
+      if (call <= 3) return { ok: false, status, json: async () => ({}) };
+      return jsonResponse({ status: 'READY', result: { operationId: 'op-gw' } });
+    };
+
+    const result = await client.awaitAnalysisJob(ACCEPTED, 'https://api.striff.io', {
+      fetchImpl, sleepImpl: clock.sleep, nowImpl: clock.now
+    });
+
+    // The server analyses one repository at a time, so the gateway in front of it answers 5xx
+    // for exactly as long as the analysis this loop is waiting for holds the pod. Giving up on
+    // that signal throws away work that is minutes from finishing.
+    assert.equal(result.ok, true);
+    assert.equal(result.json.operationId, 'op-gw');
+  });
+}
 
 test('running out of patience says the analysis is still running', async () => {
   const clock = fakeClock();
