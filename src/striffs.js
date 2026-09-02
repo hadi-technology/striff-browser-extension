@@ -27,9 +27,9 @@
   S.PREFETCH_ARTIFACT_MAX_CHANGED_FILES = 50;
   S.PREFETCH_ARTIFACT_MAX_CHANGED_FILES_BYTES = 15 * 1024 * 1024;
   // Route the common (public-repo) analysis through the queued, polled upload path instead of the
-  // synchronous server-fetch GET. Kept OFF until the interactive analysis queue is confirmed to
-  // drain in production; the background 202 polling it relies on is already live. See requestPrimary.
-  S.POST_PRIMARY_ENABLED = false;
+  // synchronous server-fetch GET. Enabled once the interactive analysis queue was confirmed to
+  // drain in production end-to-end (a fresh analysis polled to READY in ~5s). See requestPrimary.
+  S.POST_PRIMARY_ENABLED = true;
 
   S.DEFAULT_SUPPORTED_EXTS = ['java', 'ts', 'py'];
 
