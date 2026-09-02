@@ -17,13 +17,19 @@
     message: 7000,
     ping: 1000,
     waitForToolbar: 8000,
-    bgGenerate: 180000,
+    // The upload path is now queued and polled to completion in the background (ADR-035), so this
+    // must cover a full analysis (measured 177-483s) plus polling overhead, not just a single POST.
+    bgGenerate: 360000,
     bgToken: 180000,
     bgPrefetch: 30000,
     bgArtifactPrefetch: 180000,
   });
   S.PREFETCH_ARTIFACT_MAX_CHANGED_FILES = 50;
   S.PREFETCH_ARTIFACT_MAX_CHANGED_FILES_BYTES = 15 * 1024 * 1024;
+  // Route the common (public-repo) analysis through the queued, polled upload path instead of the
+  // synchronous server-fetch GET. Kept OFF until the interactive analysis queue is confirmed to
+  // drain in production; the background 202 polling it relies on is already live. See requestPrimary.
+  S.POST_PRIMARY_ENABLED = false;
 
   S.DEFAULT_SUPPORTED_EXTS = ['java', 'ts', 'py'];
 
@@ -9379,6 +9385,53 @@
     ...ZIP_LIMIT_ERROR_CODES
   ]);
 
+  // A failure from the upload path that means "this PR is too big for the ZIP route" — the case
+  // where the server-side token GET, which fetches without a client-side download and has no
+  // changed-file cap, is the right fallback.
+  function isUploadPathTooLargeError(err) {
+    const code = String(err?.errorCode || '').trim().toUpperCase();
+    if (ZIP_LIMIT_ERROR_CODES.has(code) || ZIP_REDUCE_SCOPE_ERROR_CODES.has(code)) return true;
+    if (Number(err?.status || 0) === 413) return true;
+    return /zip entry exceeds maximum allowed size|too many changes|request too large|repo(sitory)? (is )?too large|too large for the zip generation path/i
+      .test(String(err?.message || ''));
+  }
+
+  // The single analysis entry point.
+  //
+  // When POST-primary is enabled: the upload (POST) path is queued and polled to completion in the
+  // background (async, ADR-035), so it is preferred — but it downloads the base ZIP from codeload
+  // unauthenticated, so it only works on public repositories. A private repo can only be fetched
+  // server-side with the user's token (the synchronous GET path), which is also the fallback when
+  // the upload path is refused because the PR is too large for it. So: private repo -> token GET;
+  // public repo -> upload, with token GET as the size fallback.
+  //
+  // POST-primary is gated OFF until the interactive analysis queue is confirmed to drain in
+  // production (a fresh job currently sits QUEUED indefinitely — the worker is not claiming the
+  // interactive lane). While gated, dispatch is the historical one (token -> server-fetch GET,
+  // otherwise upload), so no user is routed onto a queue that never completes. The background 202
+  // polling is live regardless, so the no-token upload path is already correct; flipping this to
+  // true once the queue drains is all that turns the common path async. See S.POST_PRIMARY_ENABLED.
+  async function requestPrimary(meta, token, { quiet = false } = {}) {
+    const postPrimary = S.POST_PRIMARY_ENABLED === true && !S.isPrivateRepo?.();
+    if (!postPrimary) {
+      return token
+        ? await requestWithToken(token, meta, { quiet })
+        : await requestWithZips(meta, { quiet });
+    }
+    try {
+      return await requestWithZips(meta, { quiet });
+    } catch (err) {
+      if (token && isUploadPathTooLargeError(err)) {
+        S.cinfo?.('Upload path refused for size; falling back to token GET', {
+          errorCode: err?.errorCode || null,
+          status: err?.status || null
+        });
+        return await requestWithToken(token, meta, { quiet });
+      }
+      throw err;
+    }
+  }
+
   const shouldPromptForTokenForZipLimit = ({ token, status, errorCode, message }) => {
     if (token) return false;
     if (errorCode && ZIP_LIMIT_ERROR_CODES.has(String(errorCode).trim().toUpperCase())) return true;
@@ -9532,11 +9585,7 @@
           });
           return false;
         }
-        const fetchFreshResult = async () => (
-          token
-            ? await requestWithToken(token, meta, { quiet: true })
-            : await requestWithZips(meta, { quiet: true })
-        );
+        const fetchFreshResult = async () => await requestPrimary(meta, token, { quiet: true });
         let result = null;
         let lastError = null;
         for (let attempt = 1; attempt <= 3; attempt += 1) {
@@ -9738,7 +9787,7 @@
         }
 
         if (!result) {
-          result = token ? await requestWithToken(token, meta) : await requestWithZips(meta);
+          result = await requestPrimary(meta, token);
         }
 
         await renderStriffsResult(result, meta, { fromCache });

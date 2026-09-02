@@ -212,7 +212,65 @@ const readApiErrorResponse = BgUtils.readApiErrorResponse || (async (res) => {
   };
 });
 
-async function postIncrementalToLocal(apiUrl, beforeAB, changedFiles = [], { timeoutMs = 120000 } = {}) {
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+
+// Poll a queued analysis (ADR-035) until it is READY or FAILED, honouring the poll interval the
+// server sends on each tick. Returns the same shape as a direct call — { ok: true, json: <result> }
+// or { ok: false, error, ... } — so the caller never has to know whether the analysis was served
+// from cache (200, inline) or queued (202, polled). The in-flight fetch on each tick keeps the MV3
+// service worker alive; the gaps between ticks are the server-chosen pollAfterMs (a few seconds),
+// well inside the idle-suspension window.
+async function pollAnalysisJob(apiBase, jobId, firstDelayMs, { overallTimeoutMs = 300000 } = {}) {
+  const startedAt = Date.now();
+  let delay = Math.max(0, Number(firstDelayMs) || 0);
+  const jobsUrl = `${apiBase}/api/v1/github/striffs/jobs/${encodeURIComponent(jobId)}`;
+  while (true) {
+    if (Date.now() - startedAt > overallTimeoutMs) {
+      return { ok: false, error: 'Analysis timed out while queued. Try again in a moment.', errorCode: 'JOB_TIMEOUT' };
+    }
+    if (delay > 0) await sleep(delay);
+    const t = abortableTimeout(30000);
+    let res;
+    try {
+      res = await fetch(jobsUrl, { signal: t.signal, cache: 'no-cache' });
+    } catch (e) {
+      // A transient network blip (or a brief SW suspension) is not a failed analysis: back off and
+      // retry within the overall budget rather than abandoning work that is still running.
+      delay = Math.max(delay, 3000);
+      continue;
+    } finally {
+      t.cancel();
+    }
+    if (res.status === 404) {
+      return { ok: false, status: 404, error: 'Analysis job expired or was not found; submit again.', errorCode: 'JOB_NOT_FOUND' };
+    }
+    if (res.status === 429 || res.status >= 500) {
+      // Transient: the API or its ingress returns 429/502/503/504 during a rollout or under load
+      // while the job keeps running server-side (observed as a ~24s burst of 503s mid-poll against
+      // prod). Treat it like a network blip — back off and retry within the overall budget rather
+      // than reporting a failure for an analysis that is still queued.
+      delay = Math.max(delay, 3000);
+      continue;
+    }
+    if (!res.ok) {
+      const parsed = await readApiErrorResponse(res);
+      return { ok: false, status: res.status, error: parsed.error, errorCode: parsed.errorCode, detail: parsed.detail };
+    }
+    let body = null;
+    try { body = await res.json(); } catch {}
+    const status = String(body?.status || '').toUpperCase();
+    if (status === 'READY') {
+      return { ok: true, json: body?.result };
+    }
+    if (status === 'FAILED') {
+      return { ok: false, status: 200, error: body?.errorMessage || 'Analysis failed.', errorCode: body?.errorCode || 'JOB_FAILED' };
+    }
+    // QUEUED or RUNNING — wait the interval the server chose, then poll again.
+    delay = Math.max(1000, Number(body?.pollAfterMs) || delay || 3000);
+  }
+}
+
+async function postIncrementalToLocal(apiUrl, beforeAB, changedFiles = [], { timeoutMs = 120000, apiBase = null } = {}) {
   const sanitizedChangedFiles = sanitizeChangedFilesPayload(changedFiles);
   const fd = new FormData();
   fd.append('before', new Blob([beforeAB], { type: 'application/zip' }), 'before.zip');
@@ -221,6 +279,22 @@ async function postIncrementalToLocal(apiUrl, beforeAB, changedFiles = [], { tim
   const t = abortableTimeout(timeoutMs);
   try {
     const res = await fetch(apiUrl, { method: 'POST', body: fd, signal: t.signal });
+    // ADR-035: an analysis this platform has already run is returned inline with 200; anything else
+    // is queued and answered 202 with a job to poll, because it takes minutes and one runs per pod.
+    // 202 is a 2xx, so it MUST be handled before the ok check below or the job envelope gets
+    // mistaken for the result. Only the analysis endpoint queues; callers that pass apiBase opt into
+    // polling it to completion, so they receive one { ok, json } whichever branch the server took.
+    // (The prefetch endpoints answer 200 with a submission receipt and never reach this branch.)
+    if (res.status === 202 && apiBase) {
+      t.cancel();
+      let envelope = null;
+      try { envelope = await res.json(); } catch {}
+      const jobId = envelope?.jobId;
+      if (!jobId) {
+        return { ok: false, status: 202, error: 'Analysis was queued but no job id was returned.', errorCode: 'JOB_NO_ID' };
+      }
+      return await pollAnalysisJob(apiBase, jobId, envelope?.pollAfterMs, { overallTimeoutMs: Math.max(timeoutMs, 300000) });
+    }
     if (!res.ok) {
       const parsed = await readApiErrorResponse(res);
       return {
@@ -845,7 +919,10 @@ const handlers = {
       `${apiBase}/api/v1/github/striffs`,
       before.arrayBuffer,
       effectiveChangedFiles,
-      { timeoutMs: 180000 }
+      // apiBase opts this call into ADR-035 job polling: a 202 is followed to READY/FAILED and the
+      // final result is returned inline, so the handler below sees a result whether the analysis
+      // was cached (200) or queued (202).
+      { timeoutMs: 180000, apiBase }
     );
     const postDurationMs = Date.now() - postStart;
     const totalDurationMs = Date.now() - overallStart;
