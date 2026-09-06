@@ -2170,8 +2170,8 @@ const setRemoteConfigUrlData = async (jsonObj) => {
     }, null, { timeout: timeoutMs, polling: 200 }).catch(() => null);
   };
   const liveAiReviewResult = await runStriffsTestHook('runLiveAiReviewCheck', { timeoutMs: 180000 }, 190000);
-  const skipManualAiReviewChecks = shouldSkipLiveAiReview(liveAiReviewResult);
-  if (skipManualAiReviewChecks) {
+  const skipLiveAiReviewCheck = shouldSkipLiveAiReview(liveAiReviewResult);
+  if (skipLiveAiReviewCheck) {
     warn(`Skipping live AI review check (${JSON.stringify(liveAiReviewResult)})`);
   } else if (!liveAiReviewResult?.ok) {
     fail(`Live AI review check failed (${JSON.stringify(liveAiReviewResult)})`);
@@ -2179,18 +2179,19 @@ const setRemoteConfigUrlData = async (jsonObj) => {
     pass('Live AI review returns a changed SVG with at least one AI review note');
   }
 
-  let aiReviewManualOk = true;
-  if (skipManualAiReviewChecks) {
-    warn('Skipping manual AI review checks because the live AI review path is not applicable for this PR/backend combination.');
-  } else {
-    aiReviewManualOk = false;
-    for (let attempt = 1; attempt <= 3 && !aiReviewManualOk; attempt += 1) {
-      await waitForAiReviewHarnessReady(10000);
-      aiReviewManualOk = await runAiReviewManualChecks();
-      if (!aiReviewManualOk && attempt < 3) {
-        warn(`Retrying manual AI review checks (attempt ${attempt + 1})`);
-        await page.waitForTimeout(1500);
-      }
+  // Always run. These mock fetchAiReviewStatus outright and drive the Architecture
+  // Review button through READY and FAILED, so not one of the seven assertions
+  // depends on what the backend decided for this PR. Gating them on the live check
+  // meant the day the backend stopped returning 403 was the day they stopped
+  // running -- and the log still reported "ok", because aiReviewManualOk started
+  // out true and nothing had set it otherwise.
+  let aiReviewManualOk = false;
+  for (let attempt = 1; attempt <= 3 && !aiReviewManualOk; attempt += 1) {
+    await waitForAiReviewHarnessReady(10000);
+    aiReviewManualOk = await runAiReviewManualChecks();
+    if (!aiReviewManualOk && attempt < 3) {
+      warn(`Retrying manual AI review checks (attempt ${attempt + 1})`);
+      await page.waitForTimeout(1500);
     }
   }
   log(`AI review manual checks completed: ${aiReviewManualOk ? 'ok' : 'failed'}`);
