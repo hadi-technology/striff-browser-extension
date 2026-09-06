@@ -1639,7 +1639,12 @@
     const send = async () => {
       const resp = await S.sendMessageWithTimeout(msg, timeoutMs ?? S.TIMEOUTS.message);
       if (resp?.ok === true || resp?.success === true) return resp;
-      throw new Error(resp?.error || 'background request failed');
+      // Carry the reply on the error so a caller that must branch on the status
+      // (a 403 is terminal; a 502 is worth retrying) can recover it instead of
+      // matching on the message text.
+      const error = new Error(resp?.error || 'background request failed');
+      error.response = resp;
+      throw error;
     };
 
     try {
@@ -1655,12 +1660,20 @@
   };
 
   S.fetchAiReviewStatus = async ({ operationId, engagementToken, timeoutMs } = {}) => {
-    return await S.bgRequest({
-      type: "fetchAiReviewStatus",
-      operationId,
-      engagementToken,
-      timeoutMs
-    }, timeoutMs ?? 15000);
+    // Returns the reply rather than throwing on it: both pollers branch on
+    // resp.status, and a 403 has to stop the poll rather than retry a request
+    // that can never succeed. bgRequest throwing made those branches dead code
+    // and turned a rejected token into a silent five-second retry loop.
+    try {
+      return await S.bgRequest({
+        type: "fetchAiReviewStatus",
+        operationId,
+        engagementToken,
+        timeoutMs
+      }, timeoutMs ?? 15000);
+    } catch (e) {
+      return e?.response || { ok: false, error: String(e?.message || e) };
+    }
   };
 
   S.fetchSubdiagramRender = async ({ operationId, diagramIndex, components, timeoutMs } = {}) => {
