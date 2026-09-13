@@ -130,7 +130,7 @@ test('the built-in fallback matches the extensions the API serves today', () => 
   // Not a second source of truth: if this drifts from the server the fallback path silently
   // filters by rules the analysis no longer agrees with.
   assert.deepEqual(MANIFEST.sourceExtensions, ['cs', 'java', 'py', 'ts', 'tsx']);
-  assert.deepEqual(MANIFEST.docExtensions, ['adoc', 'md', 'mdx', 'rst']);
+  assert.deepEqual(MANIFEST.docExtensions, ['adoc', 'md', 'mdc', 'mdx', 'rst']);
   assert.equal(MANIFEST.maxUploadBytes, 15 * 1024 * 1024);
 });
 

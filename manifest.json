@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Striffs for GitHub",
   "description": "An architecture diagram of every GitHub pull request, checked against the rules in the repository's own docs.",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "minimum_chrome_version": "111",
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self'"

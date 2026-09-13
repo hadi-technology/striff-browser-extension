@@ -13,12 +13,12 @@
 (function (root) {
   'use strict';
 
-  // Mirrors the server's manifest at version 1. Used only when the endpoint cannot be reached --
+  // Mirrors the server's manifest at version 2. Used only when the endpoint cannot be reached --
   // a network failure must not mean uploading a 937MiB archive that will be refused anyway.
   const DEFAULT_MANIFEST = {
-    version: 1,
+    version: 2,
     sourceExtensions: ['cs', 'java', 'py', 'ts', 'tsx'],
-    docExtensions: ['adoc', 'md', 'mdx', 'rst'],
+    docExtensions: ['adoc', 'md', 'mdc', 'mdx', 'rst'],
     supportFileGlobs: [
       '**/package.json',
       '**/jsconfig.json',

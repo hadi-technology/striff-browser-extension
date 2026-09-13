@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.0
+
+- Cursor project rules (`.cursor/rules/*.mdc`) count as documentation in the file list the extension
+  falls back to when the API's own list cannot be fetched, so a repository's rules for its coding agent
+  still reach the analysis. The API's list is used whenever it is available.
+
 ## 1.2.0
 
 - The "first analysis takes a few minutes" notice is gone. The Striffs button's loading state shows
