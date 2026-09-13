@@ -2,7 +2,7 @@
  * Phase 8 End-to-End Manual Smoke Test
  * ===================================
  *
- * This test validates the full async AI review enrichment flow.
+ * This test validates the architecture review that loads with the diagram.
  *
  * Prerequisites (P8):
  * - striff-api running with AI review enabled (striff.ai.review.enabled=true)
@@ -11,26 +11,22 @@
  *
  * Test Flow (P8-8: Manual: full flow in Chrome with real GitHub PR):
  *
- * 1. BASE RENDER (no auto-enrichment):
+ * 1. ONE LOAD:
  *    - Navigate to GitHub PR files tab
- *    - Click "Generate Striffs" button
- *    - Verify base diagram renders WITHOUT AI annotations
- *    - Verify AI Review button shows "AI Review" text
+ *    - Click the Striffs button
+ *    - The server starts the review with the analysis; while it reports PENDING/RUNNING the
+ *      extension keeps loading and reads /api/v1/striffs/{operationId}/ai-review
+ *    - Each read returns the current status and pollAfterMs
  *
- * 2. USER-TRIGGERED ENRICHMENT:
- *    - Click "AI Review" button
- *    - Verify button disables and shows "Analyzing..."
- *    - Extension polls /api/v1/striffs/{operationId}/ai-review
- *    - Each poll returns current status and pollAfterMs
- *    - Wait for status to transition to READY (or FAILED)
+ * 2. ONE RENDER (READY):
+ *    - The diagram renders once, after the review is in
+ *    - The review is not drawn on the diagram; its findings are in the review panel
+ *    - Verify the Findings button reads "Findings (N rules)" and is enabled
+ *    - Verify the review panel does NOT open by itself, and a click on Findings opens it
  *
- * 3. ENRICHED RENDER (READY):
- *    - On READY, response includes enriched striffs array
- *    - Extension swaps SVG with enriched version
- *    - Verify enriched SVG contains AI_REVIEW_NOTE_ elements
- *    - Verify button shows "View review (N rules)" text
- *    - Verify results panel auto-opens with review summary
- *    - Verify toast notification "Architecture review complete."
+ * 3. SLOW FIRST READ:
+ *    - A review still running after the wait budget renders the diagram with the Findings button
+ *      disabled ("Reading docs…"); the button enables itself when the review arrives
  *
  * 4. CACHE VERIFICATION:
  *    - Refresh page
@@ -112,6 +108,15 @@ const storageStatePath = (process.env.GITHUB_STORAGE_STATE_PATH || '').trim();
 const GH_TEST_USER = (process.env.GH_TEST_USER || '').trim();
 const GH_TEST_PASS = (process.env.GH_TEST_PASS || '').trim();
 const NAVIGATION_TIMEOUT_MS = Number(envOr('NAVIGATION_TIMEOUT_MS', '30000'));
+// A load stays open until the architecture review is in, for up to the extension's review wait
+// budget, so a wait for a first render has to outlast that budget plus the analysis itself. Read
+// from the extension's source rather than restated, so the two cannot drift apart.
+const REVIEW_WAIT_BUDGET_MS = (() => {
+  const source = fs.readFileSync(path.resolve(__dirname, '..', 'src', 'striffs.js'), 'utf8');
+  const m = source.match(/S\.REVIEW_WAIT_BUDGET_MS = (\d+) \* 1000;/);
+  return m ? Number(m[1]) * 1000 : 150000;
+})();
+const FIRST_RENDER_TIMEOUT_MS = Number(envOr('FIRST_RENDER_TIMEOUT_MS', String(REVIEW_WAIT_BUDGET_MS + 90000)));
 
 const normalizePullRequestUrl = (url, useNewUi) => {
   if (!url) return url;
@@ -320,6 +325,8 @@ async function exportLoginProfileCookies() {
   }
 }
 
+// Set inside the main flow: reports and exits. See its definition.
+let finishRun = null;
 (async () => {
   let ok = true;
   let chromeLaunched = false;
@@ -349,6 +356,18 @@ async function exportLoginProfileCookies() {
   };
   // Ensure Chrome is killed when the IIFE exits (including early returns)
   process.on('beforeExit', () => { ensureCleanup(); });
+  // Every early `return` in the flow below ends the run with the browser still open, and an open
+  // browser keeps Node alive, so beforeExit never fires and the run sat silent until the global
+  // timeout. Headless, there is nothing to inspect: report and exit as soon as the flow is over.
+  finishRun = () => {
+    log('='.repeat(60));
+    log(`Run stopped early: ${passCount} passed, ${failures.length} failed, ${skips.length} skipped`);
+    for (const m of skips) log(`  ⊘ ${m}`);
+    for (const m of failures) log(`  ✗ ${m}`);
+    log('='.repeat(60));
+    ensureCleanup();
+    process.exit(ok ? 0 : 1);
+  };
   const runStriffsTestHook = async (fn, payload = {}, timeoutMs = 5000) => {
     return await page.evaluate(({ fn, payload, timeoutMs }) => new Promise((resolve) => {
       const id = `t-${Math.random().toString(36).slice(2)}`;
@@ -1042,7 +1061,7 @@ const setRemoteConfigUrlData = async (jsonObj) => {
           const diffs = document.querySelector('#diffs-btn');
           return striffs && diffs ? { striffs: true, diffs: true } : null;
         },
-        { timeout: 15000, polling: 300 }
+        undefined, { timeout: 15000, polling: 300 }
       )
       .catch(() => null);
 
@@ -1470,7 +1489,7 @@ const setRemoteConfigUrlData = async (jsonObj) => {
     await page.waitForFunction(() => {
       const btn = document.querySelector('#striffs-btn');
       return !!(btn && (btn.disabled === true || btn.classList.contains('is-disabled')));
-    }, { timeout: 10000 }).catch(() => null);
+    }, undefined, { timeout: 10000 }).catch(() => null);
   } else {
     await page.waitForTimeout(1000);
   }
@@ -1569,7 +1588,7 @@ const setRemoteConfigUrlData = async (jsonObj) => {
       opacity: style.opacity,
       title: btn.title || ''
     };
-  }, { timeout: 10000 }).catch(() => null);
+  }, undefined, { timeout: 10000 }).catch(() => null);
   if (!enabledState && NEW_UI) {
     warn('Retrying GitHub new UI activation after restoring production config');
     const state = await ensureNewUiExperience().catch(() => null);
@@ -1586,7 +1605,7 @@ const setRemoteConfigUrlData = async (jsonObj) => {
             opacity: style.opacity,
             title: btn.title || ''
           };
-        }, { timeout: 10000 }).catch(() => null);
+        }, undefined, { timeout: 10000 }).catch(() => null);
       }
     }
   }
@@ -1678,7 +1697,7 @@ const setRemoteConfigUrlData = async (jsonObj) => {
       opacity: style.opacity,
       title
     };
-  }, { timeout: 15000, polling: 300 }).catch(() => null) : null;
+  }, undefined, { timeout: 15000, polling: 300 }).catch(() => null) : null;
   const unsupportedState = unsupportedStateHandle ? await unsupportedStateHandle.jsonValue().catch(() => null) : null;
 
   if (unsupportedButtonsOk && !unsupportedState) {
@@ -1994,7 +2013,7 @@ const setRemoteConfigUrlData = async (jsonObj) => {
       (neutralState && /failed|error|api request|timeout|fetch/i.test(tooltip)) ||
       hasToastError ||
       failureState;
-  }, { timeout: 20000 }).catch(() => false);
+  }, undefined, { timeout: 20000 }).catch(() => false);
   let errorOk = !!errorShown;
   if (!errorOk) {
     const forced = await page.evaluate(async () => {
@@ -2061,7 +2080,9 @@ const setRemoteConfigUrlData = async (jsonObj) => {
     const btn = document.querySelector('#striffs-btn');
     const btnSuccess = !!(btn && (/check-circle/.test(btn.innerHTML) || btn.classList.contains('is-success') || /loaded from cache/i.test(btn.title || '')));
     return (hasSvg || hasError || ready || btnSuccess) ? { ready, hasSvg, hasError, visible, btnSuccess } : null;
-  }, { timeout: 45000 }).catch(() => null);
+    // Options go third: waitForFunction's second parameter is the page function's argument, and an
+    // options object passed there is ignored, which left this wait on Playwright's 30s default.
+  }, null, { timeout: FIRST_RENDER_TIMEOUT_MS }).catch(() => null);
 
   const readyState = readyStateHandle ? await readyStateHandle.jsonValue() : null;
   if (!readyState) {
@@ -2107,7 +2128,7 @@ const setRemoteConfigUrlData = async (jsonObj) => {
     const ready = !!window.Striffs?.__striffsReady;
     const currentView = window.Striffs?.__currentView;
     return (hasSvg || hasError || ready) && visible && (!currentView || currentView === 'striffs');
-  }, { timeout: 20000 }).catch(() => false);
+  }, undefined, { timeout: 20000 }).catch(() => false);
 
   if (!striffShown) {
     fail('Striffs view did not render');
@@ -2177,7 +2198,7 @@ const setRemoteConfigUrlData = async (jsonObj) => {
     const downloadIcon = download?.querySelector('svg');
     const guideIcon = guide?.querySelector('svg');
     return reset && download && guide && resetIcon && downloadIcon && guideIcon ? true : null;
-  }, { timeout: 10000 }).catch(() => null);
+  }, undefined, { timeout: 10000 }).catch(() => null);
   if (!controlsReady) {
     fail('Striffs controls not found (reset/download/guide) or icons missing');
     return;
@@ -2228,24 +2249,9 @@ const setRemoteConfigUrlData = async (jsonObj) => {
   } else if (liveAiReviewStatus !== 'READY') {
     fail(`Live AI review ended in an unexpected state (${JSON.stringify(liveAiReviewResult)})`);
   } else {
-    // Deterministic: the review ran and handed back a diagram the extension could swap in.
-    if (liveAiReviewResult.changed) {
-      pass('Live AI review reaches READY and returns an updated diagram');
-    } else {
-      fail(`Live AI review reached READY without changing the diagram (${JSON.stringify(liveAiReviewResult)})`);
-    }
-    // Judgment-dependent: assert the surfaced-item to SVG-note mapping only when the backend
-    // actually surfaced something. Asserting a note unconditionally tested the model rather than
-    // our rendering, which is why the whole block used to be skipped to stop it flaking.
-    if (liveAiReviewResult.surfacedCount > 0) {
-      if (liveAiReviewResult.hasNote) {
-        pass(`Surfaced review items are drawn as notes on the diagram (${liveAiReviewResult.surfacedCount} surfaced)`);
-      } else {
-        fail(`Backend surfaced ${liveAiReviewResult.surfacedCount} review item(s) but the diagram drew no note`);
-      }
-    } else {
-      skip('AI review note rendering: backend surfaced no review items for this PR');
-    }
+    // The review is not drawn on the diagram, so READY is the deterministic part; what it surfaced is
+    // checked where it is shown, in the panel, below.
+    pass('Live AI review reaches READY');
 
     // These assert against the real API response rather than a fixture, so they are the only
     // check that the server is still sending what the panel is built to render.
@@ -2267,16 +2273,18 @@ const setRemoteConfigUrlData = async (jsonObj) => {
       pass(`Live AI review returns a model-written overview (${liveAiReviewResult.overviewLength} chars)`);
     }
 
-    // The roster is fixed and renders whenever the review ran, so unlike findings it does not
-    // depend on this PR happening to trip a detector.
-    if (!liveAiReviewResult.panelHasStructuralChecks || liveAiReviewResult.panelCheckRowCount < 12) {
-      fail(`Live AI review panel missing the structural checks table (${JSON.stringify({
-        hasTable: liveAiReviewResult.panelHasStructuralChecks,
-        rows: liveAiReviewResult.panelCheckRowCount,
-        findings: liveAiReviewResult.findingsCount
-      })})`);
+    // Structural checks are no longer part of the review. The section must stay gone whatever the
+    // server sends -- an older API still includes detector findings -- and whatever it surfaced
+    // for the extension must still render.
+    if (liveAiReviewResult.panelHasStructuralChecks) {
+      fail(`Live AI review panel rendered a structural checks section (${liveAiReviewResult.findingsCount} findings in the response)`);
     } else {
-      pass(`Live AI review panel renders the structural checks table (${liveAiReviewResult.panelCheckRowCount} rows, ${liveAiReviewResult.findingsCount} findings)`);
+      pass(`Live AI review panel renders no structural checks section (${liveAiReviewResult.findingsCount} findings in the response)`);
+    }
+    if (liveAiReviewResult.extensionItemCount > 0 && !liveAiReviewResult.panelHasReviewItems) {
+      fail(`Live AI review surfaced ${liveAiReviewResult.extensionItemCount} review item(s) but the panel rendered none`);
+    } else if (liveAiReviewResult.extensionItemCount > 0) {
+      pass(`Live AI review panel renders review items (${liveAiReviewResult.extensionItemCount})`);
     }
 
     // Documented rules depend on the repo having docs stating rules the change reached, so their
@@ -2290,8 +2298,8 @@ const setRemoteConfigUrlData = async (jsonObj) => {
     }
   }
 
-  // Always run. These mock fetchAiReviewStatus outright and drive the Architecture
-  // Review button through READY and FAILED, so not one of the seven assertions
+  // Always run. These mock fetchAiReviewStatus outright and drive a load through a
+  // review that finishes and one that fails, so not one of the assertions
   // depends on what the backend decided for this PR. Gating them on the live check
   // meant the day the backend stopped returning 403 was the day they stopped
   // running -- and the log still reported "ok", because aiReviewManualOk started
@@ -2320,6 +2328,9 @@ const setRemoteConfigUrlData = async (jsonObj) => {
   } else {
     warn(`Live diagram reset returned: ${JSON.stringify(clearResult)}`);
   }
+  // The reset clears every striffs* storage key, the API base override among them, so without this
+  // the rest of the run silently moved to the extension's default API.
+  await setApiBaseOverride(PRODUCTION_API_BASE);
 
   // File tree click should NOT switch to Striffs when in diffs view.
   let fileTreeDiffsOk = { ok: false, reason: 'unknown' };
@@ -2426,6 +2437,12 @@ const setRemoteConfigUrlData = async (jsonObj) => {
   // File tree click should focus diagram when in Striffs view (no diff hash change).
   let fileTreeStriffsOk = { ok: false, reason: 'unknown' };
   try {
+    // After the reset this is a fresh load, and a load stays open until the review is in. Wait for it
+    // to finish before asking what a file tree click does in the Striffs view.
+    await page.waitForFunction(() => {
+      const btn = document.querySelector('#striffs-btn');
+      return !!document.querySelector('#striffs-content svg') && !!btn && !btn.disabled;
+    }, null, { timeout: FIRST_RENDER_TIMEOUT_MS }).catch(() => null);
     await clickStriffsButton('before striffs-view file tree assertion').catch(() => {});
     await page.waitForTimeout(600);
     const beforeActive = await page.evaluate(() => !!document.querySelector('#striffs-btn.is-active'));
@@ -2698,37 +2715,44 @@ const setRemoteConfigUrlData = async (jsonObj) => {
       return false;
     }
 
-    if (!result.buttonState?.disabledAfterClick) {
-      fail(`Manual AI review button not disabled after click (${JSON.stringify(result.buttonState)})`);
+    if (!result.noManualTrigger) {
+      fail(`A manual review trigger is still present (${JSON.stringify(result)})`);
       return false;
     }
-    pass('AI Review button disabled after click');
+    pass('No manual "AI Review" trigger remains');
 
-    if (!result.readyOutcome?.ok || !result.readyOutcome?.enriched || result.readyOutcome?.pollTimerActive) {
-      fail(`Manual AI review READY polling path failed (${JSON.stringify(result.readyOutcome)})`);
+    // A review reported as running is waited for, and the diagram renders once, from the review.
+    if (!result.readyOutcome?.ok || result.readyOutcome?.renders !== 1
+      || result.readyOutcome?.pollsBeforeRender < 2) {
+      fail(`Running review was not waited for before a single render (${JSON.stringify(result.readyOutcome)})`);
       return false;
     }
-    pass('AI Review button triggers enrichment that swaps in enriched SVG on READY');
+    pass('A running review is waited for, and the diagram renders once, from the review');
 
-    // The button is re-scoped from a trigger to a view once the review is in hand (#14): after READY
-    // it reads "View review (N rules)", where N is the documented-rule count, not the old "View AI Review".
-    if (!/^View review \(\d+ rules?\)$/.test(result.readyOutcome?.archBtnText || '')) {
-      fail(`AI Review button text not "View review (N rules)" after READY (got "${result.readyOutcome?.archBtnText}", ${JSON.stringify(result.readyOutcome)})`);
+    // The button counts documented rules, not problems, so it reads "Findings (N rules)".
+    if (!/^Findings \(\d+ rules?\)$/.test(result.readyOutcome?.archBtnText || '')) {
+      fail(`Findings button text not "Findings (N rules)" (got "${result.readyOutcome?.archBtnText}", ${JSON.stringify(result.readyOutcome)})`);
       return false;
     }
-    pass(`AI Review button shows "${result.readyOutcome.archBtnText}" after enrichment completes`);
+    pass(`Findings button shows "${result.readyOutcome.archBtnText}"`);
 
     if (result.readyOutcome?.archBtnDisabled !== false) {
-      fail(`AI Review button not re-enabled after READY (${JSON.stringify(result.readyOutcome)})`);
+      fail(`Findings button not enabled after the review arrived (${JSON.stringify(result.readyOutcome)})`);
       return false;
     }
-    pass('AI Review button re-enabled after enrichment completes');
+    pass('Findings button is enabled once the review is in');
+
+    if (result.readyOutcome?.panelOpenBeforeClick) {
+      fail(`Review panel opened by itself (${JSON.stringify(result.readyOutcome)})`);
+      return false;
+    }
+    pass('Review panel stays closed until Findings is clicked');
 
     if (!result.readyOutcome?.panelOpen) {
-      fail(`AI Review panel not opened after READY (${JSON.stringify(result.readyOutcome)})`);
+      fail(`Review panel did not open on click (${JSON.stringify(result.readyOutcome)})`);
       return false;
     }
-    pass('AI Review results panel auto-opens on READY');
+    pass('Clicking Findings opens the review panel');
 
     if (!result.readyOutcome?.panelHasOverview) {
       fail(`Review panel missing the model's overview (${JSON.stringify(result.readyOutcome)})`);
@@ -2736,19 +2760,20 @@ const setRemoteConfigUrlData = async (jsonObj) => {
     }
     pass('Review panel renders the overview section with the review text');
 
-    // All 12 structural rows render once the review ran. A short roster means clean rows were
-    // dropped, which would turn "checked, clean" back into silence.
-    if (!result.readyOutcome?.panelHasStructuralChecks || result.readyOutcome?.panelCheckRowCount < 12) {
-      fail(`Structural checks table missing or short (${JSON.stringify(result.readyOutcome)})`);
+    // Structural checks are no longer part of the review. The fixture still carries a detector
+    // finding of the kind older API versions send, so this also proves such a response cannot
+    // bring the section, or the finding, back.
+    if (result.readyOutcome?.panelHasStructuralChecks || result.readyOutcome?.panelShowsLegacyDetectorFinding) {
+      fail(`Review panel rendered structural checks or a detector finding (${JSON.stringify(result.readyOutcome)})`);
       return false;
     }
-    pass(`Review panel renders the structural checks table (${result.readyOutcome.panelCheckRowCount} rows)`);
+    pass('Review panel renders no structural checks, even when the response carries detector findings');
 
-    if (result.readyOutcome?.panelFlaggedRowCount < 1 || result.readyOutcome?.panelObservedRowCount < 1) {
-      fail(`Structural checks table missing flagged/observation rows (${JSON.stringify(result.readyOutcome)})`);
+    if (!result.readyOutcome?.panelHasReviewItems) {
+      fail(`Review panel missing the surfaced review item (${JSON.stringify(result.readyOutcome)})`);
       return false;
     }
-    pass('Structural checks table distinguishes flagged findings from observations');
+    pass('Review panel renders the surfaced review item');
 
     if (!result.readyOutcome?.panelHasDocumentedRules || result.readyOutcome?.panelRuleRowCount < 2) {
       fail(`Documented rules table missing or short (${JSON.stringify(result.readyOutcome)})`);
@@ -2756,25 +2781,31 @@ const setRemoteConfigUrlData = async (jsonObj) => {
     }
     pass(`Review panel renders the documented rules table (${result.readyOutcome.panelRuleRowCount} rows)`);
 
-    // An advisory row is the model's reading of something nothing verified. A pass/fail tick
-    // against one would tell a reviewer their invariant was checked when nothing checked it.
-    if (result.readyOutcome?.panelAdvisoryHasVerdict) {
-      fail(`Advisory documented rule rendered a pass/fail verdict (${JSON.stringify(result.readyOutcome)})`);
+    // A rule the review could not check is not shown at all, and so never as holding.
+    if (result.readyOutcome?.panelShowsUncheckedRule) {
+      fail(`Review panel showed a documented rule the review could not check (${JSON.stringify(result.readyOutcome)})`);
       return false;
     }
-    pass('Advisory documented rules carry no pass/fail verdict');
+    pass('Documented rules the review could not check are not shown');
 
-    if (!result.failedOutcome?.ok || result.failedOutcome?.enrichedStillPresent || result.failedOutcome?.status !== 'FAILED') {
-      fail(`Manual AI review FAILED polling path failed (${JSON.stringify(result.failedOutcome)})`);
+    if (!result.readyOutcome?.panelClosedOnSecondClick) {
+      fail(`A second click on Findings did not close the panel (${JSON.stringify(result.readyOutcome)})`);
       return false;
     }
-    pass('AI Review FAILED polling stops and keeps base diagram');
+    pass('A second click on Findings closes the review panel');
 
-    if (result.failedOutcome?.archBtnDisabled !== false) {
-      fail(`AI Review button not re-enabled after FAILED (${JSON.stringify(result.failedOutcome)})`);
+    if (!result.failedOutcome?.ok || result.failedOutcome?.renders !== 1 || result.failedOutcome?.status !== 'FAILED') {
+      fail(`Failed review did not render the diagram once (${JSON.stringify(result.failedOutcome)})`);
       return false;
     }
-    pass('AI Review button re-enabled after enrichment fails');
+    pass('A failed review still renders the diagram, once');
+
+    // Never "0 findings" or a tick: the button says the review failed and cannot be opened.
+    if (result.failedOutcome?.archBtnText !== 'Review failed' || result.failedOutcome?.archBtnDisabled !== true) {
+      fail(`Findings button does not say the review failed (${JSON.stringify(result.failedOutcome)})`);
+      return false;
+    }
+    pass('Findings button says the review failed, and cannot be opened');
     return true;
   }
 
@@ -3284,7 +3315,7 @@ const setRemoteConfigUrlData = async (jsonObj) => {
     const d = document.documentElement?.dataset || {};
     return Number(d.striffsPathToComponentSize || 0) > 0 &&
       Number(d.striffsComponentToFileSize || 0) > 0;
-  }, { timeout: 15000 }).catch(() => null);
+  }, undefined, { timeout: 15000 }).catch(() => null);
 
   const mappingSnapshot = await runStriffsTestHook('getMappingSnapshot', {}, 10000);
 
@@ -3341,7 +3372,7 @@ const setRemoteConfigUrlData = async (jsonObj) => {
   // Wait for at least one data-striffs-mapped attribute to appear
   await page.waitForFunction(() => {
     return document.querySelectorAll('[data-striffs-mapped]').length > 0;
-  }, { timeout: 5000, polling: 200 }).catch(() => null);
+  }, undefined, { timeout: 5000, polling: 200 }).catch(() => null);
   // Re-apply after wait in case the tree was lazily rendered
   // Re-apply through the hook: window.Striffs is not reachable from page.evaluate, so the call
   // that used to sit here never ran and the annotation was never refreshed.
@@ -4131,7 +4162,7 @@ const setRemoteConfigUrlData = async (jsonObj) => {
           if (!panel) return true;
           const style = getComputedStyle(panel);
           return !panel.classList.contains('striffs-comment-panel--open') || style.width === '0px';
-        }, { timeout: 5000 }).catch(() => false);
+        }, undefined, { timeout: 5000 }).catch(() => false);
         const panelStateAfterSubmit = panelClosed ? { isOpen: false } : await isCommentPanelOpen();
         if (!panelStateAfterSubmit.isOpen) {
           pass('Comment popout closes after Start review');
@@ -4191,13 +4222,13 @@ const setRemoteConfigUrlData = async (jsonObj) => {
     // Wait for the extension to finish loading from cache (or generating)
     await page.waitForFunction(() => {
       return Boolean(window.Striffs?.__striffsReady && window.Striffs?.__striffsSvg);
-    }, { timeout: 15000 }).catch(() => null);
+    }, undefined, { timeout: 15000 }).catch(() => null);
     await sBtn.click();
     await page.waitForFunction(() => {
       const el = document.querySelector('#striff-diagram-view');
       const svg = el?.querySelector('svg');
       return el && svg && el.offsetWidth > 0 && getComputedStyle(el).display !== 'none';
-    }, { timeout: 10000 }).catch(() => null);
+    }, undefined, { timeout: 10000 }).catch(() => null);
   } catch {
     // Fallback: force striffs view via API
     await page.evaluate(() => {
@@ -4210,7 +4241,7 @@ const setRemoteConfigUrlData = async (jsonObj) => {
     if (!el) return false;
     const style = getComputedStyle(el);
     return style.display !== 'none' && style.visibility !== 'hidden' && el.offsetWidth > 0 && el.offsetHeight > 0;
-  }, { timeout: 10000 }).catch(() => false);
+  }, undefined, { timeout: 10000 }).catch(() => false);
 
   // Resize check: ensure the SVG stays visible after resizing the viewport.
   const initialRects = await page.evaluate(() => {
@@ -4304,7 +4335,7 @@ const setRemoteConfigUrlData = async (jsonObj) => {
       S.currentView = 'diffs';
     }
     return visible && (!S || S.__currentView === 'diffs' || S.currentView === 'diffs');
-  }, { timeout: 20000 }).catch(() => false);
+  }, undefined, { timeout: 20000 }).catch(() => false);
 
   if (!diffsVisible) {
     try {
@@ -4348,7 +4379,7 @@ const setRemoteConfigUrlData = async (jsonObj) => {
     const style = el ? getComputedStyle(el) : null;
     const visible = !!(el && el.offsetWidth > 0 && el.offsetHeight > 0 && style?.display !== 'none' && style?.visibility !== 'hidden');
     return hasSvg && visible;
-  }, { timeout: 10000 }).catch(() => false);
+  }, undefined, { timeout: 10000 }).catch(() => false);
   if (!striffsVisibleAgain) {
     fail('Striffs view did not reappear after clicking Striffs');
   } else {
@@ -4398,7 +4429,7 @@ const setRemoteConfigUrlData = async (jsonObj) => {
       const btnSuccess = !!(btn && /check-circle/.test(btn.innerHTML));
       if (!source && !svg && !btnSuccess) return null;
       return { source, svg, btnSuccess };
-    }, { timeout: 10000 }).catch(() => null);
+    }, undefined, { timeout: 10000 }).catch(() => null);
     const reloadBootState = reloadBootHandle ? await reloadBootHandle.jsonValue() : null;
     const reloadCacheDiag = await page.evaluate(async () => {
       try {
@@ -4463,7 +4494,7 @@ const setRemoteConfigUrlData = async (jsonObj) => {
       const btn = document.querySelector('#striffs-btn');
       const btnSuccess = !!(btn && /check-circle/.test(btn.innerHTML));
       return { ready, hasSvg, hasError, visible, btnSuccess };
-    }, { timeout: 20000 }).catch(() => null);
+    }, undefined, { timeout: 20000 }).catch(() => null);
 
     let reloaded = reloadedStateHandle ? await reloadedStateHandle.jsonValue() : null;
     // If nothing visible yet, try clicking again to force the view.
@@ -4478,7 +4509,7 @@ const setRemoteConfigUrlData = async (jsonObj) => {
         const btn = document.querySelector('#striffs-btn');
         const btnSuccess = !!(btn && /check-circle/.test(btn.innerHTML));
         return { ready, hasSvg, hasError, visible, btnSuccess };
-      }, { timeout: 10000 }).catch(() => null);
+      }, undefined, { timeout: 10000 }).catch(() => null);
       reloaded = secondHandle ? await secondHandle.jsonValue() : reloaded;
     }
 
@@ -4671,7 +4702,8 @@ const setRemoteConfigUrlData = async (jsonObj) => {
           // A cold analysis is queued and polled to completion rather than served inline, and was
           // measured at 50s here against the 45s this used to allow -- the view rendered fine, 5s
           // after the check had given up on it. Cover what the extension itself waits for.
-        }, { timeout: 240000 }).catch(() => null);
+        // Options go third (see the first render's wait): passed second, this ran on the 30s default.
+        }, null, { timeout: FIRST_RENDER_TIMEOUT_MS }).catch(() => null);
 
         if (newUiViewReady) {
           pass('[new-ui] Striffs view visible');
@@ -4790,7 +4822,7 @@ const setRemoteConfigUrlData = async (jsonObj) => {
             const view = document.querySelector('#striff-diagram-view');
             const style = view ? getComputedStyle(view) : null;
             return style && (style.display === 'none' || style.visibility === 'hidden');
-          }, { timeout: 10000 }).catch(() => false);
+          }, undefined, { timeout: 10000 }).catch(() => false);
           if (newUiDiffsVisible) {
             pass('[new-ui] Diffs view toggled');
           } else {
@@ -4809,7 +4841,7 @@ const setRemoteConfigUrlData = async (jsonObj) => {
             const hasSvg = !!view?.querySelector('svg');
             const ready = !!window.Striffs?.__striffsReady;
             return (hasSvg || ready);
-          }, { timeout: 15000 }).catch(() => false);
+          }, undefined, { timeout: 15000 }).catch(() => false);
           if (newUiStriffsRestore) {
             pass('[new-ui] Striffs view reappears after clicking Striffs');
           } else {
@@ -4835,7 +4867,7 @@ const setRemoteConfigUrlData = async (jsonObj) => {
             const btn = document.querySelector('#striffs-btn');
             const btnSuccess = !!(btn && (/check-circle/.test(btn.innerHTML) || btn.classList.contains('is-success') || /loaded from cache/i.test(btn.title || '')));
             return (hasSvg || ready || btnSuccess);
-          }, { timeout: 30000 }).catch(() => false);
+          }, undefined, { timeout: 30000 }).catch(() => false);
           if (newUiCacheHit) {
             pass('[new-ui] Striffs renders after reload (cache hit)');
           } else {
@@ -4880,7 +4912,7 @@ const setRemoteConfigUrlData = async (jsonObj) => {
       return style.display === 'none' || style.visibility === 'hidden' || el.offsetWidth === 0 || el.offsetHeight === 0;
     };
     return hidden(document.querySelector('#striffs-btn')) && hidden(document.querySelector('#diffs-btn'));
-  }, { timeout: 10000 }).catch(() => null);
+  }, undefined, { timeout: 10000 }).catch(() => null);
 
   if (!buttonsHidden) {
     fail('Striffs/Diffs buttons still visible on conversation tab');
@@ -4900,13 +4932,22 @@ const setRemoteConfigUrlData = async (jsonObj) => {
     ensureCleanup();
     process.exit(0);
   } else {
-    if (!ok) {
+    if (!ok && HEADLESS) {
+      // Headless, there is no browser to inspect.
+      await context.close().catch(() => {});
+      ensureCleanup();
+      process.exit(1);
+    } else if (!ok) {
       log('Failures detected; leaving browser open for inspection.');
       // Auto-close after 60s to avoid hanging
       setTimeout(() => { ensureCleanup(); process.exit(1); }, 60000);
     } else log('KEEP_OPEN set; leaving browser open');
   }
-})().catch((e) => {
+})().then(() => {
+  // Reached when the main flow returned early (the end of the run exits by itself). Headed, the
+  // browser stays open for inspection as before.
+  if (HEADLESS) finishRun?.();
+}).catch((e) => {
   console.error('Unhandled error:', e);
   process.exit(1);
 });

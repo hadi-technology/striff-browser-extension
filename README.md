@@ -10,7 +10,7 @@ https://youtu.be/gte1iFYRN88
 
 - **Architecture-aware diffs**: Visualize code changes as interactive diagrams
 - **Multi-phase loading**: Animated progress indicator with status updates
-- **AI review notes**: Inline AI-generated code review feedback with helpful/unhelpful voting
+- **Architecture review**: The change checked against the rules in the repository's own docs, one click away in the Findings panel
 - **Smart caching**: Response caching for faster repeat PR loads
 - **Custom icons**: GitHub logo for diffs, Striffs node-graph icon for striffs
 
@@ -23,7 +23,9 @@ The Striffs button shows animated states during processing:
 | **Analyzing** | Scanning PR files and changes |
 | **Fetching** | Downloading file content from GitHub |
 | **Generating** | Rotating Striffs-specific progress copy while the diagram is prepared |
-| **Enriching** | Adding metadata and relationships |
+| **Checking Docs** | Waiting for the architecture review, so the diagram shows once, with its findings ready behind the Findings button ("Reading Docs" when a repository's documents are read for the first time) |
+
+Once loaded, the **Findings** button beside the diagram opens the architecture review. If the review is still running after two and a half minutes, the diagram shows without it and the button enables itself when the review arrives.
 
 A horizontal shine effect animates across the loading text, and a progress bar appears under the button during generation.
 

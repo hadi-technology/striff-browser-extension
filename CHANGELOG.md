@@ -2,13 +2,38 @@
 
 ## 1.2.0
 
-- The "first analysis takes a few minutes" notice appears only when a first analysis is running.
-  1.1.0 showed it whenever the diagram was not in the browser's own cache, but the server usually
-  already has the analysis and answers in about a second, so nearly every load promised minutes of
-  waiting and then finished at once. On the upload route the notice now waits for the server to
-  say it has queued an analysis (a 202 rather than a 200); on the token route, which gives no such
-  signal, it waits 10 seconds, longer than a cached answer takes. It closes when the diagram
-  arrives.
+- The "first analysis takes a few minutes" notice is gone. The Striffs button's loading state shows
+  a load in progress, so the only notices a load shows are errors.
+- The review panel no longer has a Structural Checks section. The analysis no longer runs
+  structural detector checks; the panel shows the review summary, the review items and the
+  documented rules. A response from an older API that still carries detector findings renders the
+  same panel, with the findings ignored. When nothing is raised, the panel no longer says
+  "Everything looks good": if no documented rule was checked, it says so.
+- The architecture review no longer has a button of its own to start it. Opening Striffs loads the
+  diagram and its review together, and the diagram shows once, when the review is in. The button
+  beside it then reads "Findings (N rules)" and opens the review panel, which is where the findings
+  are: the documented-rule count no longer sits over the diagram. The first review of a repository
+  reads its documents and can take several minutes, so after two and a half minutes the diagram
+  shows anyway, the button reads "Reading docs…", and it enables itself when the review arrives. A
+  review that failed, did not finish, or did not run says so on the button rather than showing an
+  empty result.
+- Documented rules the review could not check are no longer shown, in the panel or on the Findings
+  button. The panel lists the rules this pull request breaks, restores, leaves holding, or finds
+  already broken, and the button counts only those. A rule that could not be checked is never shown
+  as holding.
+- When a doc edit retires documented rules, or states them again, the review panel lists them under
+  the doc that changed. It is a note, not a finding: the Findings button's count and result do not
+  change, and its tooltip mentions the edit.
+- A private repository no longer fails its first load with "Failed downloading base zip: Failed to
+  download zip: 404". Whether a repository is private is now asked of GitHub rather than read off
+  the page, whose signals can be missing after GitHub navigates in place: with a token the load goes
+  straight to token-based generation, and without one it says a token is needed. A failed analysis
+  request is always shown as a readable message, never as its raw error text.
+- With the review panel open, the whole diagram can be scrolled into view. The panel covered the
+  diagram's right edge, which could not be scrolled out from under it. The bottom row can also be
+  scrolled clear of the zoom and download controls.
+- The helpful/unhelpful buttons under review notes on the diagram are gone, along with the feedback
+  they sent. The review's findings are in the Findings panel rather than drawn on the diagram.
 
 ## 1.1.0
 
