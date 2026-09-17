@@ -46,7 +46,6 @@ Open the extension options to configure:
 
 - **GitHub Token**: Optional, used for private repository access and token-backed API requests
 - **Clear Cache**: Removes cached diagrams and local Striffs state
-- **Send Usage Data**: Popup toggle for engagement and review interaction events
 
 ## Runtime Layout
 
@@ -135,8 +134,7 @@ npm test
 
 - GitHub tokens are stored in extension storage until cleared from the popup or options page
 - Live/manual test hooks exist in source but are stripped from the packaged production artifact
-- Usage-data collection can be disabled from the popup without disabling base diagram generation
-- Engagement, review interaction, and AI review feedback events may be sent to the configured Striffs backend when usage data is enabled
+- The extension collects no usage or interaction events
 - All API calls go to the packaged production base URL or the unpacked local-development base URL
 
 ## Icons

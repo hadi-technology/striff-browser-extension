@@ -102,9 +102,6 @@
   S.CACHE_CLEAR_FLAG_KEY = BgUtils.CLEAR_FLAG_KEY || 'striffsCacheClearAt';
   S.CACHE_CLEAR_SEEN_KEY = BgUtils.CACHE_CLEAR_SEEN_KEY || 'striffsCacheClearSeenAt';
   S.STRIFFS_CACHE_DB = BgUtils.INDEXEDDB_NAME || 'striffs-cache-db';
-  S.ENGAGEMENT_SCHEMA_VERSION = 2;
-  S.ENGAGEMENT_COMPONENT_IDS_LIMIT = 80;
-  S.ENGAGEMENT_ZOOM_IDLE_MS = 220;
   S.__remoteConfig = null;
   S.__remoteConfigFetchedAt = 0;
   S.__remoteConfigUrl = null;
@@ -112,15 +109,12 @@
   S.__disabledByRemote = false;
   S.__debugEnabled = false;
   S.__testModeEnabled = false;
-  S.__engagementCtx = S.__engagementCtx || {
-    sessionId: null,
+  // The per-operation access token the API issues with an analysis. It authorises the review
+  // status reads for that operation, and nothing else the extension does.
+  S.__operationTokenCtx = S.__operationTokenCtx || {
     operationId: null,
-    engagementWriteToken: null
+    operationAccessToken: null
   };
-  S.__engagementSentCount = Number(S.__engagementSentCount || 0);
-  S.__engagementAckCount = Number(S.__engagementAckCount || 0);
-  S.__engagementFailedCount = Number(S.__engagementFailedCount || 0);
-  S.__engagementSkippedCount = Number(S.__engagementSkippedCount || 0);
 
   // ---------- Comment component selection state ----------
   S.COMMENT_MAX_SELECTION = 10;
@@ -432,162 +426,17 @@
     }
   };
 
-  const makeClientSessionId = () => {
-    try {
-      if (window.crypto && typeof window.crypto.randomUUID === "function") {
-        return window.crypto.randomUUID();
-      }
-    } catch {}
-    return `sess-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-  };
-
-  S.ensureEngagementSessionId = () => {
-    const existing = S.__engagementCtx?.sessionId;
-    if (existing) return existing;
-    let stored = "";
-    try {
-      stored = sessionStorage.getItem("striffsEngagementSessionId") || "";
-    } catch {}
-    const next = stored || makeClientSessionId();
-    try {
-      sessionStorage.setItem("striffsEngagementSessionId", next);
-    } catch {}
-    S.__engagementCtx.sessionId = next;
-    return next;
-  };
-
-  S.getExtensionVersion = S.getExtensionVersion || (() => {
-    try {
-      const manifest = chrome?.runtime?.getManifest?.();
-      const raw = String(manifest?.version || "").trim();
-      return raw || null;
-    } catch {
-      return null;
-    }
-  });
-
-  S.makeEngagementEventId = S.makeEngagementEventId || (() => {
-    try {
-      if (window.crypto && typeof window.crypto.randomUUID === "function") {
-        return `eng-${window.crypto.randomUUID()}`;
-      }
-    } catch {}
-    return `eng-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-  });
-
-  S.normalizeEngagementValue = S.normalizeEngagementValue || ((value, depth = 0) => {
-    const maxDepth = 5;
-    const maxArrayItems = 120;
-    if (value === undefined) return undefined;
-    if (value === null) return null;
-    if (depth > maxDepth) return null;
-
-    const valueType = typeof value;
-    if (valueType === "string") return value;
-    if (valueType === "boolean") return value;
-    if (valueType === "number") return Number.isFinite(value) ? value : null;
-    if (valueType === "bigint") return String(value);
-    if (valueType === "function" || valueType === "symbol") return undefined;
-    if (Array.isArray(value)) {
-      const out = [];
-      const limit = Math.min(value.length, maxArrayItems);
-      for (let i = 0; i < limit; i += 1) {
-        const normalizedItem = S.normalizeEngagementValue?.(value[i], depth + 1);
-        if (normalizedItem !== undefined) out.push(normalizedItem);
-      }
-      return out;
-    }
-    if (valueType === "object") {
-      const out = {};
-      for (const [key, child] of Object.entries(value)) {
-        if (!key) continue;
-        const normalizedChild = S.normalizeEngagementValue?.(child, depth + 1);
-        if (normalizedChild !== undefined) out[String(key)] = normalizedChild;
-      }
-      return out;
-    }
-    return String(value);
-  });
-
-  S.normalizeEngagementObject = S.normalizeEngagementObject || ((obj) => {
-    if (!obj || typeof obj !== "object" || Array.isArray(obj)) return {};
-    const normalized = S.normalizeEngagementValue?.(obj, 0);
-    if (!normalized || typeof normalized !== "object" || Array.isArray(normalized)) return {};
-    return normalized;
-  });
-
-  S.parsePullNumber = S.parsePullNumber || ((value) => {
-    const parsed = Number(value);
-    if (!Number.isInteger(parsed) || parsed <= 0) return null;
-    return parsed;
-  });
-
-  S.buildEngagementPayload = S.buildEngagementPayload || ((eventType, eventPayload = {}, metadataPayload = {}) => {
-    const type = String(eventType || "").trim();
-    if (!type) return null;
-    const meta = S.extractPRMetadata?.() || {};
-    const owner = meta?.owner ? String(meta.owner) : null;
-    const repo = meta?.repo ? String(meta.repo) : null;
-    const pullNumber = S.parsePullNumber?.(meta?.pull_number);
-    const currentView = S.getCurrentView?.() || null;
-    const zoom = Number.isFinite(Number(S.__striffsZoom)) ? Number(S.__striffsZoom) : 1;
-    const attrs = S.normalizeEngagementObject?.(eventPayload);
-    const extra = S.normalizeEngagementObject?.(metadataPayload);
-    const now = Date.now();
-    const sessionId = S.ensureEngagementSessionId?.() || null;
-
-    return {
-      schemaVersion: Number(S.ENGAGEMENT_SCHEMA_VERSION || 1),
-      eventId: S.makeEngagementEventId?.() || null,
-      eventType: type,
-      source: "striff-browser-extension",
-      extensionVersion: S.getExtensionVersion?.() || null,
-      operationId: String(S.__engagementCtx?.operationId || "").trim() || null,
-      sessionId,
-      occurredAtMs: now,
-      occurredAt: new Date(now).toISOString(),
-      repository: {
-        owner,
-        name: repo,
-        pullNumber
-      },
-      context: {
-        pageUrl: location.href,
-        currentView,
-        zoom
-      },
-      attributes: attrs,
-      extra,
-      event: { ...(attrs || {}), type },
-      metadata: {
-        ...(extra || {}),
-        pageUrl: location.href,
-        owner,
-        repo,
-        pull_number: pullNumber,
-        currentView,
-        zoom
-      },
-      clientTimestamp: now
-    };
-  });
-
-  S.syncEngagementDebugState = () => {
+  S.syncOperationTokenDebugState = () => {
     try {
       const root = document.documentElement;
       if (!root) return;
-      const ctx = S.__engagementCtx || {};
-      root.dataset.striffsEngagementHasOperationId = String(Boolean(String(ctx.operationId || '').trim()) ? 1 : 0);
-      root.dataset.striffsEngagementHasToken = String(Boolean(String(ctx.engagementWriteToken || '').trim()) ? 1 : 0);
-      root.dataset.striffsEngagementLastError = String(S.__lastEngagementContextError || '');
-      root.dataset.striffsEngagementSent = String(Number(S.__engagementSentCount || 0));
-      root.dataset.striffsEngagementAck = String(Number(S.__engagementAckCount || 0));
-      root.dataset.striffsEngagementFailed = String(Number(S.__engagementFailedCount || 0));
-      root.dataset.striffsEngagementSkipped = String(Number(S.__engagementSkippedCount || 0));
-      root.dataset.striffsEngagementLastEventType = String(S.__engagementLastEventType || '');
+      const ctx = S.__operationTokenCtx || {};
+      root.dataset.striffsOperationTokenHasOperationId = String(Boolean(String(ctx.operationId || '').trim()) ? 1 : 0);
+      root.dataset.striffsOperationTokenHasToken = String(Boolean(String(ctx.operationAccessToken || '').trim()) ? 1 : 0);
+      root.dataset.striffsOperationTokenLastError = String(S.__lastOperationTokenError || '');
     } catch {}
   };
-  S.syncEngagementDebugState?.();
+  S.syncOperationTokenDebugState?.();
 
   S.syncSaveDebugState = (status = "", extra = {}) => {
     try {
@@ -646,16 +495,16 @@
     return S.isReviewNoteQualifiedName(entity.getAttribute?.("data-qualified-name"));
   };
 
-  S.logEngagementCollectionBlocked = (reason = "", extra = {}) => {
+  S.logOperationTokenUnavailable = (reason = "", extra = {}) => {
     try {
-      S.debugDump?.("engagement collection blocked", {
+      S.debugDump?.("operation token unavailable", {
         reason: String(reason || "").trim() || "unknown",
         ...(extra || {})
       });
     } catch {}
   };
 
-  S.extractEngagementContextFromPayload = (payload) => {
+  S.extractOperationTokenFromPayload = (payload) => {
     const candidates = [
       payload,
       payload?.result,
@@ -665,8 +514,6 @@
       payload?.body,
       payload?.meta,
       payload?.metadata,
-      payload?.engagement,
-      payload?.engagementContext,
       payload?.context,
       payload?.review,
       payload?.aiReview,
@@ -683,119 +530,66 @@
     };
     return {
       operationId: readFirst(["operationId", "operationID", "operation_id"]),
-      engagementWriteToken: readFirst([
-        "engagementWriteToken",
-        "engagementToken",
-        "engagement_write_token",
-        "engagement_token"
+      // `engagementWriteToken` is the field's former name on the wire. The API emits both while
+      // clients move over; read the new name first and fall back to the old one.
+      operationAccessToken: readFirst([
+        "operationAccessToken",
+        "operation_access_token",
+        "engagementWriteToken"
       ])
     };
   };
 
-  S.updateEngagementContextFromResult = (result) => {
-    const prev = S.__engagementCtx || {};
-    const sessionId = S.ensureEngagementSessionId?.() || prev.sessionId || null;
-    const extracted = S.extractEngagementContextFromPayload?.(result) || {};
+  S.updateOperationTokenFromResult = (result) => {
+    const prev = S.__operationTokenCtx || {};
+    const extracted = S.extractOperationTokenFromPayload?.(result) || {};
     const opId = String(extracted.operationId || "").trim();
-    const providedToken = String(extracted.engagementWriteToken || "").trim();
+    const providedToken = String(extracted.operationAccessToken || "").trim();
     if (!opId) {
-      S.__engagementCtx = {
-        sessionId,
+      S.__operationTokenCtx = {
         operationId: null,
-        engagementWriteToken: null
+        operationAccessToken: null
       };
-      S.__lastEngagementContextError = "missing operationId";
-      S.cwarn?.("Engagement context missing operationId", {
+      S.__lastOperationTokenError = "missing operationId";
+      S.cwarn?.("Operation token context missing operationId", {
         hasToken: Boolean(providedToken),
         resultKeys: result && typeof result === "object" ? Object.keys(result).slice(0, 30) : []
       });
-      S.syncEngagementDebugState?.();
-      S.logEngagementCollectionBlocked?.("missing operationId", {
+      S.syncOperationTokenDebugState?.();
+      S.logOperationTokenUnavailable?.("missing operationId", {
         hasOperationId: false,
         hasToken: Boolean(providedToken)
       });
       return false;
     }
-    S.__engagementCtx = {
-      sessionId,
+    S.__operationTokenCtx = {
       operationId: opId,
-      engagementWriteToken: providedToken || prev.engagementWriteToken || null
+      operationAccessToken: providedToken || prev.operationAccessToken || null
     };
-    if (!S.__engagementCtx.engagementWriteToken) {
-      S.__lastEngagementContextError = "missing engagementWriteToken";
-      S.cwarn?.("Engagement context missing engagementWriteToken", {
+    if (!S.__operationTokenCtx.operationAccessToken) {
+      S.__lastOperationTokenError = "missing operationAccessToken";
+      S.cwarn?.("Operation token context missing operationAccessToken", {
         operationId: opId,
         resultKeys: result && typeof result === "object" ? Object.keys(result).slice(0, 30) : []
       });
-      S.syncEngagementDebugState?.();
-      S.logEngagementCollectionBlocked?.("missing engagementWriteToken", {
+      S.syncOperationTokenDebugState?.();
+      S.logOperationTokenUnavailable?.("missing operationAccessToken", {
         hasOperationId: true,
         hasToken: false,
         operationId: opId
       });
       return false;
     }
-    S.__lastEngagementContextError = null;
-    S.persistEngagementContextForCurrentPr?.();
-    S.syncEngagementDebugState?.();
+    S.__lastOperationTokenError = null;
+    S.persistOperationTokenForCurrentPr?.();
+    S.syncOperationTokenDebugState?.();
     // Re-apply comment affordances now that operationId is available
-    // (fixes race when engagement context arrives after SVG render)
+    // (fixes race when the operation context arrives after SVG render)
     if (!prev.operationId && S.__striffsSvg && !S.__commentState?.active) {
       try { S.applyCommentAffordances?.(); } catch {}
       S.updateCommentButtonVisibility?.();
     }
     return true;
-  };
-
-  S.getViewableComponents = (limit = S.ENGAGEMENT_COMPONENT_IDS_LIMIT || 80) => {
-    const max = Number.isFinite(Number(limit)) ? Math.max(1, Number(limit)) : 80;
-    const view = S.getStriffScrollEl?.();
-    const svg = S.__striffsSvg || view?.querySelector?.("svg");
-    if (!view || !svg) {
-      return { ids: [], total: 0, truncated: false };
-    }
-    const viewport = view.getBoundingClientRect?.();
-    if (!viewport) {
-      return { ids: [], total: 0, truncated: false };
-    }
-    const out = [];
-    const uniq = new Set();
-    let total = 0;
-    const nodes = svg.querySelectorAll?.("g.entity[data-qualified-name]") || [];
-    for (const node of nodes) {
-      const id = node.getAttribute?.("data-qualified-name");
-      if (!id || uniq.has(id) || S.isReviewNoteQualifiedName?.(id)) continue;
-      const rect = node.getBoundingClientRect?.();
-      if (!rect) continue;
-      const offscreen =
-        rect.right < viewport.left ||
-        rect.left > viewport.right ||
-        rect.bottom < viewport.top ||
-        rect.top > viewport.bottom;
-      if (offscreen) continue;
-      total += 1;
-      uniq.add(id);
-      if (out.length < max) out.push(id);
-    }
-    return { ids: out, total, truncated: total > out.length };
-  };
-
-  S.capturePanZoomSnapshot = (limit = S.ENGAGEMENT_COMPONENT_IDS_LIMIT || 80) => {
-    const view = S.getStriffScrollEl?.();
-    const visible = S.getViewableComponents?.(limit) || { ids: [], total: 0, truncated: false };
-    const x = Number(view?.scrollLeft || 0);
-    const y = Number(view?.scrollTop || 0);
-    return {
-      coordinates: { x, y },
-      zoom: Number(S.__striffsZoom) || 1,
-      viewport: {
-        width: Number(view?.clientWidth || 0),
-        height: Number(view?.clientHeight || 0)
-      },
-      viewableComponentIds: visible.ids || [],
-      viewableComponentCount: Number(visible.total || 0),
-      viewableComponentIdsTruncated: Boolean(visible.truncated)
-    };
   };
 
   // ---------- Logging ----------
@@ -815,7 +609,7 @@
   };
 
   // Convert hyphenated names to dotted format (e.g., "my-component" -> "my.component")
-  // Used for component qualified names in telemetry and display
+  // Used for component qualified names in debug state and display
   S.toDottedName = (name) => {
     if (!name) return null;
     return String(name).replace(/-/g, '.');
@@ -909,76 +703,6 @@
 
   S.loadDebugFlag?.();
   S.loadTestFlag?.().then(() => S.syncTestHarnessState?.()).catch(() => {});
-
-  S.emitEngagementEvent = (eventType, eventPayload = {}, metadataPayload = {}) => {
-    try {
-      const type = String(eventType || "").trim();
-      if (!type) return false;
-      const ctx = S.__engagementCtx || {};
-      const operationId = String(ctx.operationId || "").trim();
-      const engagementWriteToken = String(ctx.engagementWriteToken || "").trim();
-      if (!operationId || !engagementWriteToken) {
-        S.logEngagementCollectionBlocked?.("missing operation/token", {
-          type,
-          hasOperationId: Boolean(operationId),
-          hasToken: Boolean(engagementWriteToken)
-        });
-        S.syncEngagementDebugState?.();
-        return false;
-      }
-      const payload = S.buildEngagementPayload?.(type, eventPayload, metadataPayload);
-      if (!payload) {
-        S.__engagementSkippedCount = Number(S.__engagementSkippedCount || 0) + 1;
-        S.logEngagementCollectionBlocked?.("failed to build engagement payload", { type });
-        S.syncEngagementDebugState?.();
-        return false;
-      }
-      if (typeof S.bgRequest !== "function") {
-        S.__engagementSkippedCount = Number(S.__engagementSkippedCount || 0) + 1;
-        S.logEngagementCollectionBlocked?.("missing background bridge", { type });
-        S.syncEngagementDebugState?.();
-        return false;
-      }
-      S.__engagementSentCount = Number(S.__engagementSentCount || 0) + 1;
-      S.__engagementLastEventType = type;
-      S.syncEngagementDebugState?.();
-      S.bgRequest({
-        type: "recordEngagementEvent",
-        operationId,
-        engagementToken: engagementWriteToken,
-        payload
-      }, S.TIMEOUTS?.message || 7000).then((resp) => {
-        if (resp?.ok === true || resp?.success === true) {
-          S.__engagementAckCount = Number(S.__engagementAckCount || 0) + 1;
-          S.syncEngagementDebugState?.();
-          return;
-        }
-        S.__engagementFailedCount = Number(S.__engagementFailedCount || 0) + 1;
-        S.debugDump?.("engagement send returned non-ok", {
-          type,
-          response: resp || null
-        });
-        S.syncEngagementDebugState?.();
-      }).catch((err) => {
-        S.__engagementFailedCount = Number(S.__engagementFailedCount || 0) + 1;
-        S.debugDump?.("engagement send failed", { type, error: String(err?.message || err) });
-        S.syncEngagementDebugState?.();
-      });
-      return true;
-    } catch (e) {
-      S.debugDump?.("engagement emit failed", { error: String(e?.message || e) });
-      S.syncEngagementDebugState?.();
-      return false;
-    }
-  };
-
-  S.getEngagementCounters = () => ({
-    sent: Number(S.__engagementSentCount || 0),
-    ack: Number(S.__engagementAckCount || 0),
-    failed: Number(S.__engagementFailedCount || 0),
-    skipped: Number(S.__engagementSkippedCount || 0),
-    lastEventType: S.__engagementLastEventType || null
-  });
 
   S.getPrimaryDiagramSvg = () => {
     if (S.__striffsSvg && document.body.contains(S.__striffsSvg)) return S.__striffsSvg;
@@ -1369,9 +1093,9 @@
     S.__supportedExtensionsFetchedAt = 0;
     S.__supportedExtensionsPromise = null;
     S.__suppressCacheWritesUntil = Date.now() + 2000;
-    S.__engagementRefreshPromise = null;
-    S.__lastEngagementContextError = null;
-    S.__engagementCtx = { sessionId: null, operationId: null, engagementWriteToken: null };
+    S.__operationTokenRefreshPromise = null;
+    S.__lastOperationTokenError = null;
+    S.__operationTokenCtx = { operationId: null, operationAccessToken: null };
 
     // Clear IndexedDB cache
     try {
@@ -1534,7 +1258,7 @@
     }
   };
 
-  S.fetchAiReviewStatus = async ({ operationId, engagementToken, timeoutMs } = {}) => {
+  S.fetchAiReviewStatus = async ({ operationId, operationToken, timeoutMs } = {}) => {
     // Returns the reply rather than throwing on it: both pollers branch on
     // resp.status, and a 403 has to stop the poll rather than retry a request
     // that can never succeed. bgRequest throwing made those branches dead code
@@ -1543,7 +1267,7 @@
       return await S.bgRequest({
         type: "fetchAiReviewStatus",
         operationId,
-        engagementToken,
+        operationToken,
         timeoutMs
       }, timeoutMs ?? 15000);
     } catch (e) {
@@ -2081,19 +1805,11 @@
         }
 
         const onDiffClick = () => {
-            S.emitEngagementEvent?.("diffs_button_pressed", {
-                fromView: S.getCurrentView?.() || null
-            });
             S.showDiffView();
             S.saveActiveTab('diffs');
         };
 
         const onStriffClick = async () => {
-            S.emitEngagementEvent?.("striffs_button_pressed", {
-                fromView: S.getCurrentView?.() || null,
-                ready: Boolean(S.__striffsReady && S.__striffsSvg),
-                disabledByRemote: Boolean(S.__disabledByRemote)
-            });
               if (S.__disabledByRemote) {
                   S.disableStriffsButton();
                   return;
@@ -3226,68 +2942,11 @@
             let panDistance = 0;
             let lastMouseX = 0;
             let lastMouseY = 0;
-            let panOp = null;
-            let zoomOp = null;
-            let zoomFinalizeTimer = 0;
             const scrollEl = striffView.querySelector('#striffs-scroll') || striffView;
             striffView.__striffsZoomBoundScrollEl = scrollEl;
-            const normalizePanZoomSnapshot = (snap) => {
-                const safe = snap || {};
-                return {
-                    coordinates: safe.coordinates || { x: Number(scrollEl.scrollLeft || 0), y: Number(scrollEl.scrollTop || 0) },
-                    zoom: Number(safe.zoom || S.__striffsZoom || 1),
-                    viewport: safe.viewport || { width: Number(scrollEl.clientWidth || 0), height: Number(scrollEl.clientHeight || 0) },
-                    viewableComponentIds: Array.isArray(safe.viewableComponentIds) ? safe.viewableComponentIds : [],
-                    viewableComponentCount: Number(safe.viewableComponentCount || 0),
-                    viewableComponentIdsTruncated: Boolean(safe.viewableComponentIdsTruncated)
-                };
-            };
-            const emitPanZoomOperation = (operation, startedAt, startSnap, endSnap, extraEvent = {}) => {
-                const start = normalizePanZoomSnapshot(startSnap);
-                const end = normalizePanZoomSnapshot(endSnap);
-                const durationMs = Math.max(0, Date.now() - Number(startedAt || Date.now()));
-                S.emitEngagementEvent?.("pan_zoom_operation", {
-                    operation,
-                    durationMs,
-                    startCoordinates: start.coordinates,
-                    endCoordinates: end.coordinates,
-                    zoomStart: start.zoom,
-                    zoomEnd: end.zoom,
-                    ...extraEvent
-                }, {
-                    viewportStart: start.viewport,
-                    viewportEnd: end.viewport,
-                    initialViewableComponents: start.viewableComponentIds,
-                    initialViewableComponentCount: start.viewableComponentCount,
-                    initialViewableComponentIdsTruncated: start.viewableComponentIdsTruncated,
-                    endingViewableComponents: end.viewableComponentIds,
-                    endingViewableComponentCount: end.viewableComponentCount,
-                    endingViewableComponentIdsTruncated: end.viewableComponentIdsTruncated
-                });
-            };
-            const finalizeZoomOperation = () => {
-                if (!zoomOp) return;
-                if (zoomFinalizeTimer) {
-                    clearTimeout(zoomFinalizeTimer);
-                    zoomFinalizeTimer = 0;
-                }
-                const end = S.capturePanZoomSnapshot?.();
-                emitPanZoomOperation("zoom", zoomOp.startedAt, zoomOp.start, end, {
-                    wheelSteps: Number(zoomOp.wheelSteps || 0)
-                });
-                zoomOp = null;
-            };
-            const scheduleZoomFinalize = () => {
-                if (zoomFinalizeTimer) clearTimeout(zoomFinalizeTimer);
-                zoomFinalizeTimer = window.setTimeout(
-                    finalizeZoomOperation,
-                    Number(S.ENGAGEMENT_ZOOM_IDLE_MS || 220)
-                );
-            };
             scrollEl.addEventListener('mousedown', (e) => {
                 if (e.button !== 0) return;
                 if (e.target && e.target.closest && e.target.closest('#striffs-controls')) return;
-                finalizeZoomOperation();
                 isPanning = true;
                 panMoved = false;
                 panDistance = 0;
@@ -3297,10 +2956,6 @@
                 lastMouseY = e.clientY;
                 panScrollLeft = scrollEl.scrollLeft;
                 panScrollTop = scrollEl.scrollTop;
-                panOp = {
-                    startedAt: Date.now(),
-                    start: S.capturePanZoomSnapshot?.()
-                };
                 striffView.classList.add('is-panning');
                 e.preventDefault();
             });
@@ -3323,15 +2978,7 @@
                 striffView.classList.remove('is-panning');
                 if (panMoved && panDistance > 10) {
                     S.__recentPanAt = Date.now();
-                    emitPanZoomOperation(
-                        "pan",
-                        panOp?.startedAt,
-                        panOp?.start,
-                        S.capturePanZoomSnapshot?.(),
-                        { distancePx: Math.round(panDistance) }
-                    );
                 }
-                panOp = null;
                 panMoved = false;
                 panDistance = 0;
             });
@@ -3351,17 +2998,7 @@
                 const clientY = atBottom
                     ? (scrollEl.getBoundingClientRect().top + viewportHeight / 2)
                     : e.clientY;
-                if (!zoomOp) {
-                    zoomOp = {
-                        startedAt: Date.now(),
-                        start: S.capturePanZoomSnapshot?.(),
-                        wheelSteps: 0
-                    };
-                }
-                const didApply = S.applyZoomAtPoint(scrollEl, svg, next, e.clientX, clientY);
-                if (!didApply) return;
-                zoomOp.wheelSteps = Number(zoomOp.wheelSteps || 0) + 1;
-                scheduleZoomFinalize();
+                S.applyZoomAtPoint(scrollEl, svg, next, e.clientX, clientY);
             }, { passive: false });
         }
         return striffView;
@@ -3441,7 +3078,7 @@
   };
 
   S.showStriffView = () => {
-    S.restoreEngagementContextFromCachedPayload?.();
+    S.restoreOperationTokenFromCachedPayload?.();
     if (S.__striffsNoChanges) {
       return S.applyNoChangesUiState?.("No changes were found");
     }
@@ -4692,13 +4329,6 @@
       } catch {}
     }
 
-    S.emitEngagementEvent?.("diagram_component_clicked", {
-      componentQualifiedName: dottedQn || null,
-      mappedFile: file || null,
-      hasMappedFile: Boolean(file),
-      diffId: diffId || null,
-      hasDiffTarget: Boolean(diffId)
-    });
     if (!file) {
       S.cwarn?.('Striffs component click: no file mapped for component', { id: qn });
       S.syncDiagramClickDebugState?.("missing-file", {
@@ -5059,8 +4689,8 @@
         if (typeof result.error === "string" && result.error.trim()) return result.error.trim();
         if (result.message === "error") return "Invalid response.";
         if (!Array.isArray(result.striffs)) return "Invalid Striffs response: missing striffs array.";
-        // operationId and engagementWriteToken are optional — their absence
-        // only affects telemetry, not diagram rendering.
+        // operationId and the operation access token are optional — their absence
+        // only affects the review status reads, not diagram rendering.
         return null;
     };
 
@@ -5076,14 +4706,14 @@
     };
 
     S.syncAiReviewStateFromResult = (result, { cachedStatus = null } = {}) => {
-        const engagement = S.extractEngagementContextFromPayload?.(result) || {};
+        const operationCtx = S.extractOperationTokenFromPayload?.(result) || {};
         const status = cachedStatus || S.getAiReviewStatusFromResult?.(result) || null;
         S.__aiReviewStatus = status;
         S.__aiReviewId = String(
             result?.aiReviewId || result?.ai_review_id || ""
         ).trim() || null;
         S.__aiReviewOperationId = String(
-            engagement.operationId || ""
+            operationCtx.operationId || ""
         ).trim() || null;
         if (status === "READY" && S.__aiReviewId) {
             S.__aiReviewLastCompletedReviewId = S.__aiReviewId;
@@ -5109,7 +4739,7 @@
       } catch (e) {
         cwarn("applyHoverability failed", e);
       }
-      // Show + affordances whenever SVG is visible (do NOT gate on engagement
+      // Show + affordances whenever SVG is visible (do NOT gate on the operation
       // context — the affordances are purely visual; the panel open is gated).
       if (!S.__commentState?.active) {
         S.applyCommentAffordances?.();
@@ -5127,21 +4757,21 @@
     return `striffs:${id.owner}/${id.repo}#${id.pull_number}`;
   };
 
-  S.engagementCacheKey = () => {
+  S.operationTokenCacheKey = () => {
     const key = S.cacheKey?.();
-    return key ? `${key}:engagement` : null;
+    return key ? `${key}:operation-token` : null;
   };
 
-  S.persistEngagementContextForCurrentPr = () => {
+  S.persistOperationTokenForCurrentPr = () => {
     try {
-      const key = S.engagementCacheKey?.();
+      const key = S.operationTokenCacheKey?.();
       if (!key) return false;
-      const operationId = String(S.__engagementCtx?.operationId || '').trim();
-      const engagementWriteToken = String(S.__engagementCtx?.engagementWriteToken || '').trim();
-      if (!operationId || !engagementWriteToken) return false;
+      const operationId = String(S.__operationTokenCtx?.operationId || '').trim();
+      const operationAccessToken = String(S.__operationTokenCtx?.operationAccessToken || '').trim();
+      if (!operationId || !operationAccessToken) return false;
       localStorage.setItem(key, JSON.stringify({
         operationId,
-        engagementWriteToken,
+        operationAccessToken,
         savedAt: Date.now()
       }));
       return true;
@@ -5150,10 +4780,10 @@
     }
   };
 
-  S.restoreEngagementContextFromCachedPayload = () => {
+  S.restoreOperationTokenFromCachedPayload = () => {
     try {
-      const existingCtx = S.__engagementCtx || {};
-      if (String(existingCtx.operationId || '').trim() && String(existingCtx.engagementWriteToken || '').trim()) {
+      const existingCtx = S.__operationTokenCtx || {};
+      if (String(existingCtx.operationId || '').trim() && String(existingCtx.operationAccessToken || '').trim()) {
         return true;
       }
       const key = S.cacheKey?.();
@@ -5161,27 +4791,26 @@
       const raw = localStorage.getItem(key);
       const parsed = raw ? JSON.parse(raw) : null;
       let cachedOperationId = String(parsed?.cachedOperationId || '').trim();
-      let cachedEngagementWriteToken = String(parsed?.cachedEngagementWriteToken || '').trim();
-      if (!cachedOperationId || !cachedEngagementWriteToken) {
-        const engagementKey = S.engagementCacheKey?.();
-        const engagementRaw = engagementKey ? localStorage.getItem(engagementKey) : null;
-        if (engagementRaw) {
+      let cachedOperationAccessToken = String(parsed?.cachedOperationAccessToken || '').trim();
+      if (!cachedOperationId || !cachedOperationAccessToken) {
+        const tokenKey = S.operationTokenCacheKey?.();
+        const tokenRaw = tokenKey ? localStorage.getItem(tokenKey) : null;
+        if (tokenRaw) {
           try {
-            const engagementParsed = JSON.parse(engagementRaw);
-            cachedOperationId = cachedOperationId || String(engagementParsed?.operationId || '').trim();
-            cachedEngagementWriteToken = cachedEngagementWriteToken || String(engagementParsed?.engagementWriteToken || '').trim();
+            const tokenParsed = JSON.parse(tokenRaw);
+            cachedOperationId = cachedOperationId || String(tokenParsed?.operationId || '').trim();
+            cachedOperationAccessToken = cachedOperationAccessToken || String(tokenParsed?.operationAccessToken || '').trim();
           } catch {}
         }
       }
-      if (!cachedOperationId || !cachedEngagementWriteToken) return false;
-      S.__engagementCtx = {
-        sessionId: S.ensureEngagementSessionId?.() || existingCtx.sessionId || null,
+      if (!cachedOperationId || !cachedOperationAccessToken) return false;
+      S.__operationTokenCtx = {
         operationId: cachedOperationId,
-        engagementWriteToken: cachedEngagementWriteToken
+        operationAccessToken: cachedOperationAccessToken
       };
-      S.__lastEngagementContextError = null;
-      S.persistEngagementContextForCurrentPr?.();
-      S.syncEngagementDebugState?.();
+      S.__lastOperationTokenError = null;
+      S.persistOperationTokenForCurrentPr?.();
+      S.syncOperationTokenDebugState?.();
       return true;
     } catch {
       return false;
@@ -5215,16 +4844,9 @@
     S.__aiReviewReason = null;
     S.__aiReviewWarmupRequired = false;
 
-    // Reset engagement counters on PR navigation
-    S.__engagementSentCount = 0;
-    S.__engagementAckCount = 0;
-    S.__engagementFailedCount = 0;
-    S.__engagementSkippedCount = 0;
-
-    // Preserve the session id, but clear the per-operation ids/tokens.
+    // Clear the per-operation id and token.
     try {
-      const sessionId = S.ensureEngagementSessionId?.() || S.__engagementCtx?.sessionId || null;
-      S.__engagementCtx = { sessionId, operationId: null, engagementWriteToken: null };
+      S.__operationTokenCtx = { operationId: null, operationAccessToken: null };
     } catch {}
 
     S.__lastEnrichmentResult = null;
@@ -5356,24 +4978,23 @@
           return false;
 	        }
           const cachedOperationId = String(parsed?.cachedOperationId || '').trim();
-          const cachedEngagementWriteToken = String(parsed?.cachedEngagementWriteToken || '').trim();
-	        S.updateEngagementContextFromResult?.(parsed.result);
-          if ((cachedOperationId || cachedEngagementWriteToken) && !String(S.__engagementCtx?.engagementWriteToken || '').trim()) {
-            const prevCtx = S.__engagementCtx || {};
-            S.__engagementCtx = {
-              sessionId: S.ensureEngagementSessionId?.() || prevCtx.sessionId || null,
+          const cachedOperationAccessToken = String(parsed?.cachedOperationAccessToken || '').trim();
+	        S.updateOperationTokenFromResult?.(parsed.result);
+          if ((cachedOperationId || cachedOperationAccessToken) && !String(S.__operationTokenCtx?.operationAccessToken || '').trim()) {
+            const prevCtx = S.__operationTokenCtx || {};
+            S.__operationTokenCtx = {
               operationId: String(prevCtx.operationId || cachedOperationId || '').trim() || null,
-              engagementWriteToken: String(prevCtx.engagementWriteToken || cachedEngagementWriteToken || '').trim() || null
+              operationAccessToken: String(prevCtx.operationAccessToken || cachedOperationAccessToken || '').trim() || null
             };
-            if (S.__engagementCtx.operationId && S.__engagementCtx.engagementWriteToken) {
-              S.__lastEngagementContextError = null;
+            if (S.__operationTokenCtx.operationId && S.__operationTokenCtx.operationAccessToken) {
+              S.__lastOperationTokenError = null;
             }
-            S.syncEngagementDebugState?.();
+            S.syncOperationTokenDebugState?.();
           }
-          if (!String(S.__engagementCtx?.engagementWriteToken || '').trim()) {
-            S.restoreEngagementContextFromCachedPayload?.();
+          if (!String(S.__operationTokenCtx?.operationAccessToken || '').trim()) {
+            S.restoreOperationTokenFromCachedPayload?.();
           } else {
-            S.persistEngagementContextForCurrentPr?.();
+            S.persistOperationTokenForCurrentPr?.();
           }
           const cachedReviewStatus = S.syncAiReviewStateFromResult?.(parsed.result, {
             cachedStatus: String(parsed?.cachedAiReviewStatus || "").trim().toUpperCase() || null
@@ -5704,7 +5325,7 @@
 
   S.isCommentModeAvailable = function isCommentModeAvailable() {
     if (!S.__striffsSvg) return false;
-    const opId = String(S.__engagementCtx?.operationId || "").trim();
+    const opId = String(S.__operationTokenCtx?.operationId || "").trim();
     return Boolean(opId);
   };
 
@@ -5736,15 +5357,15 @@
   S.enterCommentMode = async function enterCommentMode() {
     if (S.__commentState.active) { S.clog?.('[comment] already active'); return; }
 
-    let opId = String(S.__engagementCtx?.operationId || "").trim();
+    let opId = String(S.__operationTokenCtx?.operationId || "").trim();
     S.clog?.('[comment] enterCommentMode', { opId, hasOpId: !!opId });
 
-    // Lazily fetch engagement context if missing
+    // Lazily fetch the operation context if missing
     if (!opId) {
       S.toast?.("Loading operation context...", "info", { timeoutMs: 4000 });
       try {
-        await S.refreshEngagementContextFromFreshResult?.(S.extractPRMetadata?.());
-        opId = String(S.__engagementCtx?.operationId || "").trim();
+        await S.refreshOperationTokenFromFreshResult?.(S.extractPRMetadata?.());
+        opId = String(S.__operationTokenCtx?.operationId || "").trim();
       } catch {}
       if (!opId) {
         S.toast?.("Cannot enter comment mode: unable to obtain operation context.", "warning", { timeoutMs: 5000 });
@@ -5771,7 +5392,6 @@
     S.openCommentPanel?.();
     const commentBtn = document.getElementById('striffs-comment-btn');
     if (commentBtn) commentBtn.classList.add('is-active');
-    S.emitEngagementEvent?.("comment_mode_entered", {});
   };
 
   S.exitCommentMode = function exitCommentMode() {
@@ -5787,7 +5407,6 @@
       if (wasActive) {
         S.clearAllSelectionHighlights?.();
         S.removeCommentAffordances?.();
-        S.emitEngagementEvent?.("comment_mode_exited", {});
       }
     } catch (err) {
       S.cwarn?.("[exitCommentMode] cleanup error", err);
@@ -5955,7 +5574,7 @@
     const seq = ++S.__commentState.requestSeq;
 
     let svg = null;
-    const opId = operationId || S.__engagementCtx?.operationId;
+    const opId = operationId || S.__operationTokenCtx?.operationId;
     if (opId) {
       try {
         const componentList = selectedIds.join(",");
@@ -6030,7 +5649,7 @@
       await S.enterCommentMode?.();
     }
 
-    if (!S.__commentState.active) { S.clog?.('[comment-click] abort: not active after enter attempt', { opId: S.__engagementCtx?.operationId || '' }); return false; }
+    if (!S.__commentState.active) { S.clog?.('[comment-click] abort: not active after enter attempt', { opId: S.__operationTokenCtx?.operationId || '' }); return false; }
     S.clog?.('[comment-click] toggling', qn, { selectedIds: [...S.__commentState.selectedIds] });
     S.toggleComponentSelection?.(qn);
     return true;
@@ -6318,11 +5937,6 @@
     if (S.__commentState.submitting) return;
     S.__commentState.submitting = true;
     updateSubmitState(document.getElementById(PANEL_ID));
-
-    S.emitEngagementEvent?.("comment_submitted", {
-      componentCount: selectedIds.length,
-      componentIds: selectedIds.slice(0, 10)
-    });
 
     try {
       await fillComposer(previewSvg);
@@ -7478,13 +7092,6 @@
         });
       }
 
-      // Convert hyphenated back to dotted for telemetry (more readable/standard)
-      const dottedComponentId = S.toDottedName(mappedComponentId);
-      S.emitEngagementEvent?.("file_explorer_item_clicked_in_striffs_view", {
-        filePath: normalizedPath,
-        mappedComponentId: dottedComponentId,
-        hasMappedComponent: Boolean(mappedComponentId)
-      });
       if (mappedComponentId) {
         try {
           const root = document.documentElement;
@@ -7519,7 +7126,7 @@
           targetNode.closest?.("g.entity[data-qualified-name]");
         if (!target) return false;
         const qn = target.getAttribute("data-qualified-name");
-        // Convert hyphenated to dotted for engagement telemetry and debug state
+        // Convert hyphenated to dotted for debug state
         const dottedQn = S.toDottedName(qn);
         if (S.isReviewNoteQualifiedName?.(qn)) {
           S.syncDiagramClickDebugState?.("ignored-note", {
@@ -7605,7 +7212,7 @@
             }
           }
         }
-        // Route affordance clicks to comment handler regardless of engagement
+        // Route affordance clicks to comment handler regardless of operation
         // context availability — enterCommentMode handles context fetch lazily.
         if (affTarget) {
           S.clog?.('[diagram-click] affordance clicked');
@@ -8088,7 +7695,7 @@
       if (!key) return false;
       localStorage.removeItem(key);
       localStorage.removeItem(`striffsCacheMeta:${key}`);
-      localStorage.removeItem(`${key}:engagement`);
+      localStorage.removeItem(`${key}:operation-token`);
       return true;
     } catch {
       return false;
@@ -8153,18 +7760,18 @@
     return parsed.result || null;
   }
 
-  function buildCacheableResultWithEngagement(result) {
+  function buildCacheableResultWithOperationToken(result) {
     if (!result || typeof result !== 'object') return result;
-    const currentCtx = S.__engagementCtx || {};
+    const currentCtx = S.__operationTokenCtx || {};
     const currentOperationId = String(
       S.__aiReviewOperationId || currentCtx.operationId || ''
     ).trim();
-    const currentToken = String(currentCtx.engagementWriteToken || '').trim();
+    const currentToken = String(currentCtx.operationAccessToken || '').trim();
     if (!currentOperationId && !currentToken) return result;
 
-    const extracted = S.extractEngagementContextFromPayload?.(result) || {};
+    const extracted = S.extractOperationTokenFromPayload?.(result) || {};
     const existingOperationId = String(extracted.operationId || '').trim();
-    const existingToken = String(extracted.engagementWriteToken || '').trim();
+    const existingToken = String(extracted.operationAccessToken || '').trim();
     if (existingOperationId && existingToken) return result;
 
     const cachedResult = Array.isArray(result) ? result.slice() : { ...result };
@@ -8172,7 +7779,7 @@
       cachedResult.operationId = currentOperationId;
     }
     if (!existingToken && currentToken) {
-      cachedResult.engagementWriteToken = currentToken;
+      cachedResult.operationAccessToken = currentToken;
     }
     return cachedResult;
   }
@@ -8183,12 +7790,12 @@
     try {
       const key = S.cacheKey();
       if (!key) return false;
-        const cacheableResult = buildCacheableResultWithEngagement(result);
+        const cacheableResult = buildCacheableResultWithOperationToken(result);
 	      const payload = {
 	        result: cacheableResult,
           cachedAiReviewStatus: S.getAiReviewStatusFromResult?.(result),
-          cachedOperationId: String(S.__aiReviewOperationId || S.__engagementCtx?.operationId || '').trim() || null,
-          cachedEngagementWriteToken: String(S.__engagementCtx?.engagementWriteToken || '').trim() || null,
+          cachedOperationId: String(S.__aiReviewOperationId || S.__operationTokenCtx?.operationId || '').trim() || null,
+          cachedOperationAccessToken: String(S.__operationTokenCtx?.operationAccessToken || '').trim() || null,
 	        updated_at: updatedAt,
 	        commit_count: commitCount != null ? commitCount : null,
 	        savedAt: Date.now(),
@@ -8203,11 +7810,11 @@
       };
       try { window.__striffsCacheMeta = payload.savedAt; window.__striffsCacheKey = key; } catch {}
       setCacheDataset(payload.savedAt);
-      if (payload.cachedOperationId && payload.cachedEngagementWriteToken) {
+      if (payload.cachedOperationId && payload.cachedOperationAccessToken) {
         try {
-          localStorage.setItem(`${key}:engagement`, JSON.stringify({
+          localStorage.setItem(`${key}:operation-token`, JSON.stringify({
             operationId: payload.cachedOperationId,
-            engagementWriteToken: payload.cachedEngagementWriteToken,
+            operationAccessToken: payload.cachedOperationAccessToken,
             savedAt: payload.savedAt
           }));
         } catch {}
@@ -8671,23 +8278,23 @@
     const generation = S.__reviewCollection;
     const isCurrent = () => generation === S.__reviewCollection && !S.__disabledByRemote;
     const context = () => ({
-      operationId: String(S.__engagementCtx?.operationId || "").trim(),
-      engagementToken: String(S.__engagementCtx?.engagementWriteToken || "").trim()
+      operationId: String(S.__operationTokenCtx?.operationId || "").trim(),
+      operationToken: String(S.__operationTokenCtx?.operationAccessToken || "").trim()
     });
-    let { operationId, engagementToken } = context();
-    if (!operationId || !engagementToken) {
-      // The analysis response can arrive before its write token is attached; a fresh read of the
+    let { operationId, operationToken } = context();
+    if (!operationId || !operationToken) {
+      // The analysis response can arrive before its access token is attached; a fresh read of the
       // same analysis usually carries it.
-      await S.refreshEngagementContextFromFreshResult?.(meta);
-      ({ operationId, engagementToken } = context());
+      await S.refreshOperationTokenFromFreshResult?.(meta);
+      ({ operationId, operationToken } = context());
     }
     const startedAt = Date.now();
     return {
       isCurrent,
-      available: Boolean(operationId && engagementToken),
+      available: Boolean(operationId && operationToken),
       // Reads until budgetMs after the collection opened.
       collect: (budgetMs) => ReviewState.collectReview({
-        fetchStatus: () => S.fetchAiReviewStatus({ operationId, engagementToken, timeoutMs: 15000 }),
+        fetchStatus: () => S.fetchAiReviewStatus({ operationId, operationToken, timeoutMs: 15000 }),
         sleep: S.sleep,
         now: () => Date.now(),
         deadline: startedAt + budgetMs,
@@ -9533,17 +9140,17 @@
     };
   };
 
-  async function refreshEngagementContextFromFreshResult(meta) {
-    if (S.__engagementRefreshPromise) return S.__engagementRefreshPromise;
-    S.__engagementRefreshPromise = (async () => {
+  async function refreshOperationTokenFromFreshResult(meta) {
+    if (S.__operationTokenRefreshPromise) return S.__operationTokenRefreshPromise;
+    S.__operationTokenRefreshPromise = (async () => {
       try {
         const token = await S.getStoredToken?.();
         if (!token && S.isPrivateRepo?.()) {
-          S.__lastEngagementContextError = "cache refresh unavailable";
-          S.syncEngagementDebugState?.();
-          S.logEngagementCollectionBlocked?.("cache refresh unavailable", {
+          S.__lastOperationTokenError = "cache refresh unavailable";
+          S.syncOperationTokenDebugState?.();
+          S.logOperationTokenUnavailable?.("cache refresh unavailable", {
             privateRepo: true,
-            cachedOperationId: S.__engagementCtx?.operationId || null
+            cachedOperationId: S.__operationTokenCtx?.operationId || null
           });
           return false;
         }
@@ -9561,7 +9168,7 @@
             if (!/Failed to fetch|NetworkError|fetch/i.test(message) || attempt === 3) {
               throw e;
             }
-            S.cwarn?.('Engagement context refresh attempt failed; retrying', {
+            S.cwarn?.('Operation token refresh attempt failed; retrying', {
               attempt,
               error: message
             });
@@ -9572,46 +9179,47 @@
         if (!result && lastError) throw lastError;
         const validationError = S.getStriffsResultValidationError?.(result);
         if (validationError) throw new Error(validationError);
-        const engagementReady = S.updateEngagementContextFromResult?.(result);
-        if (!engagementReady) {
-          S.cwarn?.('Engagement telemetry not available after refresh');
+        const operationTokenReady = S.updateOperationTokenFromResult?.(result);
+        if (!operationTokenReady) {
+          S.cwarn?.('Operation access token not available after refresh');
         }
         const freshStatus = S.syncAiReviewStateFromResult?.(result);
         // A refresh renders nothing, so it replaces the cache only with a result that is already
         // final: one whose review finished, or that has none.
         if (freshStatus === null || freshStatus === "READY") {
-          // Preserve engagement token from existing cache if the fresh result doesn't have one
-          const freshExtracted = S.extractEngagementContextFromPayload?.(result) || {};
-          const freshToken = String(freshExtracted.engagementWriteToken || "").trim();
-          if (!freshToken && S.__engagementCtx?.engagementWriteToken) {
+          // Preserve the operation access token from the existing cache if the fresh result
+          // doesn't carry one.
+          const freshExtracted = S.extractOperationTokenFromPayload?.(result) || {};
+          const freshToken = String(freshExtracted.operationAccessToken || "").trim();
+          if (!freshToken && S.__operationTokenCtx?.operationAccessToken) {
             try {
               const resultObj = result && typeof result === 'object' ? result : {};
-              resultObj.engagementWriteToken = S.__engagementCtx.engagementWriteToken;
+              resultObj.operationAccessToken = S.__operationTokenCtx.operationAccessToken;
             } catch {}
           }
           writeCachedDiagram(result, meta);
         }
-        S.debugDump?.("engagement context refreshed after cache load", {
-          operationId: String(S.__engagementCtx?.operationId || ""),
+        S.debugDump?.("operation token refreshed after cache load", {
+          operationId: String(S.__operationTokenCtx?.operationId || ""),
           loadSource: S.__lastLoadSource || null
         });
         return true;
       } catch (e) {
-        S.cwarn?.('Engagement context refresh failed, keeping existing context from cache', e);
-        S.__lastEngagementContextError = "cache refresh failed (cached context preserved)";
-        S.syncEngagementDebugState?.();
-        S.logEngagementCollectionBlocked?.("cache refresh failed (cached context preserved)", {
+        S.cwarn?.('Operation token refresh failed, keeping existing context from cache', e);
+        S.__lastOperationTokenError = "cache refresh failed (cached context preserved)";
+        S.syncOperationTokenDebugState?.();
+        S.logOperationTokenUnavailable?.("cache refresh failed (cached context preserved)", {
           error: String(e?.message || e),
-          cachedOperationId: S.__engagementCtx?.operationId || null
+          cachedOperationId: S.__operationTokenCtx?.operationId || null
         });
         return false;
       } finally {
-        S.__engagementRefreshPromise = null;
+        S.__operationTokenRefreshPromise = null;
       }
     })();
-    return S.__engagementRefreshPromise;
+    return S.__operationTokenRefreshPromise;
   }
-  S.refreshEngagementContextFromFreshResult = refreshEngagementContextFromFreshResult;
+  S.refreshOperationTokenFromFreshResult = refreshOperationTokenFromFreshResult;
 
   async function renderStriffsResult(result, meta, { fromCache = false } = {}) {
     const updated_at = meta?.updated_at;
@@ -9619,7 +9227,7 @@
     if (validationError) {
       throw new Error(validationError);
     }
-    const engagementReady = S.updateEngagementContextFromResult?.(result);
+    const operationTokenReady = S.updateOperationTokenFromResult?.(result);
     const analysisStatus = S.syncAiReviewStateFromResult?.(result);
     S.debugDump?.("render result payload summary", {
       aiReviewStatus: analysisStatus,
@@ -9657,12 +9265,12 @@
       else review = await collection.collect(S.REVIEW_WAIT_BUDGET_MS);
       // The page moved on while we waited: what we would render belongs to a page the user left.
       if (review.status === "CANCELLED") return;
-    } else if (!engagementReady) {
-      S.cwarn?.('Engagement telemetry not available for this response');
-      // The initial response can omit the write token even when an operationId is present (the
+    } else if (!operationTokenReady) {
+      S.cwarn?.('Operation access token not available for this response');
+      // The initial response can omit the access token even when an operationId is present (the
       // backend attaches it slightly after creating the operation). Retry once in the background so
-      // telemetry arms without waiting for comment mode.
-      Promise.resolve(S.refreshEngagementContextFromFreshResult?.(meta)).catch?.(() => {});
+      // the token is ready without waiting for comment mode.
+      Promise.resolve(S.refreshOperationTokenFromFreshResult?.(meta)).catch?.(() => {});
     }
     const loaded = ReviewState.mergeReviewResult(result, review.result);
 
@@ -9924,15 +9532,15 @@
         } }, '*');
         return;
       }
-      if (data.fn === 'getEngagementState') {
-        const ctx = S.__engagementCtx || {};
+      if (data.fn === 'getOperationTokenState') {
+        const ctx = S.__operationTokenCtx || {};
         window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: {
           operationId: String(ctx.operationId || '').trim() || null,
-          engagementWriteToken: String(ctx.engagementWriteToken || '').trim() || null,
+          operationAccessToken: String(ctx.operationAccessToken || '').trim() || null,
           hasOperationId: Boolean(String(ctx.operationId || '').trim()),
-          hasToken: Boolean(String(ctx.engagementWriteToken || '').trim()),
+          hasToken: Boolean(String(ctx.operationAccessToken || '').trim()),
           commentModeAvailable: Boolean(S.isCommentModeAvailable?.()),
-          lastError: S.__lastEngagementContextError || null
+          lastError: S.__lastOperationTokenError || null
         } }, '*');
         return;
       }
@@ -10031,15 +9639,15 @@
 
           const serializer = new XMLSerializer();
           const originalSvg = serializer.serializeToString(currentSvg);
-          const operationId = String(S.__engagementCtx?.operationId || '').trim();
-          const engagementWriteToken = String(S.__engagementCtx?.engagementWriteToken || '').trim();
-          if (!operationId || !engagementWriteToken) {
-            return { ok: false, reason: 'missing-engagement-context', operationId, hasToken: Boolean(engagementWriteToken) };
+          const operationId = String(S.__operationTokenCtx?.operationId || '').trim();
+          const operationAccessToken = String(S.__operationTokenCtx?.operationAccessToken || '').trim();
+          if (!operationId || !operationAccessToken) {
+            return { ok: false, reason: 'missing-operation-token-context', operationId, hasToken: Boolean(operationAccessToken) };
           }
 
           const makeResult = (status, svgText, extras = {}) => ({
             operationId,
-            engagementWriteToken,
+            operationAccessToken,
             aiReviewStatus: status,
             aiReviewPollAfterMs: status === 'READY' || status === 'FAILED' ? null : 25,
             aiReviewId: extras.aiReviewId || `manual-${status.toLowerCase()}`,
@@ -10235,15 +9843,15 @@
           if (!S.getPrimaryDiagramSvg?.()) {
             return { ok: false, reason: 'missing-base-svg' };
           }
-          const operationId = String(S.__engagementCtx?.operationId || S.__aiReviewOperationId || '').trim();
-          const engagementWriteToken = String(S.__engagementCtx?.engagementWriteToken || '').trim();
-          if (!operationId || !engagementWriteToken) {
+          const operationId = String(S.__operationTokenCtx?.operationId || S.__aiReviewOperationId || '').trim();
+          const operationAccessToken = String(S.__operationTokenCtx?.operationAccessToken || '').trim();
+          if (!operationId || !operationAccessToken) {
             return {
               ok: false,
-              reason: 'missing-engagement-context',
+              reason: 'missing-operation-token-context',
               operationId,
-              hasToken: Boolean(engagementWriteToken),
-              ctxOperationId: String(S.__engagementCtx?.operationId || '').trim() || null,
+              hasToken: Boolean(operationAccessToken),
+              ctxOperationId: String(S.__operationTokenCtx?.operationId || '').trim() || null,
               aiReviewOperationId: String(S.__aiReviewOperationId || '').trim() || null
             };
           }
@@ -10255,7 +9863,7 @@
           while ((Date.now() - startedAt) < timeoutMs) {
             const resp = await S.fetchAiReviewStatus?.({
               operationId,
-              engagementToken: engagementWriteToken,
+              operationToken: operationAccessToken,
               timeoutMs: 15000
             });
             if (!resp?.ok) {
@@ -10265,7 +9873,7 @@
                 status: Number(resp?.status || 0),
                 error: String(resp?.error || ''),
                 operationId,
-                ctxOperationId: String(S.__engagementCtx?.operationId || '').trim() || null,
+                ctxOperationId: String(S.__operationTokenCtx?.operationId || '').trim() || null,
                 aiReviewOperationId: String(S.__aiReviewOperationId || '').trim() || null
               };
             }
@@ -10613,17 +10221,17 @@
       S.updateStriffButton?.({ loading: true, tooltip: "Refreshing Striffs…", phase: "Refreshing" });
       await S.autoFetchStriffs?.();
     } else if (cacheStatus === 'fresh') {
-      // primeDiagramFromCache already restored engagement context from the
+      // primeDiagramFromCache already restored the operation context from the
       // cached payload (Chrome Storage / IndexedDB / localStorage).  If the
       // context is still missing, making a full API call here is wasteful —
-      // the same API response would be missing engagement data too.  Context
+      // the same API response would be missing the operation token too.  Context
       // will be obtained on the next load that reads the review.
       const hasCachedCtx = Boolean(
-        String(S.__engagementCtx?.operationId || '').trim() &&
-        String(S.__engagementCtx?.engagementWriteToken || '').trim()
+        String(S.__operationTokenCtx?.operationId || '').trim() &&
+        String(S.__operationTokenCtx?.operationAccessToken || '').trim()
       );
       if (!hasCachedCtx) {
-        S.cwarn?.('Engagement context missing after cache load — will be obtained on next generation');
+        S.cwarn?.('Operation token missing after cache load — will be obtained on next generation');
       }
     }
 

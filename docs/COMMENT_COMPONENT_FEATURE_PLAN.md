@@ -67,7 +67,7 @@ All backend work for Phase 1 is **implemented and tested**:
 | Component | Status | Details |
 |-----------|--------|---------|
 | `src/plantuml-utils.js` | Done | PlantUML encoding/decoding utility (extracts PUML from SVG comments, encodes/decodes PlantUML format). Not used by the backend-first comment flow, but available as a fallback. |
-| `operationId` in extension state | Done | Available via `S.__engagementCtx.operationId` — set from the API response when striffs are loaded |
+| `operationId` in extension state | Done | Available via `S.__operationTokenCtx.operationId` — set from the API response when striffs are loaded |
 | SVG component identity mapping | Done | SVG `data-qualified-name` attributes on diagram entities match `DiagramComponent.uniqueName()` (via ADR-003 post-processing) |
 
 ### NOT DONE — Extension (All Remaining Work)
@@ -151,7 +151,7 @@ The selection state (`selectedIds`) must be keyed by component identifiers that 
 
 The extension needs `{ operationId, diagramIndex }` to call the backend subdiagram endpoint. Both are now resolved:
 
-- **`operationId`** — already available via `S.__engagementCtx.operationId` from the API response
+- **`operationId`** — already available via `S.__operationTokenCtx.operationId` from the API response
 - **`diagramIndex`** — always `0`. The extension currently renders a single diagram per operation, so the index is hardcoded.
 
 ## Remaining Work (Implementation Steps)
