@@ -845,64 +845,16 @@ const handlers = {
       t.cancel();
     }
   },
-  recordEngagementEvent: async (msg, { safeReply }) => {
-    const {
-      operationId,
-      engagementToken,
-      payload,
-      timeoutMs = 12000
-    } = msg || {};
-    const op = String(operationId || "").trim();
-    const token = String(engagementToken || "").trim();
-    if (!op) { safeReply({ ok: false, error: "missing operationId" }); return; }
-    if (!token) { safeReply({ ok: false, error: "missing engagementToken" }); return; }
-    if (!payload || typeof payload !== "object") {
-      safeReply({ ok: false, error: "missing payload" });
-      return;
-    }
-    const apiBase = await getApiBase();
-    const url = `${apiBase}/api/v1/striffs/${encodeURIComponent(op)}/engagement`;
-    const t = abortableTimeout(timeoutMs);
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Striff-Engagement-Token": token
-        },
-        body: JSON.stringify(payload),
-        signal: t.signal,
-        cache: "no-cache"
-      });
-      const status = res.status;
-      if (!res.ok) {
-        const text = await res.text().catch(() => "");
-        debugLog("recordEngagementEvent failed", {
-          operationId: op,
-          status,
-          eventType: payload?.eventType || payload?.event?.type || null
-        });
-        safeReply({ ok: false, status, error: `HTTP ${status}`, body: text });
-        return;
-      }
-      const json = await res.json().catch(() => null);
-      safeReply({ ok: true, status, json });
-    } catch (e) {
-      safeReply({ ok: false, error: String(e?.message || e) });
-    } finally {
-      t.cancel();
-    }
-  },
   fetchAiReviewStatus: async (msg, { safeReply }) => {
     const {
       operationId,
-      engagementToken,
+      operationToken,
       timeoutMs = 15000
     } = msg || {};
     const op = String(operationId || "").trim();
-    const token = String(engagementToken || "").trim();
+    const token = String(operationToken || "").trim();
     if (!op) { safeReply({ ok: false, error: "missing operationId" }); return; }
-    if (!token) { safeReply({ ok: false, error: "missing engagementToken" }); return; }
+    if (!token) { safeReply({ ok: false, error: "missing operationToken" }); return; }
     const apiBase = await getApiBase();
     const url = `${apiBase}/api/v1/striffs/${encodeURIComponent(op)}/ai-review`;
     const t = abortableTimeout(timeoutMs);
@@ -910,7 +862,7 @@ const handlers = {
       const res = await fetch(url, {
         method: "GET",
         headers: {
-          "X-Striff-Engagement-Token": token
+          "X-Striff-Operation-Token": token
         },
         signal: t.signal,
         cache: "no-cache"

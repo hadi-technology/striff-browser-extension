@@ -292,12 +292,12 @@ const DETECTOR_TRACES = ['STRUCTURAL CHECKS', '✅ clean', '👀', '❗', 'obser
   // -----------------------------------------------------------------------------------------------
   const svg = (which) => `<svg xmlns="http://www.w3.org/2000/svg" data-diagram="${which}" width="200" height="100" viewBox="0 0 200 100"><rect width="200" height="100"/></svg>`;
   const analysis = (status, extra = {}) => ({
-    operationId: 'op-1', engagementWriteToken: 'tok-1', aiReviewStatus: status,
+    operationId: 'op-1', operationAccessToken: 'tok-1', aiReviewStatus: status,
     striffs: [{ svgCode: svg('base') }], ...extra
   });
   const reply = (status, extra = {}) => ({
     ok: true, status: 200,
-    json: { operationId: 'op-1', engagementWriteToken: 'tok-1', aiReviewStatus: status, aiReviewPollAfterMs: 1000, ...extra }
+    json: { operationId: 'op-1', operationAccessToken: 'tok-1', aiReviewStatus: status, aiReviewPollAfterMs: 1000, ...extra }
   });
   const readyReply = (review = CURRENT) => reply('READY', { striffs: [{ svgCode: svg('reviewed') }], ...review });
 
@@ -775,7 +775,7 @@ const DETECTOR_TRACES = ['STRUCTURAL CHECKS', '✅ clean', '👀', '❗', 'obser
     // place it often does not -- so only GitHub's own answer can tell.
     await page.evaluate(() => {
       const S = window.Striffs;
-      const payload = () => ({ operationId: 'op-p', engagementWriteToken: 'tok-p',
+      const payload = () => ({ operationId: 'op-p', operationAccessToken: 'tok-p',
         striffs: [{ svgCode: '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100" viewBox="0 0 200 100"><rect width="200" height="100"/></svg>' }] });
       S.__loadTest = async ({ repo, token = null, github, zipOk = false }) => {
         const calls = [];

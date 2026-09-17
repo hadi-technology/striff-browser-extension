@@ -7,16 +7,9 @@
 - GitHub pull request page metadata from pages where the extension runs
 - Repository file paths and changed-file content needed to build diagrams
 - Optional GitHub personal access token when the user provides one
-- Diagram engagement and AI review feedback events sent to the configured Striffs backend
 
-Engagement events can include:
-
-- Striffs button clicks and generation attempts
-- View switches between Diffs and Striffs
-- Pan/zoom interactions on a rendered diagram
-- File-tree navigation inside the Striffs UI
-- Review-note feedback interactions
-- Comment-mode entry, exit, and review submission events
+The extension does not collect usage or interaction events. It sends nothing to the Striffs backend
+beyond what a diagram and its review require.
 
 ## Storage
 
@@ -26,10 +19,9 @@ Engagement events can include:
 ## Network requests
 
 - The extension talks to GitHub endpoints needed for pull request data and repository content.
-- The extension talks to the configured Striffs backend to generate diagrams, fetch remote config, poll AI review status, and send engagement/feedback events.
+- The extension talks to the configured Striffs backend to generate diagrams, fetch remote config, and poll AI review status.
 
 ## User control
 
 - Users can clear the saved token from the extension UI.
 - Users can clear local Striffs cache/state from the extension UI.
-- Users can disable usage-data collection from the extension popup without disabling Striffs generation.

@@ -1297,57 +1297,30 @@ const setRemoteConfigUrlData = async (jsonObj) => {
     };
   }).catch(() => ({ textareaFound: false, textareaVisible: false, textareaValue: '', changeCount: 0, fileNames: [], embedded: false, previewCount: 0 }));
 
-  const waitForTelemetryArmed = async (timeoutMs = 15000) => {
+  const waitForOperationTokenArmed = async (timeoutMs = 15000) => {
     const handle = await page.waitForFunction(() => {
       const d = document.documentElement?.dataset || {};
-      const hasOperationId = d.striffsEngagementHasOperationId === '1';
-      const hasToken = d.striffsEngagementHasToken === '1';
+      const hasOperationId = d.striffsOperationTokenHasOperationId === '1';
+      const hasToken = d.striffsOperationTokenHasToken === '1';
       if (!hasOperationId || !hasToken) return null;
       return {
         hasOperationId,
         hasToken,
-        lastError: d.striffsEngagementLastError || null
+        lastError: d.striffsOperationTokenLastError || null
       };
     }, null, { timeout: timeoutMs, polling: 250 }).catch(() => null);
     return handle ? handle.jsonValue() : null;
   };
 
-  const getTelemetryDiag = async () => page.evaluate(() => {
+  const getOperationTokenDiag = async () => page.evaluate(() => {
     const d = document.documentElement?.dataset || {};
     return {
       currentView: window.Striffs?.getCurrentView?.() || window.Striffs?.__currentView || window.Striffs?.currentView || null,
-      lastEngagementContextError: d.striffsEngagementLastError || null,
-      counters: {
-        sent: Number(d.striffsEngagementSent || 0),
-        ack: Number(d.striffsEngagementAck || 0),
-        failed: Number(d.striffsEngagementFailed || 0),
-        skipped: Number(d.striffsEngagementSkipped || 0),
-        lastEventType: d.striffsEngagementLastEventType || null
-      },
-      hasOperationId: d.striffsEngagementHasOperationId === '1',
-      hasToken: d.striffsEngagementHasToken === '1'
+      lastOperationTokenError: d.striffsOperationTokenLastError || null,
+      hasOperationId: d.striffsOperationTokenHasOperationId === '1',
+      hasToken: d.striffsOperationTokenHasToken === '1'
     };
   }).catch(() => null);
-
-  const waitForTelemetryDelivery = async ({ minAck = 1, timeoutMs = 10000 } = {}) => {
-    const handle = await page.waitForFunction(({ requiredAck }) => {
-      const d = document.documentElement?.dataset || {};
-      const ack = Number(d.striffsEngagementAck || 0);
-      if (ack < Number(requiredAck || 0)) return null;
-      return {
-        counters: {
-          sent: Number(d.striffsEngagementSent || 0),
-          ack,
-          failed: Number(d.striffsEngagementFailed || 0),
-          skipped: Number(d.striffsEngagementSkipped || 0),
-          lastEventType: d.striffsEngagementLastEventType || null
-        },
-        currentView: window.Striffs?.getCurrentView?.() || window.Striffs?.__currentView || window.Striffs?.currentView || null,
-        lastEngagementContextError: d.striffsEngagementLastError || null
-      };
-    }, { requiredAck: minAck }, { timeout: timeoutMs, polling: 250 }).catch(() => null);
-    return handle ? handle.jsonValue() : null;
-  };
 
   // Navigate to PR page first — content script injection activates the extension
   // service worker, making it discoverable via CDP.
@@ -2136,42 +2109,23 @@ const setRemoteConfigUrlData = async (jsonObj) => {
     pass('Striffs view visible');
   }
 
-  const telemetryArmed = await waitForTelemetryArmed(15000);
-  if (!telemetryArmed) {
-    const diag = await getTelemetryDiag();
-    fail(`Engagement telemetry not initialized after Striffs render${diag ? ` (${JSON.stringify(diag)})` : ''}`);
+  const operationTokenArmed = await waitForOperationTokenArmed(15000);
+  if (!operationTokenArmed) {
+    const diag = await getOperationTokenDiag();
+    fail(`Operation token context not initialized after Striffs render${diag ? ` (${JSON.stringify(diag)})` : ''}`);
     return;
   } else {
-    pass('Engagement telemetry initialized after Striffs render');
-    // Verify both operationId AND write token are present (not just operationId)
-    const diag = await getTelemetryDiag();
+    pass('Operation token context initialized after Striffs render');
+    // Verify both operationId AND access token are present (not just operationId)
+    const diag = await getOperationTokenDiag();
     if (!diag?.hasToken) {
-      fail(`Engagement write token missing (operationId present but token is not): ${JSON.stringify(diag)}`);
+      fail(`Operation access token missing (operationId present but token is not): ${JSON.stringify(diag)}`);
     } else {
-      pass('Engagement write token present');
-    }
-    if (Number(diag?.counters?.skipped || 0) > 0) {
-      fail(`Engagement events were skipped before delivery test (${JSON.stringify(diag?.counters)})`);
+      pass('Operation access token present');
     }
   }
 
   await diffsBtn.click().catch(() => {});
-  const telemetryDelivered = await waitForTelemetryDelivery({ minAck: 1, timeoutMs: 10000 });
-  if (!telemetryDelivered) {
-    const diag = await getTelemetryDiag();
-    fail(`Engagement telemetry not delivered after Diffs button click${diag ? ` (${JSON.stringify(diag)})` : ''}`);
-    return;
-  } else if (Number(telemetryDelivered?.counters?.failed || 0) > 0) {
-    fail(`Engagement telemetry had delivery failures (${JSON.stringify(telemetryDelivered.counters)})`);
-    return;
-  } else {
-    pass('Engagement telemetry delivered after Diffs button click');
-    const diag = await getTelemetryDiag();
-    if (Number(diag?.counters?.skipped || 0) > 0) {
-      fail(`Engagement events skipped after delivery (${JSON.stringify(diag?.counters)})`);
-    }
-  }
-
   await clickStriffsButton('after cache restore').catch(() => {});
   const striffsVisibleAfterTelemetryCheck = await page.waitForFunction(() => {
     const el = document.querySelector('#striff-diagram-view');
@@ -3856,8 +3810,8 @@ const setRemoteConfigUrlData = async (jsonObj) => {
 
   // 1. Check comment mode availability
   const commentAvail = await page.evaluate(() => ({
-    hasOpId: document.documentElement.dataset.striffsEngagementHasOperationId === '1',
-    hasToken: document.documentElement.dataset.striffsEngagementHasToken === '1',
+    hasOpId: document.documentElement.dataset.striffsOperationTokenHasOperationId === '1',
+    hasToken: document.documentElement.dataset.striffsOperationTokenHasToken === '1',
     hasSvg: !!document.querySelector('#striffs-content svg')
   }));
   if (!commentAvail?.hasOpId) {
@@ -4433,10 +4387,10 @@ const setRemoteConfigUrlData = async (jsonObj) => {
     const reloadBootState = reloadBootHandle ? await reloadBootHandle.jsonValue() : null;
     const reloadCacheDiag = await page.evaluate(async () => {
       try {
-        // Wait for engagement context to be populated (async refresh may be in flight)
+        // Wait for the operation token context to be populated (async refresh may be in flight)
         for (let i = 0; i < 30; i++) {
-          const ctx = window.Striffs?.__engagementCtx;
-          if (ctx && ctx.operationId && ctx.engagementWriteToken) break;
+          const ctx = window.Striffs?.__operationTokenCtx;
+          if (ctx && ctx.operationId && ctx.operationAccessToken) break;
           await new Promise(r => setTimeout(r, 500));
         }
         const dataset = document.documentElement?.dataset || {};
@@ -4459,16 +4413,16 @@ const setRemoteConfigUrlData = async (jsonObj) => {
           primeCacheProbe: dataset.striffsPrimeCacheProbe || null,
           primeCacheStatus: dataset.striffsPrimeCacheStatus || null,
           cachedAiReviewStatus,
-          engagementWriteToken: window.Striffs?.__engagementCtx?.engagementWriteToken || null,
-          cachedEngagementContext: (() => {
+          operationAccessToken: window.Striffs?.__operationTokenCtx?.operationAccessToken || null,
+          cachedOperationTokenContext: (() => {
             try {
               if (!cacheKey) return null;
-              const raw = localStorage.getItem(`${cacheKey}:engagement`);
+              const raw = localStorage.getItem(`${cacheKey}:operation-token`);
               const parsed = raw ? JSON.parse(raw) : null;
-              if (!parsed?.operationId || !parsed?.engagementWriteToken) return null;
+              if (!parsed?.operationId || !parsed?.operationAccessToken) return null;
               return {
                 operationId: parsed.operationId,
-                engagementWriteToken: parsed.engagementWriteToken
+                operationAccessToken: parsed.operationAccessToken
               };
             } catch {
               return null;
@@ -4577,47 +4531,47 @@ const setRemoteConfigUrlData = async (jsonObj) => {
       warn(`Cache has cachedAiReviewStatus=${cachedAiStatus} — enriched diagrams should not be cached`);
     }
 
-    // Verify engagement context was restored after reload
-    // Read engagement context AFTER the Striffs view is shown (not from pre-click state)
-    // Ask the content script for its engagement context rather than reading __engagementCtx
+    // Verify the operation token context was restored after reload
+    // Read it AFTER the Striffs view is shown (not from pre-click state)
+    // Ask the content script for its operation token context rather than reading __operationTokenCtx
     // from the main world, where it is always undefined. The poll that used to sit here spent
     // fifteen seconds waiting for a value that could not arrive, and the stronger of the two
     // assertions below could therefore never be the one that fired -- every run fell through
     // to the weaker localStorage branch and reported it as a pass.
-    let hookEngagement = null;
+    let hookOperationToken = null;
     for (let i = 0; i < 30; i += 1) {
-      hookEngagement = await runStriffsTestHook('getEngagementState', {}, 3000);
-      if (hookEngagement?.hasOperationId && hookEngagement?.hasToken) break;
+      hookOperationToken = await runStriffsTestHook('getOperationTokenState', {}, 3000);
+      if (hookOperationToken?.hasOperationId && hookOperationToken?.hasToken) break;
       await page.waitForTimeout(500);
     }
-    const postReloadEngagement = await page.evaluate(({ hookCtx }) => {
+    const postReloadOperationToken = await page.evaluate(({ hookCtx }) => {
       return {
         operationId: hookCtx?.operationId || null,
-        engagementWriteToken: hookCtx?.engagementWriteToken || null,
-        cachedEngagementContext: (() => {
+        operationAccessToken: hookCtx?.operationAccessToken || null,
+        cachedOperationTokenContext: (() => {
           try {
             const cacheKey = document.documentElement?.dataset?.striffsCacheKey || '';
             if (!cacheKey) return null;
-            const raw = localStorage.getItem(`${cacheKey}:engagement`);
+            const raw = localStorage.getItem(`${cacheKey}:operation-token`);
             const parsed = raw ? JSON.parse(raw) : null;
-            if (!parsed?.operationId || !parsed?.engagementWriteToken) return null;
+            if (!parsed?.operationId || !parsed?.operationAccessToken) return null;
             return {
               operationId: parsed.operationId,
-              engagementWriteToken: parsed.engagementWriteToken
+              operationAccessToken: parsed.operationAccessToken
             };
           } catch {
             return null;
           }
         })()
       };
-    }, { hookCtx: hookEngagement }).catch(() => ({ operationId: null, engagementWriteToken: null, cachedEngagementContext: null }));
-    const engToken = postReloadEngagement?.engagementWriteToken;
-    if (engToken) {
-      pass('Engagement context restored from cache (no fresh API call needed)');
-    } else if (postReloadEngagement?.cachedEngagementContext?.engagementWriteToken || reloadCacheDiag?.cachedEngagementContext?.engagementWriteToken) {
-      pass('Engagement context persisted in PR-scoped cache and is available for deferred hydration after reload');
+    }, { hookCtx: hookOperationToken }).catch(() => ({ operationId: null, operationAccessToken: null, cachedOperationTokenContext: null }));
+    const opToken = postReloadOperationToken?.operationAccessToken;
+    if (opToken) {
+      pass('Operation token context restored from cache (no fresh API call needed)');
+    } else if (postReloadOperationToken?.cachedOperationTokenContext?.operationAccessToken || reloadCacheDiag?.cachedOperationTokenContext?.operationAccessToken) {
+      pass('Operation token context persisted in PR-scoped cache and is available for deferred hydration after reload');
     } else {
-      fail(`Engagement write token not available after reload (operationId: ${postReloadEngagement?.operationId || reloadCacheDiag?.engagementOperationId || 'none'})`);
+      fail(`Operation access token not available after reload (operationId: ${postReloadOperationToken?.operationId || 'none'})`);
     }
   }
   }
@@ -4713,7 +4667,7 @@ const setRemoteConfigUrlData = async (jsonObj) => {
 
         // [new-ui] Comment mode + subdiagram preview
         const newUiCommentAvail = await page.evaluate(() => ({
-          hasOpId: document.documentElement.dataset.striffsEngagementHasOperationId === '1',
+          hasOpId: document.documentElement.dataset.striffsOperationTokenHasOperationId === '1',
           hasSvg: !!document.querySelector('#striffs-content svg')
         }));
         if (!newUiCommentAvail?.hasOpId || !newUiCommentAvail?.hasSvg) {

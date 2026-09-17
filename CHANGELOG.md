@@ -2,6 +2,11 @@
 
 ## 1.3.0
 
+- The extension no longer records or sends usage events. Clicking the Diffs or Striffs tab, panning
+  and zooming the diagram, clicking a component or a file, and opening, leaving or submitting a
+  diagram comment are no longer reported anywhere. Nothing about the diagram, the comment flow or
+  the review changes: the same views open, the same comments are composed, and the review's findings
+  still arrive with the diagram.
 - A public pull request that already has a Striff check from the GitHub App opens with that analysis
   instead of waiting for a second one, whether or not a GitHub token is set. The upload now names the
   pull request so the API can find it.
