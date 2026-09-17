@@ -2,6 +2,9 @@
 
 ## 1.3.0
 
+- A public pull request that already has a Striff check from the GitHub App opens with that analysis
+  instead of waiting for a second one, whether or not a GitHub token is set. The upload now names the
+  pull request so the API can find it.
 - Cursor project rules (`.cursor/rules/*.mdc`) count as documentation in the file list the extension
   falls back to when the API's own list cannot be fetched, so a repository's rules for its coding agent
   still reach the analysis. The API's list is used whenever it is available.
