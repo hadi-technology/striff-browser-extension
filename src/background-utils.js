@@ -70,6 +70,18 @@ const StriffsBackgroundUtilsFactory = (() => {
   // all of them. Nothing sends one there today; this keeps it that way.
   const TOKEN_HOSTS = new Set(['api.github.com', 'raw.githubusercontent.com']);
 
+  // The pull request an upload is of, as the form fields the API reads to answer it with the GitHub App's
+  // analysis when the repository has the App. All three or none: the API ignores a partial name, so
+  // sending one would only put values in the request that do nothing.
+  function pullRequestFormFields({ owner, repo, pullNumber } = {}) {
+    const name = /^[A-Za-z0-9_.-]+$/;
+    const number = String(pullNumber ?? '').trim();
+    if (!name.test(String(owner || '')) || !name.test(String(repo || '')) || !/^[1-9][0-9]*$/.test(number)) {
+      return [];
+    }
+    return [['owner', owner], ['repo', repo], ['pull_number', number]];
+  }
+
   function withoutUnexpectedAuthorization(rawUrl, headers = {}) {
     let host = '';
     try { host = new URL(String(rawUrl || '')).hostname; } catch (_) {}
@@ -201,6 +213,7 @@ const StriffsBackgroundUtilsFactory = (() => {
     parseTempChangedFilesTimestamp,
     parseTempResponseTimestamp,
     pickReturnHeaders,
+    pullRequestFormFields,
     readApiErrorResponse,
     selectChromeStorageCacheKeys,
     shouldAllowProxyUrl,

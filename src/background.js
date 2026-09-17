@@ -233,7 +233,7 @@ async function downloadRepoZipAsArrayBuffer(owner, repo, ref, apiBase) {
 
 const readApiErrorResponse = BgUtils.readApiErrorResponse;
 
-async function postIncrementalToLocal(apiUrl, beforeAB, changedFiles = [], { timeoutMs = 120000, apiBase = '' } = {}) {
+async function postIncrementalToLocal(apiUrl, beforeAB, changedFiles = [], { timeoutMs = 120000, apiBase = '', pullRequest = null } = {}) {
   const sanitizedChangedFiles = sanitizeChangedFilesPayload(changedFiles);
 
   // The archive arrives already filtered -- downloadRepoZipAsArrayBuffer is the only source of it
@@ -242,6 +242,10 @@ async function postIncrementalToLocal(apiUrl, beforeAB, changedFiles = [], { tim
   const fd = new FormData();
   fd.append('before', new Blob([beforeAB], { type: 'application/zip' }), 'before.zip');
   fd.append('changed_files', new Blob([JSON.stringify(sanitizedChangedFiles)], { type: 'application/json' }));
+  // Lets the API answer with the GitHub App's analysis of this pull request instead of a second one.
+  for (const [name, value] of BgUtils.pullRequestFormFields?.(pullRequest || {}) || []) {
+    fd.append(name, value);
+  }
 
   const t = abortableTimeout(timeoutMs);
   try {
@@ -682,7 +686,8 @@ const handlers = {
     const {
       baseOwner, baseRepo, baseBranch,
       changedFiles = [],
-      changedFilesStorageKey = ''
+      changedFilesStorageKey = '',
+      pullRequest = null
     } = msg;
 
     if (!baseOwner || !baseRepo || !baseBranch) {
@@ -754,7 +759,8 @@ const handlers = {
       // follows, which carries its own budget, so this timeout covers the upload alone.
       {
         timeoutMs: 180000,
-        apiBase
+        apiBase,
+        pullRequest
       }
     );
     const postDurationMs = Date.now() - postStart;

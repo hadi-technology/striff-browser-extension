@@ -9200,6 +9200,7 @@
       type: "generateStriffs",
       baseOwner: refs.baseOwner, baseRepo: refs.baseRepo, baseBranch: refs.baseBranch,
       changedFilesStorageKey,
+      pullRequest: { owner: meta.owner, repo: meta.repo, pullNumber: meta.pull_number },
       updated_at,
     }, timeoutFor("bgGenerate", timeoutFor("message", 7000)));
 

@@ -15,6 +15,7 @@ const {
   readApiErrorResponse,
   selectChromeStorageCacheKeys,
   shouldAllowProxyUrl,
+  pullRequestFormFields,
   withoutUnexpectedAuthorization,
 } = require('../src/background-utils.js');
 
@@ -152,4 +153,15 @@ test('withoutUnexpectedAuthorization keeps the token for GitHub API hosts only',
       { Accept: 'application/vnd.github+json' }
     );
   }
+});
+
+test('pullRequestFormFields names the pull request only when owner, repo and number are all usable', () => {
+  assert.deepEqual(pullRequestFormFields({ owner: 'acme', repo: 'app.js', pullNumber: '7' }),
+    [['owner', 'acme'], ['repo', 'app.js'], ['pull_number', '7']]);
+  assert.deepEqual(pullRequestFormFields({ owner: 'acme', repo: 'app', pullNumber: 42 }),
+    [['owner', 'acme'], ['repo', 'app'], ['pull_number', '42']]);
+  assert.deepEqual(pullRequestFormFields({ owner: 'acme', repo: 'app' }), []);
+  assert.deepEqual(pullRequestFormFields({ owner: 'acme/../x', repo: 'app', pullNumber: '7' }), []);
+  assert.deepEqual(pullRequestFormFields({ owner: 'acme', repo: 'app', pullNumber: '0' }), []);
+  assert.deepEqual(pullRequestFormFields(), []);
 });
