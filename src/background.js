@@ -172,7 +172,7 @@ async function downloadRepoZipAsArrayBuffer(owner, repo, ref, apiBase) {
     // no-cache because `ref` is usually a branch and therefore moves. A stale archive would be
     // analysed and reported as the current revision, which is wrong rather than merely old.
     const res = await fetch(url, { signal: t.signal, cache: 'no-cache' });
-    if (!res.ok) return { ok: false, error: `Failed to download zip: ${res.status}` };
+    if (!res.ok) return { ok: false, status: res.status, error: `Failed to download zip: ${res.status}` };
     if (utils && res.body && typeof utils.filterZipStream === 'function') {
       filtered = await utils.filterZipStream(res.body, manifest, {
         maxKeptBytes: ceiling,
@@ -726,10 +726,13 @@ const handlers = {
         baseError: before.error,
         tooLarge: !!before.tooLarge
       });
+      // codeload answers a private repository with 404, so this is how the tab learns it sent a
+      // private repo down the upload path, and falls back to the token GET.
+      const errorCode = before.tooLarge ? 'ZIP_TOO_LARGE' : before.status === 404 ? 'BASE_ZIP_NOT_FOUND' : null;
       safeReply({
         ok: false,
         error: before.tooLarge ? before.error : `Failed downloading base zip: ${before.error}`,
-        ...(before.tooLarge ? { errorCode: 'ZIP_TOO_LARGE' } : {})
+        ...(errorCode ? { errorCode } : {})
       });
       return;
     }
@@ -749,7 +752,10 @@ const handlers = {
       effectiveChangedFiles,
       // The submit itself is fast now -- it uploads and returns. The long wait is the poll that
       // follows, which carries its own budget, so this timeout covers the upload alone.
-      { timeoutMs: 180000, apiBase }
+      {
+        timeoutMs: 180000,
+        apiBase
+      }
     );
     const postDurationMs = Date.now() - postStart;
     const totalDurationMs = Date.now() - overallStart;
