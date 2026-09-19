@@ -530,13 +530,7 @@
     };
     return {
       operationId: readFirst(["operationId", "operationID", "operation_id"]),
-      // `engagementWriteToken` is the field's former name on the wire. The API emits both while
-      // clients move over; read the new name first and fall back to the old one.
-      operationAccessToken: readFirst([
-        "operationAccessToken",
-        "operation_access_token",
-        "engagementWriteToken"
-      ])
+      operationAccessToken: readFirst(["operationAccessToken", "operation_access_token"])
     };
   };
 
