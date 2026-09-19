@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.0
+
+- On a private repository with no GitHub token set, the Striffs button's tooltip now says the token
+  is required because the repository is private, instead of a bare "Token required".
+
 ## 1.3.0
 
 - The extension no longer records or sends usage events. Clicking the Diffs or Striffs tab, panning

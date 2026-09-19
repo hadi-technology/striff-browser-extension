@@ -1840,7 +1840,7 @@
             // Early check for private repo without token
             const token = await S.getStoredToken?.();
             if (!token && S.isPrivateRepo?.()) {
-                S.updateStriffButton({ neutral: true, disabled: true, tooltip: "Token required" });
+                S.updateStriffButton({ neutral: true, disabled: true, tooltip: "Token required: this repo is private" });
                 return;
             }
 
@@ -9012,7 +9012,7 @@
     // Only reached without a token; with one, requestPrimary has already retried on the token GET.
     if (code === 'BASE_ZIP_NOT_FOUND' || code === 'PRIVATE_REPO_TOKEN_REQUIRED') {
       return {
-        tooltip: "Token required",
+        tooltip: "Token required: this repo is private",
         toast: "<strong>This repository looks private.</strong> Connect a GitHub token in the extension popup to analyse it.",
         tone: 'neutral',
         disabled: true,
