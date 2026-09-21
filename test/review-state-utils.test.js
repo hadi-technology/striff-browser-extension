@@ -6,8 +6,7 @@ const {
   mergeReviewResult,
   reviewButtonState,
   isReviewPending,
-  reviewProgressText,
-  reviewWaitingText
+  reviewProgressText
 } = require('../src/review-state-utils.js');
 
 // Sleeping advances the clock instantly, so a budget of minutes runs in microseconds.
@@ -214,6 +213,18 @@ test('a running review says so and cannot be opened', () => {
   assert.match(firstRead.title, /for the first time/);
 });
 
+test('only a review still being read is busy, so only it spins', () => {
+  // The spinner says "work is happening". Every state below is an outcome, including the two that
+  // are disabled for other reasons -- a button that kept spinning on a failed or timed-out review
+  // would promise a result that is never coming.
+  for (const status of ['PENDING', 'RUNNING', 'pending']) {
+    assert.equal(reviewButtonState({ status }).busy, true, status);
+  }
+  for (const status of ['READY', 'FAILED', 'TIMED_OUT', 'UNAVAILABLE', 'SKIPPED', null, '']) {
+    assert.equal(reviewButtonState({ status, ruleCount: 2 }).busy, false, String(status));
+  }
+});
+
 test('a failed review says it failed', () => {
   const s = reviewButtonState({ status: 'FAILED', reason: 'model timed out' });
   assert.equal(s.text, 'Review failed');
@@ -253,14 +264,11 @@ test('no state asks the user to start a review or claims a result that was not e
 });
 
 test('the wording for a running review says what is happening, and the first read takes minutes', () => {
-  assert.match(reviewWaitingText(false), /Waiting for the architecture review/);
   assert.match(reviewProgressText(false), /still running/);
-  for (const text of [reviewWaitingText(true), reviewProgressText(true)]) {
-    assert.match(text, /for the first time/);
-    assert.match(text, /few minutes/);
-  }
-  // Without the first-read hint, neither promises a wait of minutes it has no basis for.
-  assert.doesNotMatch(`${reviewWaitingText(false)} ${reviewProgressText(false)}`, /minute/);
+  assert.match(reviewProgressText(true), /for the first time/);
+  assert.match(reviewProgressText(true), /few minutes/);
+  // Without the first-read hint, it does not promise a wait of minutes it has no basis for.
+  assert.doesNotMatch(reviewProgressText(false), /minute/);
 });
 
 test('only PENDING and RUNNING count as a review in progress', () => {

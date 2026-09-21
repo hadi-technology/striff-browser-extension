@@ -17,10 +17,11 @@
  * older API that still sends them. Several fixtures here are old-style responses: the panel must
  * render the same documented rules and review items for them, and nothing from the detectors.
  *
- * The second half covers the load itself: the review arrives with the diagram, so a load waits for
- * a running review and renders once, and the findings button opens the panel only on a click. It
- * drives the render the load paths share, with the review's status endpoint stubbed, and asserts
- * the order of status reads and renders, and what the button says in every review state.
+ * The second half covers the load itself: the diagram does not wait for the review, so a load
+ * renders once before reading any review status, the review is collected behind it, and the
+ * findings button opens the panel only on a click. It drives the render the load paths share, with
+ * the review's status endpoint stubbed, and asserts the order of status reads and renders, and what
+ * the button says in every review state.
  *
  * Needs a browser but no network and no GitHub login, unlike test:visual and test:live.
  *
@@ -324,7 +325,7 @@ const DETECTOR_TRACES = ['STRUCTURAL CHECKS', '✅ clean', '👀', '❗', 'obser
       if (state?.loading) S.__flow?.events.push(`loading:${state.phase}`);
       return updateStriffButton(state);
     };
-    S.__resetFlow = ({ replies = [], afterRender = null, budgetMs = 10000, timeoutMs = 20000 } = {}) => {
+    S.__resetFlow = ({ replies = [], afterRender = null, timeoutMs = 20000 } = {}) => {
       S.cancelReviewCollection('test');
       S.closeArchReviewPanel();
       S.__striffsReady = false;
@@ -334,13 +335,23 @@ const DETECTOR_TRACES = ['STRUCTURAL CHECKS', '✅ clean', '👀', '❗', 'obser
       view.innerHTML = S.getStriffsContainerMarkup('');
       view.style.display = 'block';
       S.setCurrentView('striffs');
-      S.REVIEW_WAIT_BUDGET_MS = budgetMs;
       S.REVIEW_COLLECTION_TIMEOUT_MS = timeoutMs;
       S.__flow = { events: [], replies, afterRender, reads: 0, readsAfterRender: 0 };
     };
     S.__startLoad = (scenario) => {
       S.__resetFlow(scenario);
       return S.renderStriffsResult(scenario.result, null);
+    };
+    // A load that began before the page moved on, as autoFetchStriffs runs it: the generation is
+    // captured up front and the result only arrives afterwards.
+    S.__startStaleLoad = async (scenario, how) => {
+      S.__resetFlow(scenario);
+      const generation = S.__reviewCollection;
+      if (how === 'pr-change') S.resetPrScopedState('test');
+      else S.__disabledByRemote = true;
+      await S.renderStriffsResult(scenario.result, null, { generation });
+      S.__disabledByRemote = false;
+      return S.__flowSnapshot();
     };
     S.__flowSnapshot = () => {
       const btn = document.getElementById('striffs-arch-review-btn');
@@ -350,6 +361,9 @@ const DETECTOR_TRACES = ['STRUCTURAL CHECKS', '✅ clean', '👀', '❗', 'obser
         text: String(btn?.textContent || '').trim(),
         title: String(btn?.title || ''),
         disabled: Boolean(btn?.disabled),
+        spinner: Boolean(btn?.querySelector('.striffs-running-indicator')),
+        busyClass: Boolean(btn?.classList.contains('is-busy')),
+        ariaBusy: String(btn?.getAttribute('aria-busy') || ''),
         hidden: !btn || btn.style.display === 'none',
         panelOpen: Boolean(document.querySelector('#striffs-arch-review-panel.striffs-arch-review-panel--open')),
         panelText: String(document.getElementById('striffs-arch-review-panel')?.innerText || '')
@@ -371,6 +385,13 @@ const DETECTOR_TRACES = ['STRUCTURAL CHECKS', '✅ clean', '👀', '❗', 'obser
   const waitForButton = (prefix, ms) => page.waitForFunction(
     (t) => String(document.getElementById('striffs-arch-review-btn')?.textContent || '').trim().startsWith(t),
     prefix, { timeout: ms }).then(() => true, () => false);
+  // The review is collected after the render, so a scenario that asserts on a finished review waits
+  // for it to land rather than reading the button the load itself left behind.
+  const loadSettled = async (scenario, expect) => {
+    await load(scenario);
+    await waitForButton(expect, 8000);
+    return snapshot();
+  };
   const renders = (s) => s.events.filter(e => e === 'render').length;
   // Status reads and renders, in order.
   const flow = (s) => s.events.filter(e => e === 'render' || e.startsWith('read:')).join(' ');
@@ -389,27 +410,60 @@ const DETECTOR_TRACES = ['STRUCTURAL CHECKS', '✅ clean', '👀', '❗', 'obser
     check('a second click closes it', !closed.panelOpen);
   }
 
-  console.log('\none load — review running, finishes inside the wait');
+  console.log('\nthe findings button spins only while the review is being read');
   {
     const s = await load({ result: analysis('PENDING'), replies: [reply('PENDING'), readyReply()] });
-    check('reads the review until it is ready, then renders once', flow(s) === 'read:PENDING read:READY render', flow(s));
-    const waiting = s.events.indexOf('loading:Reviewing');
-    check('the loading state covers the wait', waiting >= 0 && waiting < s.events.indexOf('render'), s.events.join(' '));
-    check('renders the review-complete diagram', s.diagram === 'reviewed', s.diagram);
-    check('the button shows the documented-rule count', s.text === 'Findings (4 rules)' && !s.disabled, s.text);
-    check('the panel does not open by itself', !s.panelOpen);
+    check('a running review shows a spinner', s.spinner, `${s.text} spinner=${s.spinner}`);
+    check('and is marked busy for assistive technology', s.busyClass && s.ariaBusy === 'true',
+      `${s.busyClass} ${s.ariaBusy}`);
+    check('the spinner adds no text of its own', s.text === 'Reading docs…', s.text);
+    // The button is refreshed on view changes and comment-mode toggles too. Rebuilding it then
+    // would restart the animation, so an update that changes nothing must leave the node alone.
+    const untouched = await page.evaluate(() => {
+      const btn = document.getElementById('striffs-arch-review-btn');
+      const before = btn.querySelector('.striffs-running-indicator');
+      window.Striffs.updateArchReviewButton();
+      return before === btn.querySelector('.striffs-running-indicator');
+    });
+    check('a no-op refresh does not restart the spinner', untouched);
+
+    await waitForButton('Findings (', 8000);
+    const after = await snapshot();
+    check('a finished review stops spinning', !after.spinner && !after.busyClass, after.text);
+    check('and drops aria-busy', after.ariaBusy === '', after.ariaBusy);
+
+    const failed = await loadSettled({ result: analysis('PENDING'), replies: [reply('FAILED')] }, 'Review failed');
+    check('a failed review does not keep spinning', !failed.spinner && !failed.busyClass, failed.text);
   }
 
-  console.log('\none load — review outlasts the wait, finishes in the background');
+  console.log('\none load — review running, arrives shortly after the render');
+  {
+    const s = await load({ result: analysis('PENDING'), replies: [reply('PENDING'), readyReply()] });
+    // The point of the whole path: the diagram does not wait on the review, so the render is the
+    // first thing that happens and no status read precedes it.
+    check('renders before reading the review at all', flow(s).startsWith('render'), flow(s));
+    check('renders once', renders(s) === 1, flow(s));
+    check('no loading phase for the review', !s.events.some(e => e.startsWith('loading:')), s.events.join(' '));
+    check('the button says the review is still running', s.text === 'Reading docs…' && s.disabled, s.text);
+    const arrived = await waitForButton('Findings (', 8000);
+    const after = await snapshot();
+    check('the button enables itself when the review lands', arrived && !after.disabled
+      && after.text === 'Findings (4 rules)', after.text);
+    // The status reply carries a diagram of its own; the one on screen is the analysis's and stays.
+    check('the diagram is not rendered again', renders(after) === 1 && after.diagram === 'base',
+      `${flow(after)} ${after.diagram}`);
+    check('the panel does not open by itself', !after.panelOpen);
+  }
+
+  console.log('\none load — first read of the repository\'s documents, which takes minutes');
   {
     const s = await load({
       result: analysis('PENDING', { aiReviewWarmupRequired: true }),
       replies: [reply('PENDING')],
-      afterRender: [reply('PENDING'), readyReply()],
-      budgetMs: 1500
+      afterRender: [reply('PENDING'), readyReply()]
     });
-    check('renders the analysis diagram when the wait runs out', renders(s) === 1 && s.diagram === 'base', `${flow(s)} ${s.diagram}`);
-    check('the loading state says the documents are read for the first time', s.events.includes('loading:Reading Docs'), s.events.join(' '));
+    check('renders the analysis diagram straight away', renders(s) === 1 && s.diagram === 'base', `${flow(s)} ${s.diagram}`);
+    check('the render waits on nothing', flow(s).startsWith('render'), flow(s));
     check('the button says the review is still running', s.text === 'Reading docs…', s.text);
     check('the button cannot be opened yet', s.disabled);
     check('the button uses the first-read wording', /for the first time/.test(s.title), s.title);
@@ -430,8 +484,8 @@ const DETECTOR_TRACES = ['STRUCTURAL CHECKS', '✅ clean', '👀', '❗', 'obser
 
   console.log('\none load — review never finishes');
   {
-    const s = await load({ result: analysis('PENDING'), replies: [reply('RUNNING')], budgetMs: 500, timeoutMs: 1500 });
-    check('renders the diagram when the wait runs out', renders(s) === 1, flow(s));
+    const s = await load({ result: analysis('PENDING'), replies: [reply('RUNNING')], timeoutMs: 1500 });
+    check('renders the diagram without waiting for the review', renders(s) === 1, flow(s));
     check('the button says the review is still running', s.text === 'Reading docs…' && s.disabled, s.text);
     const gaveUp = await waitForButton("Review didn't finish", 6000);
     const after = await snapshot();
@@ -449,9 +503,12 @@ const DETECTOR_TRACES = ['STRUCTURAL CHECKS', '✅ clean', '👀', '❗', 'obser
       result: analysis('PENDING'),
       replies: [reply('PENDING'), reply('FAILED', { aiReviewErrorMessage: 'The review model timed out.' })]
     });
-    check('a review that fails during the wait renders once', flow(during) === 'read:PENDING read:FAILED render', flow(during));
+    check('a review that fails after the render renders once', renders(during) === 1
+      && flow(during).startsWith('render'), flow(during));
     check('it keeps the analysis diagram', during.diagram === 'base', during.diagram);
-    check('the button says the review failed', during.text === 'Review failed' && during.disabled, during.text);
+    const failed = await waitForButton('Review failed', 6000);
+    const afterFail = await snapshot();
+    check('the button says the review failed', failed && afterFail.disabled, afterFail.text);
   }
 
   console.log('\none load — no review ran');
@@ -463,12 +520,14 @@ const DETECTOR_TRACES = ['STRUCTURAL CHECKS', '✅ clean', '👀', '❗', 'obser
     const none = await load({ result: analysis(undefined) });
     check('with no review status at all, says no review ran', none.text === 'No review' && none.disabled, none.text);
     const during = await load({ result: analysis('PENDING'), replies: [reply('SKIPPED')] });
-    check('a review skipped during the wait says no review ran', during.text === 'No review' && renders(during) === 1, during.text);
+    const said = await waitForButton('No review', 6000);
+    const afterSkip = await snapshot();
+    check('a review skipped after the render says no review ran', said && renders(afterSkip) === 1, afterSkip.text);
   }
 
   console.log('\none load — review finished, but checked no documented rules');
   {
-    const s = await load({ result: analysis('PENDING'), replies: [readyReply(QUIET)] });
+    const s = await loadSettled({ result: analysis('PENDING'), replies: [readyReply(QUIET)] }, 'Findings');
     check('the button carries no count', s.text === 'Findings' && !s.disabled, s.text);
     const opened = await clickFindings();
     check('the panel says no documented rules were checked', opened.panelText.includes('no documented rules were checked'));
@@ -477,13 +536,63 @@ const DETECTOR_TRACES = ['STRUCTURAL CHECKS', '✅ clean', '👀', '❗', 'obser
 
   console.log('\none load — review status refused');
   {
-    const s = await load({ result: analysis('PENDING'), replies: [{ ok: false, status: 403, error: 'HTTP 403' }] });
+    const s = await loadSettled({ result: analysis('PENDING'), replies: [{ ok: false, status: 403, error: 'HTTP 403' }] }, 'Review unavailable');
     check('renders once', renders(s) === 1, flow(s));
     check('the button says the review is unavailable', s.text === 'Review unavailable' && s.disabled, s.text);
   }
 
-  console.log('\none load — the page moves on during the wait');
+  console.log('\nthe findings button still opens after the panel node has been destroyed');
   {
+    // The panel lives inside the diagram view, so a move to another pull request rebuilds that view
+    // and takes the panel with it. Reported live as: the review finishes, the button enables, and
+    // clicking it does nothing until the page is reloaded.
+    const s = await load({ result: analysis('PENDING'), replies: [readyReply()] });
+    await waitForButton('Findings (', 8000);
+    // The delegated click listener used to stack up one per render, so this asserts the click
+    // actually toggles rather than firing an even number of times and cancelling itself out.
+    const opened = await clickFindings();
+    check('the panel opens the first time', opened.panelOpen);
+
+    const reopened = await page.evaluate(() => {
+      const S = window.Striffs;
+      // What a rebuild of the diagram view does to the open panel.
+      document.getElementById('striffs-arch-review-panel')?.remove();
+      S.toggleArchReviewPanel();
+      return Boolean(document.querySelector('#striffs-arch-review-panel.striffs-arch-review-panel--open'));
+    });
+    check('a click after the panel was destroyed opens it again, with no reload', reopened);
+
+    const closed = await clickFindings();
+    check('and it still closes on the next click', !closed.panelOpen);
+  }
+
+  console.log('\none load — the page moved on before the result arrived');
+  {
+    // The analysis can run for minutes. If the user moves to another pull request while it does,
+    // the result that finally lands describes the pull request they left, and must not be rendered
+    // onto the one they are looking at now.
+    const stale = (how) => page.evaluate(
+      ({ scenario, how }) => window.Striffs.__startStaleLoad(scenario, how),
+      { scenario: { result: analysis('READY', { ...CURRENT }) }, how });
+    const prChange = await stale('pr-change');
+    check('a move to another PR renders nothing', renders(prChange) === 0, prChange.events.join(' '));
+    check('and leaves no diagram behind', prChange.diagram === '', prChange.diagram);
+    const killed = await stale('kill-switch');
+    check('the remote kill switch renders nothing', renders(killed) === 0, killed.events.join(' '));
+    // A pending review must not start a collection either: it would read the old PR's review and
+    // lay it on the button of the new one.
+    const pending = await page.evaluate(
+      (scenario) => window.Striffs.__startStaleLoad(scenario, 'pr-change'),
+      { result: analysis('PENDING'), replies: [reply('PENDING'), readyReply()] });
+    check('and no review is collected for it', renders(pending) === 0
+      && pending.events.filter(e => e.startsWith('read:')).length === 0, pending.events.join(' '));
+  }
+
+  console.log('\none load — the page moves on while the review is being collected');
+  {
+    // The diagram no longer waits for the review, so by the time the page can move on it is
+    // already on screen. What must stop is the collection behind it: a review belonging to the PR
+    // the user left must not keep being read, nor land on the button they are looking at now.
     const moveOn = (how) => page.evaluate(async ({ scenario, how }) => {
       const S = window.Striffs;
       const done = S.__startLoad(scenario);
@@ -495,13 +604,15 @@ const DETECTOR_TRACES = ['STRUCTURAL CHECKS', '✅ clean', '👀', '❗', 'obser
       const snap = S.__flowSnapshot();
       S.__disabledByRemote = false;
       return snap;
-    }, { scenario: { result: analysis('PENDING'), replies: [reply('PENDING')] }, how });
+    }, { scenario: { result: analysis('PENDING'), replies: [reply('PENDING'), readyReply()] }, how });
+    const readsOf = (s) => s.events.filter(e => e.startsWith('read:')).length;
     const prChange = await moveOn('pr-change');
-    check('a move to another PR stops the wait and renders nothing', renders(prChange) === 0
-      && prChange.events.filter(e => e.startsWith('read:')).length === 1, prChange.events.join(' '));
+    check('a move to another PR stops the collection', readsOf(prChange) === 1, prChange.events.join(' '));
+    check('and the review that arrives after it is not shown', !prChange.text.startsWith('Findings ('),
+      prChange.text);
     const killed = await moveOn('kill-switch');
-    check('the remote kill switch stops the wait and renders nothing', renders(killed) === 0
-      && killed.events.filter(e => e.startsWith('read:')).length === 1, killed.events.join(' '));
+    check('the remote kill switch stops the collection', readsOf(killed) === 1, killed.events.join(' '));
+    check('and shows no review either', !killed.text.startsWith('Findings ('), killed.text);
     const hidden = await page.evaluate(async (result) => {
       const S = window.Striffs;
       await S.__startLoad({ result });
@@ -567,7 +678,7 @@ const DETECTOR_TRACES = ['STRUCTURAL CHECKS', '✅ clean', '👀', '❗', 'obser
     const broken = await render({ ...CURRENT, surfacedItems: [], findings: [], ...gaps });
     check('a broken rule still withholds it', !broken.text.includes('✓'), broken.text);
 
-    const loaded = await load({ result: analysis('PENDING', gaps), replies: [readyReply(CURRENT)] });
+    const loaded = await loadSettled({ result: analysis('PENDING', gaps), replies: [readyReply(CURRENT)] }, 'Findings (');
     check('the findings button counts only the rules shown', loaded.text === 'Findings (4 rules)' && !loaded.disabled, loaded.text);
     check('and its tooltip says nothing of what was not checked',
       !/could not be read|re-checked|unread/i.test(loaded.title), loaded.title);
@@ -623,7 +734,7 @@ const DETECTOR_TRACES = ['STRUCTURAL CHECKS', '✅ clean', '👀', '❗', 'obser
       && hostile.html.includes('&lt;script&gt;') && hostile.html.includes('&lt;iframe') && hostile.html.includes('&lt;img'));
 
     // The label and the clean/unclean state are untouched; the tooltip mentions the edit.
-    const kept = await load({ result: analysis('PENDING', { docRuleChanges: CHANGES }), replies: [readyReply(CURRENT)] });
+    const kept = await loadSettled({ result: analysis('PENDING', { docRuleChanges: CHANGES }), replies: [readyReply(CURRENT)] }, 'Findings (');
     check('the findings button reads as it would without the note', kept.text === 'Findings (4 rules)' && !kept.disabled, kept.text);
     check('its tooltip mentions the doc edit', /A doc edit retired 2 documented rules and restored 1\./.test(kept.title), kept.title);
     const opened = await clickFindings();

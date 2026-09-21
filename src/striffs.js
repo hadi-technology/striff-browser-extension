@@ -12,20 +12,15 @@
   // ---------- Constants / State ----------
   S.MAX_UNAUTH_ZIP_SIZE_MB = 50;
   S.CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
-  // How long a load waits for the architecture review before it shows the diagram without it. The
-  // server starts the review with every analysis, and unless it is reading a repository's documents
-  // for the first time the review lands close behind the diagram -- so waiting for it costs little
-  // and means the diagram arrives with its findings ready, rather than the findings turning up
-  // after it. A first read of a repository's documents takes minutes. Two and a half minutes
-  // covers much of that without holding back a finished diagram for the whole read; past it the
-  // diagram renders and the review keeps arriving in the background.
-  S.REVIEW_WAIT_BUDGET_MS = 150 * 1000;
-
-  // How long the review is collected at all, counted from when the wait began. Deliberately shorter
-  // than the server's own bound on a review: a button reading "Reading docs…" for a quarter of an
-  // hour is a worse outcome than an early "didn't finish", and the review is not lost when we stop
-  // waiting -- it completes server-side and the next load of the PR picks it up as READY.
-  S.REVIEW_COLLECTION_TIMEOUT_MS = 5 * 60 * 1000;
+  // How long the review is collected, counted from when the collection opened. A load no longer
+  // waits for the review before rendering -- the diagram goes up as soon as it arrives and this
+  // budget is spent entirely in the background -- so the cost of a long one is a findings button
+  // that reads "Reading docs…" for a while, not a diagram nobody can see. That is cheap enough to
+  // cover the reviews that actually occur: a first read of a repository's documents took 308s on
+  // JabRef, which the previous five-minute budget missed by seconds and reported as "didn't
+  // finish". Still bounded rather than endless, and nothing is lost at the bound -- the review
+  // completes server-side and the next load of the PR picks it up as READY.
+  S.REVIEW_COLLECTION_TIMEOUT_MS = 10 * 60 * 1000;
 
   // Derived from the constant rather than written out, so raising the budget to follow the server
   // cannot leave the message quoting a number that stopped being true.
@@ -83,7 +78,6 @@
   // it started with is still current.
   S.__reviewCollection = 0;
   S.__lastEnrichmentResult = null;
-  S.__archReviewPanelOpen = false;
   S.__supportedExtensionsForUi = S.__supportedExtensionsForUi ||
     (Array.isArray(S.DEFAULT_SUPPORTED_EXTS) ? [...S.DEFAULT_SUPPORTED_EXTS] : []);
   S.PAN_CLICK_DEBOUNCE_MS = 250;
@@ -962,14 +956,20 @@
 
   // ---------- Utils ----------
   S.sleep = (ms) => new Promise(r => setTimeout(r, ms));
-  // Stops any review collection in flight, including a load's wait for the review, which then renders
-  // nothing: whatever it would have rendered belongs to a page the user has left.
+  // Stops any review collection in flight, and invalidates any load that began before it: whatever
+  // that load would render belongs to a page the user has left.
   S.cancelReviewCollection = (reason = "") => {
     S.__reviewCollection += 1;
     if (reason && S.isDebug?.()) {
       S.cinfo?.("Review collection cancelled", { reason });
     }
   };
+
+  // Whether `generation` is still the one in force. A move to another pull request, a cache clear and
+  // the remote kill switch all bump the counter, so anything that began on an older generation --
+  // a load's result, a review being collected -- belongs to a page that is no longer on screen.
+  S.isReviewGenerationCurrent = (generation) =>
+    generation === S.__reviewCollection && !S.__disabledByRemote;
 
   // ---------- Cache clearing (per-page) ----------
   S.clearLocalDiagramCaches = async (opts = {}) => {
@@ -2513,6 +2513,29 @@
     opacity: 0.5;
     cursor: not-allowed;
   }
+  /* A review still being read is working, not spent: it keeps nearly full strength so the spinner
+     is legible, while staying un-clickable. The outcome states keep the flat 0.5 above. */
+  #striffs-arch-review-btn:disabled.is-busy{
+    opacity: 0.9;
+  }
+  /* The shared indicator is amber on a light button; this one sits on solid blue, so it draws
+     itself in the button's own text colour instead. */
+  .striffs-running-indicator--on-accent{
+    margin-right: 0;
+    width: 12px;
+    height: 12px;
+    flex: 0 0 12px;
+  }
+  .striffs-running-indicator--on-accent::before{
+    border-top-color: currentColor;
+    border-right-color: color-mix(in srgb, currentColor 45%, transparent);
+  }
+  .striffs-running-indicator--on-accent .striffs-running-indicator__dot{
+    width: 4px;
+    height: 4px;
+    background: currentColor;
+    box-shadow: none;
+  }
   #striffs-scroll{
     position: relative;
     flex: 1 1 auto;
@@ -2912,7 +2935,18 @@
         };
         if (!striffView.__striffsZoomBound || !striffView.__striffsZoomBoundScrollEl || !striffView.contains(striffView.__striffsZoomBoundScrollEl)) {
             striffView.__striffsZoomBound = true;
-            striffView.addEventListener('click', (event) => {
+            // The re-bind below used to leave the previous listener in place. The scroll element is
+            // replaced when the container's markup is rewritten -- which is what this guard detects
+            // -- but striffView itself survives, so every re-render added another click listener
+            // beside the last. A delegated click then ran the handler once per listener: harmless
+            // for zoom-reset and download, which do the same thing however often they run, but the
+            // findings button toggles, so an even number of listeners opened the panel and closed it
+            // again within the one click. The button appeared dead, and only a reload -- which built
+            // a fresh view with a single listener -- brought it back.
+            if (striffView.__striffsViewClickHandler) {
+                striffView.removeEventListener('click', striffView.__striffsViewClickHandler);
+            }
+            striffView.__striffsViewClickHandler = (event) => {
                 const target = event?.target;
                 if (!(target instanceof Element)) return;
                 if (target.closest?.('#striffs-zoom-reset')) {
@@ -2923,10 +2957,12 @@
                     runDownloadAction();
                 }
                 if (target.closest?.('#striffs-arch-review-btn')) {
-                    // The review arrives with the diagram, so the button only opens and closes it.
+                    // The review lands on the button behind the diagram, so the button only opens
+                    // and closes what has already arrived.
                     if (S.__aiReviewStatus === "READY") S.toggleArchReviewPanel?.();
                 }
-            });
+            };
+            striffView.addEventListener('click', striffView.__striffsViewClickHandler);
             let isPanning = false;
             let panStartX = 0;
             let panStartY = 0;
@@ -8202,7 +8238,6 @@
         s.style.transition = "margin-right .25s ease";
       });
     }
-    S.__archReviewPanelOpen = true;
   };
 
   S.closeArchReviewPanel = function closeArchReviewPanel() {
@@ -8216,11 +8251,24 @@
         s.style.marginRight = "";
       });
     }
-    S.__archReviewPanelOpen = false;
   };
 
+  /**
+   * Whether the panel is open, read from the panel itself rather than remembered.
+   *
+   * The panel is a child of the diagram view, so everything that rebuilds that view -- a move to
+   * another pull request, a cache clear, a fresh render -- takes the panel with it. A boolean left
+   * over from the last time it was opened then said "open" about a node that no longer existed, and
+   * the findings button spent every click trying to close it: nothing happened, and nothing ever
+   * would, because closing bails out early when there is no panel and so never cleared the flag
+   * either. Only a reload fixed it, by rebuilding the state the flag lived in.
+   */
+  S.isArchReviewPanelOpen = () => Boolean(
+    document.getElementById(ARCH_PANEL_ID)?.classList.contains("striffs-arch-review-panel--open")
+  );
+
   S.toggleArchReviewPanel = function toggleArchReviewPanel() {
-    if (S.__archReviewPanelOpen) {
+    if (S.isArchReviewPanelOpen()) {
       S.closeArchReviewPanel?.();
     } else {
       S.openArchReviewPanel?.();
@@ -8244,10 +8292,36 @@
       warmup: S.__aiReviewWarmupRequired,
       reason: S.__aiReviewReason
     });
+    const busy = state.busy === true;
     btn.style.display = "";
-    btn.textContent = state.text;
     btn.title = state.title;
     btn.disabled = !state.enabled || Boolean(S.__commentState?.active);
+    btn.classList.toggle("is-busy", busy);
+    // The label already says the review is running; aria-busy says it to assistive technology
+    // without the text having to change on every poll.
+    if (busy) btn.setAttribute("aria-busy", "true");
+    else btn.removeAttribute("aria-busy");
+
+    // Rewriting the button's contents restarts the spinner's animation from its first frame, and
+    // this function runs on every view change and comment-mode toggle as well as on a review
+    // landing -- so the contents are replaced only when they actually differ. Rebuilding
+    // unconditionally left the spinner stuttering back to the top instead of turning.
+    if (btn.dataset.striffsLabel === state.text && (btn.dataset.striffsBusy === "1") === busy) return;
+    btn.dataset.striffsLabel = state.text;
+    btn.dataset.striffsBusy = busy ? "1" : "0";
+    btn.textContent = "";
+    if (busy) {
+      // Nodes rather than markup, and decorative: the label stays the button's only text, so
+      // textContent still reads exactly as the state's label for anything that inspects it.
+      const indicator = document.createElement("span");
+      indicator.className = "striffs-running-indicator striffs-running-indicator--on-accent";
+      indicator.setAttribute("aria-hidden", "true");
+      const dot = document.createElement("span");
+      dot.className = "striffs-running-indicator__dot";
+      indicator.appendChild(dot);
+      btn.appendChild(indicator);
+    }
+    btn.appendChild(document.createTextNode(state.text));
   };
 
   /**
@@ -8267,10 +8341,13 @@
    * Opens a collection of the review the server started with this analysis. It never starts or
    * requests a review: it reads the operation's review status, and stops when the review ends, its
    * deadline passes, or the page moves on (another PR, a new load, the remote kill switch).
+   *
+   * `generation` is the load's, so the collection is tied to the load that began it rather than to
+   * the moment it was opened. Capturing it here instead would re-validate a load the page had
+   * already moved past, and then collect its review onto the pull request the user moved to.
    */
-  async function openReviewCollection(meta) {
-    const generation = S.__reviewCollection;
-    const isCurrent = () => generation === S.__reviewCollection && !S.__disabledByRemote;
+  async function openReviewCollection(meta, generation = S.__reviewCollection) {
+    const isCurrent = () => S.isReviewGenerationCurrent(generation);
     const context = () => ({
       operationId: String(S.__operationTokenCtx?.operationId || "").trim(),
       operationToken: String(S.__operationTokenCtx?.operationAccessToken || "").trim()
@@ -8298,10 +8375,10 @@
   }
 
   /**
-   * The fallback: the review outlasted the wait, so the diagram is on screen with the review marked
-   * as still running, and the review keeps arriving here with no action from the user. Only the
-   * findings button and the panel's data change. The diagram does not carry the review, so it is not
-   * rendered again.
+   * Where every running review is collected: the diagram is already on screen with the review marked
+   * as still running, and the review arrives here with no action from the user. Only the findings
+   * button and the panel's data change. The diagram does not carry the review, so it is not rendered
+   * again.
    */
   async function finishReviewInBackground(collection, analysis, meta) {
     const review = await collection.collect(S.REVIEW_COLLECTION_TIMEOUT_MS);
@@ -9215,12 +9292,17 @@
   }
   S.refreshOperationTokenFromFreshResult = refreshOperationTokenFromFreshResult;
 
-  async function renderStriffsResult(result, meta, { fromCache = false } = {}) {
+  async function renderStriffsResult(result, meta, { fromCache = false, generation = S.__reviewCollection } = {}) {
     const updated_at = meta?.updated_at;
     const validationError = S.getStriffsResultValidationError?.(result);
     if (validationError) {
       throw new Error(validationError);
     }
+    // The page moved on while this result was being fetched -- an analysis can run for minutes -- so
+    // it describes a pull request the user has left. Checked here, before anything is written to the
+    // page, the operation-token context or the cache: every one of those would otherwise be the
+    // previous pull request's, laid over the one on screen now.
+    if (!S.isReviewGenerationCurrent(generation)) return;
     const operationTokenReady = S.updateOperationTokenFromResult?.(result);
     const analysisStatus = S.syncAiReviewStateFromResult?.(result);
     S.debugDump?.("render result payload summary", {
@@ -9241,24 +9323,22 @@
       return;
     }
 
-    // One load, one render. The server starts the architecture review with every analysis; while it
-    // is still running, keep loading and wait for it -- up to REVIEW_WAIT_BUDGET_MS -- so the diagram
-    // renders once, with its findings ready behind the findings button.
+    // One load, one render, and the render never waits for the review. The server starts the
+    // architecture review with every analysis and it is far the slower of the two: on JabRef the
+    // analysis was ready in 26s and the review took 308s. Holding the finished diagram back for it
+    // made the review's length the load's length, which is what a load "taking forever" was. The
+    // diagram now renders as soon as it arrives and the review is collected behind it, enabling the
+    // findings button when it lands.
     let review = { status: analysisStatus, result: null };
     let collection = null;
     if (ReviewState.isReviewPending(analysisStatus)) {
-      const warmup = result?.aiReviewWarmupRequired === true;
-      S.updateStriffButton({
-        loading: true,
-        phase: warmup ? "Reading Docs" : "Reviewing",
-        tooltip: ReviewState.reviewWaitingText(warmup)
-      });
-      collection = await openReviewCollection(meta);
-      if (!collection.isCurrent()) review = { status: "CANCELLED", result: null };
-      else if (!collection.available) review = { status: "UNAVAILABLE", result: null };
-      else review = await collection.collect(S.REVIEW_WAIT_BUDGET_MS);
-      // The page moved on while we waited: what we would render belongs to a page the user left.
-      if (review.status === "CANCELLED") return;
+      collection = await openReviewCollection(meta, generation);
+      // Opening the collection can go to the network for a missing access token; the page may have
+      // moved on while it did.
+      if (!collection.isCurrent()) return;
+      review = collection.available
+        ? { status: "PENDING", result: null }
+        : { status: "UNAVAILABLE", result: null };
     } else if (!operationTokenReady) {
       S.cwarn?.('Operation access token not available for this response');
       // The initial response can omit the access token even when an operationId is present (the
@@ -9294,8 +9374,8 @@
     S.setAutoGenerateIntent?.(true);
     S.setReviewState(review.status, loaded);
     S.updateStriffButton({ success: true, tooltip: "Striffs loaded. Click to view." });
-    // The fallback: the review outlasted the wait, so it keeps arriving in the background and the
-    // findings button enables itself when it lands.
+    // The review is slower than the diagram, so it arrives here rather than before the render, and
+    // the findings button enables itself when it lands.
     if (review.status === "PENDING" && collection?.available) {
       finishReviewInBackground(collection, loaded, meta)
         .catch((e) => S.cwarn?.('Background review collection failed', e));
@@ -9307,6 +9387,10 @@
     // A load already in flight is this load; only a new one supersedes the previous one's review.
     if (S.__autoFetchPromise) return S.__autoFetchPromise;
     S.cancelReviewCollection?.("auto-fetch");
+    // Captured before the fetch, not after it. The fetch below can run for minutes, and a move to
+    // another pull request during it must invalidate whatever it returns; a generation read after
+    // the fetch would already carry that move and call the stale result current.
+    const loadGeneration = S.__reviewCollection;
     S.__autoFetchPromise = (async () => {
       let terminalErrorMessage = "";
       let skipReconcile = false; // Flag to skip reconcile in finally block
@@ -9352,7 +9436,7 @@
           result = await requestPrimary(meta, token);
         }
 
-        await renderStriffsResult(result, meta, { fromCache });
+        await renderStriffsResult(result, meta, { fromCache, generation: loadGeneration });
 
         // Ensure diff map is built before we continue
         if (diffMapPromise) await diffMapPromise;
@@ -9748,6 +9832,18 @@
           };
           const archButton = () => document.getElementById('striffs-arch-review-btn');
           const panelIsOpen = () => Boolean(document.querySelector('#striffs-arch-review-panel.striffs-arch-review-panel--open'));
+          // The load renders and returns while the review is still running, so the review's own
+          // outcome arrives after it. Waiting for a terminal status here is what the old blocking
+          // render used to do inside renderStriffsResult.
+          const TERMINAL = new Set(['READY', 'FAILED', 'SKIPPED', 'TIMED_OUT', 'UNAVAILABLE']);
+          const waitForReview = async (timeoutMs = 15000) => {
+            const deadline = Date.now() + timeoutMs;
+            while (Date.now() < deadline) {
+              if (TERMINAL.has(String(S.__aiReviewStatus || '').toUpperCase())) return true;
+              await S.sleep(100);
+            }
+            return false;
+          };
           // A load of the pending analysis, with the review's status endpoint answering `replies` in turn.
           const loadWith = async (replies) => {
             renders = 0;
@@ -9760,8 +9856,11 @@
             };
             S.closeArchReviewPanel?.();
             await renderStriffsResult(pendingResult, meta);
+            const renderedBeforeReview = renders;
+            await waitForReview();
             S.showStriffView?.();
             return {
+              rendersBeforeReview: renderedBeforeReview,
               renders,
               pollsBeforeRender: readsBeforeRender,
               status: String(S.__aiReviewStatus || ''),

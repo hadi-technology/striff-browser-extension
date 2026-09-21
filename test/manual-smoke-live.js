@@ -108,15 +108,10 @@ const storageStatePath = (process.env.GITHUB_STORAGE_STATE_PATH || '').trim();
 const GH_TEST_USER = (process.env.GH_TEST_USER || '').trim();
 const GH_TEST_PASS = (process.env.GH_TEST_PASS || '').trim();
 const NAVIGATION_TIMEOUT_MS = Number(envOr('NAVIGATION_TIMEOUT_MS', '30000'));
-// A load stays open until the architecture review is in, for up to the extension's review wait
-// budget, so a wait for a first render has to outlast that budget plus the analysis itself. Read
-// from the extension's source rather than restated, so the two cannot drift apart.
-const REVIEW_WAIT_BUDGET_MS = (() => {
-  const source = fs.readFileSync(path.resolve(__dirname, '..', 'src', 'striffs.js'), 'utf8');
-  const m = source.match(/S\.REVIEW_WAIT_BUDGET_MS = (\d+) \* 1000;/);
-  return m ? Number(m[1]) * 1000 : 150000;
-})();
-const FIRST_RENDER_TIMEOUT_MS = Number(envOr('FIRST_RENDER_TIMEOUT_MS', String(REVIEW_WAIT_BUDGET_MS + 90000)));
+// A load no longer waits for the architecture review, so a first render has to outlast the analysis
+// alone: the base download, the upload, and the queued analysis itself, which has been measured at
+// 177-483s. The review lands on the findings button afterwards and is waited for separately.
+const FIRST_RENDER_TIMEOUT_MS = Number(envOr('FIRST_RENDER_TIMEOUT_MS', '240000'));
 
 const normalizePullRequestUrl = (url, useNewUi) => {
   if (!url) return url;
@@ -2675,13 +2670,15 @@ const setRemoteConfigUrlData = async (jsonObj) => {
     }
     pass('No manual "AI Review" trigger remains');
 
-    // A review reported as running is waited for, and the diagram renders once, from the review.
+    // A review reported as running does NOT hold the diagram back: the render happens before any
+    // review status is read, once, and the review lands on the findings button afterwards.
     if (!result.readyOutcome?.ok || result.readyOutcome?.renders !== 1
-      || result.readyOutcome?.pollsBeforeRender < 2) {
-      fail(`Running review was not waited for before a single render (${JSON.stringify(result.readyOutcome)})`);
+      || result.readyOutcome?.rendersBeforeReview !== 1
+      || result.readyOutcome?.pollsBeforeRender !== 0) {
+      fail(`Diagram did not render once, ahead of the review (${JSON.stringify(result.readyOutcome)})`);
       return false;
     }
-    pass('A running review is waited for, and the diagram renders once, from the review');
+    pass('A running review does not delay the diagram: it renders once, before any review read');
 
     // The button counts documented rules, not problems, so it reads "Findings (N rules)".
     if (!/^Findings \(\d+ rules?\)$/.test(result.readyOutcome?.archBtnText || '')) {

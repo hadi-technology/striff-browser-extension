@@ -21,15 +21,10 @@
     return Number.isFinite(n) && n > 0 ? Math.max(MIN_POLL_DELAY_MS, n) : DEFAULT_POLL_DELAY_MS;
   };
 
-  // What to say while a review is running. The server says when it has not read this repository's
-  // documents yet, which is the case that takes minutes rather than seconds; only some responses
-  // carry that hint, so without it the wording promises no particular length of wait.
-  //
-  // reviewWaitingText is the Striffs button's while a load waits for the review;
-  // reviewProgressText is the findings button's once the diagram shows without it.
-  const reviewWaitingText = (warmup) => (warmup === true
-    ? WARMUP_TEXT
-    : 'Waiting for the architecture review, so the diagram arrives with its findings.');
+  // What the findings button says while a review is running. A load never waits for the review, so
+  // this is the only place a running review is reported. The server says when it has not read this
+  // repository's documents yet, which is the case that takes minutes rather than seconds; only some
+  // responses carry that hint, so without it the wording promises no particular length of wait.
   const reviewProgressText = (warmup) => (warmup === true
     ? WARMUP_TEXT
     : 'The architecture review is still running. Its findings will appear here when it finishes.');
@@ -117,6 +112,11 @@
    *
    * status is the server's review status, or one of the two this extension records itself:
    * TIMED_OUT (it stopped waiting) and UNAVAILABLE (it could not read the review).
+   *
+   * `busy` marks the one state that is still going somewhere -- a review being read right now --
+   * which the button shows as a spinner. It is decided here rather than in the DOM so that "still
+   * running" has one definition, the same one `isReviewPending` uses. Every other state is an
+   * outcome: disabled and busy are not the same thing, and a failed review must not keep spinning.
    */
   function reviewButtonState({ status, ruleCount = 0, retiredCount = 0, restoredCount = 0, warmup = false, reason = null } = {}) {
     const s = normalizeStatus(status);
@@ -131,22 +131,22 @@
       // label, and not whether the result reads as clean.
       const changes = docRuleChangesText(retiredCount, restoredCount);
       const title = changes ? `${base.replace(/\.?$/, '.')} ${changes}.` : base;
-      return { text: n > 0 ? `Findings (${n} rule${n === 1 ? '' : 's'})` : 'Findings', enabled: true, title };
+      return { text: n > 0 ? `Findings (${n} rule${n === 1 ? '' : 's'})` : 'Findings', enabled: true, busy: false, title };
     }
     if (PENDING_STATUSES.has(s)) {
-      return { text: 'Reading docs…', enabled: false, title: reviewProgressText(warmup) };
+      return { text: 'Reading docs…', enabled: false, busy: true, title: reviewProgressText(warmup) };
     }
     if (s === 'FAILED') {
-      return { text: 'Review failed', enabled: false, title: why || 'The architecture review failed. The diagram is still available.' };
+      return { text: 'Review failed', enabled: false, busy: false, title: why || 'The architecture review failed. The diagram is still available.' };
     }
     if (s === 'TIMED_OUT') {
-      return { text: "Review didn't finish", enabled: false, title: 'The review is still running on the server. Reload the page to pick it up once it finishes.' };
+      return { text: "Review didn't finish", enabled: false, busy: false, title: 'The review is still running on the server. Reload the page to pick it up once it finishes.' };
     }
     if (s === 'UNAVAILABLE') {
-      return { text: 'Review unavailable', enabled: false, title: why || 'The architecture review for this analysis could not be read. Reload the page to try again.' };
+      return { text: 'Review unavailable', enabled: false, busy: false, title: why || 'The architecture review for this analysis could not be read. Reload the page to try again.' };
     }
     // SKIPPED, or no review at all.
-    return { text: 'No review', enabled: false, title: why || 'No architecture review ran for this pull request.' };
+    return { text: 'No review', enabled: false, busy: false, title: why || 'No architecture review ran for this pull request.' };
   }
 
   const api = {
@@ -155,7 +155,6 @@
     mergeReviewResult,
     reviewButtonState,
     reviewProgressText,
-    reviewWaitingText,
     docRuleChangesText
   };
 

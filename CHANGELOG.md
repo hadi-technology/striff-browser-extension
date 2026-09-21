@@ -2,6 +2,30 @@
 
 ## 1.4.0
 
+- The diagram no longer waits for the architecture review. It used to be held back for up to two and
+  a half minutes so it could arrive with its findings, which on a large repository made the review's
+  length the load's length — on JabRef the analysis was ready in 26 seconds and the review took 308.
+  The diagram now appears as soon as it is ready, and the review is collected behind it: the findings
+  button reads "Reading docs…" while it runs and enables itself when it lands, with no reload.
+- The architecture review is now collected for ten minutes rather than five. Nothing waits on the
+  diagram any more, so a long review costs a findings button that says it is still running instead of
+  a diagram nobody can see — and a first read of a large repository's documents no longer just misses
+  the budget and reports "Review didn't finish".
+- The findings button works after the first pull request viewed in a tab. The diagram view kept the
+  click listener it was given on every render, so a second render left two listeners on it, a third
+  three, and a delegated click ran the handler once per listener. Zoom-reset and download did not
+  care, but the findings button toggles the review panel: an even number of listeners opened it and
+  closed it again within the same click, so it looked dead until the page was reloaded.
+- The review panel also no longer loses track of itself. Whether it is open is now read from the
+  panel, not remembered in a flag that outlived the panel whenever the diagram view was rebuilt.
+- The findings button now spins while the architecture review is being read, instead of sitting
+  still on "Reading docs…" with nothing to say whether anything was happening. Only a review still
+  running spins: a failed, skipped or timed-out one is an outcome, not work in progress.
+- Moving to another pull request while a diagram is still being generated no longer lets the old
+  one land on the new page. An analysis can run for minutes, and a move during it left the result
+  that finally arrived looking current: it rendered the previous pull request's diagram, and its
+  operation token and cache entry, over the one on screen. A load is now tied to the pull request it
+  began on and its result is discarded if that changes.
 - On a private repository with no GitHub token set, the Striffs button's tooltip now says the token
   is required because the repository is private, instead of a bare "Token required".
 
