@@ -6808,97 +6808,6 @@
         left:0;
         color:var(--fgColor-muted,#6e7781);
       }
-      .striffs-arch-review-panel__item{
-        display:flex;
-        flex-direction:column;
-        gap:8px;
-        padding:14px 15px;
-        border:1px solid rgba(15,23,42,.08);
-        border-radius:10px;
-        margin-bottom:10px;
-        background:#f8fafc;
-      }
-      .striffs-arch-review-panel__item--HIGH,
-      .striffs-arch-review-panel__item--CRITICAL{
-        border-color:rgba(207,34,46,.15);
-        background:#fef2f2;
-      }
-      .striffs-arch-review-panel__item--MEDIUM{
-        border-color:rgba(154,103,0,.15);
-        background:#fffbeb;
-      }
-      /* Doc conflicts get their own colour rather than a severity tint -- "your own docs say
-         otherwise" is a different kind of claim than "this looks risky", and the distinction
-         is the whole point of the signal. */
-      .striffs-arch-review-panel__item--DOC{
-        border-color:rgba(130,80,223,.2);
-        background:#faf5ff;
-      }
-      .striffs-arch-review-panel__item-header{
-        display:flex;
-        align-items:center;
-        gap:8px;
-        min-width:0;
-      }
-      .striffs-arch-review-panel__item-severity{
-        display:inline-flex;
-        align-items:center;
-        gap:4px;
-        padding:4px 11px;
-        border-radius:999px;
-        font-size:12px;
-        font-weight:800;
-        text-transform:uppercase;
-        letter-spacing:.05em;
-        flex-shrink:0;
-      }
-      #striff-diagram-view .striffs-arch-review-panel__item-severity-icon{
-        width:12px;
-        height:12px;
-        flex-shrink:0;
-      }
-      .striffs-arch-review-panel__code{
-        font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",Menlo,monospace;
-        font-weight:700;
-        font-size:85%;
-        background:rgba(175,184,193,.2);
-        padding:.1em .4em;
-        border-radius:6px;
-        white-space:break-spaces;
-      }
-      .striffs-arch-review-panel__item-severity--HIGH,
-      .striffs-arch-review-panel__item-severity--CRITICAL{background:rgba(207,34,46,.1);color:#cf222e;}
-      .striffs-arch-review-panel__item-severity--MEDIUM{background:rgba(154,103,0,.1);color:#92400e;}
-      .striffs-arch-review-panel__item-severity--LOW{background:rgba(26,127,55,.1);color:#1a7f37;}
-      .striffs-arch-review-panel__item-severity--DOC{background:rgba(130,80,223,.1);color:#8250df;}
-      .striffs-arch-review-panel__item-docs{
-        font-size:15px;
-        line-height:1.6;
-        color:#8250df;
-        margin-top:4px;
-      }
-      .striffs-arch-review-panel__item-body{
-        min-width:0;
-      }
-      .striffs-arch-review-panel__item-title{
-        font-weight:700;
-        font-size:16px;
-        line-height:1.35;
-        color:var(--fgColor-default,#1f2328);
-        min-width:0;
-      }
-      .striffs-arch-review-panel__item-text{
-        font-size:15px;
-        line-height:1.6;
-        color:var(--fgColor-muted,#6e7781);
-        margin-top:4px;
-      }
-      .striffs-arch-review-panel__item-action{
-        font-size:15px;
-        line-height:1.6;
-        color:var(--fgColor-accent,#0969da);
-        margin-top:4px;
-      }
       .striffs-arch-review-panel__good{
         text-align:center;
         padding:32px 16px;
@@ -7884,25 +7793,6 @@
     return d.innerHTML;
   }
 
-  const SEVERITY_ICON_SVG = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" class="striffs-arch-review-panel__item-severity-icon"><path d="M8 1L1 14h14L8 1z"/><path d="M8 6v4M8 12h.01"/></svg>';
-
-  const DOC_CONFLICT_ICON_SVG = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" class="striffs-arch-review-panel__item-severity-icon"><path d="M9.5 1.5H4a1 1 0 0 0-1 1v11a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V5L9.5 1.5z"/><path d="M9.5 1.5V5H13"/></svg>';
-  const DOC_CONFLICT_LABEL = "Doc Conflict";
-
-  // SurfacedReviewItem.priority is a canonical label (ADR-015: no P1/P2/P3 codes), not a
-  // HIGH/MEDIUM/LOW severity tier. Map it to a severity tier for badge styling while keeping
-  // the canonical label as the badge text.
-  const SURFACED_PRIORITY_SEVERITY = {
-    STRUCTURAL_REGRESSION: "HIGH",
-    REVIEW_HOTSPOT: "MEDIUM",
-    INFORMATIONAL_SIGNAL: "LOW"
-  };
-  const SURFACED_PRIORITY_LABEL = {
-    STRUCTURAL_REGRESSION: "Structural Regression",
-    REVIEW_HOTSPOT: "Review Hotspot",
-    INFORMATIONAL_SIGNAL: "Informational Signal"
-  };
-
   function escHtmlWithCode(s) {
     return escHtml(s).replace(/`([^`]+)`/g, '<code class="striffs-arch-review-panel__code">$1</code>');
   }
@@ -8083,21 +7973,11 @@
 
   function buildArchReviewPanelHtml(result) {
     const summary = result?.reviewSummary || {};
-    const surfacedItems = Array.isArray(result?.surfacedItems) ? result.surfacedItems : [];
-
-    const extensionItems = surfacedItems
-      .filter(i => i.showInExtension !== false)
-      // Doc conflicts sort to the front: the repo's own documentation contradicting the change
-      // is the highest-trust signal available, so it never sits below a lower-trust item. Same
-      // rule the GitHub check run applies (CheckRunFormatter), so both surfaces lead with the
-      // same item. sort() is stable, so the server's rank order holds within each group.
-      .sort((a, b) => Number(b.docConflict === true) - Number(a.docConflict === true));
-
     let bodyHtml = "";
 
     // Overview is narrative, not a finding. striff-api keeps facts and narrative in disjoint
-    // regions (ADR-023) and this panel does the same -- the overview renders alongside items
-    // and never as one, so it shows whether or not anything surfaced.
+    // regions (ADR-023) and this panel does the same -- the overview renders alongside the rules
+    // and never as one, so it shows whether or not anything was checked.
     if (summary.overview) {
       bodyHtml += `<div class="striffs-arch-review-panel__section">
         <div class="striffs-arch-review-panel__section-title">Overview</div>
@@ -8105,86 +7985,48 @@
       </div>`;
     }
 
-    if (extensionItems.length > 0) {
-      bodyHtml += `<div class="striffs-arch-review-panel__section">
-        <div class="striffs-arch-review-panel__section-title">Review Items</div>
-        ${extensionItems.map(item => {
-          const isDocConflict = item.docConflict === true;
-          const rawPriority = String(item.priority || "").toUpperCase();
-          const severity = SURFACED_PRIORITY_SEVERITY[rawPriority]
-            || String(item.priority || item.severity || "LOW").toUpperCase();
-          const sevClass = ["HIGH","CRITICAL"].includes(severity) ? severity : severity === "MEDIUM" ? "MEDIUM" : "LOW";
-          // A doc conflict replaces the priority badge instead of sitting beside it, so the
-          // reviewer reads "your own docs say otherwise" before any severity wording.
-          const styleClass = isDocConflict ? "DOC" : sevClass;
-          const badgeLabel = isDocConflict ? DOC_CONFLICT_LABEL : (SURFACED_PRIORITY_LABEL[rawPriority] || sevClass);
-          const badgeIcon = isDocConflict ? DOC_CONFLICT_ICON_SVG : SEVERITY_ICON_SVG;
-          // Short basenames, never full repo paths -- the API sends them pre-shortened.
-          const conflictingDocs = isDocConflict && Array.isArray(item.conflictingDocs)
-            ? item.conflictingDocs.filter(Boolean)
-            : [];
-          return `<div class="striffs-arch-review-panel__item striffs-arch-review-panel__item--${styleClass}">
-            <div class="striffs-arch-review-panel__item-header">
-              <span class="striffs-arch-review-panel__item-severity striffs-arch-review-panel__item-severity--${styleClass}">${badgeIcon}${badgeLabel}</span>
-            </div>
-            <div class="striffs-arch-review-panel__item-title">${escHtmlWithCode(item.title || "") || ""}</div>
-            <div class="striffs-arch-review-panel__item-body">
-              ${conflictingDocs.length ? `<div class="striffs-arch-review-panel__item-docs">Conflicts with ${conflictingDocs.map(doc => `<code class="striffs-arch-review-panel__code">${escHtml(doc)}</code>`).join(", ")}</div>` : ""}
-              ${item.whyShown ? `<div class="striffs-arch-review-panel__item-text">${escHtmlWithCode(item.whyShown) || ""}</div>` : ""}
-              ${item.reviewAction ? `<div class="striffs-arch-review-panel__item-action">→ ${escHtmlWithCode(item.reviewAction) || ""}</div>` : ""}
-              ${item.suggestedDirection && item.suggestedDirection !== item.reviewAction ? `<div class="striffs-arch-review-panel__item-action">💡 ${escHtmlWithCode(item.suggestedDirection) || ""}</div>` : ""}
-            </div>
-          </div>`;
-        }).join("")}
-      </div>`;
-    } else {
-      // An empty item list is a real "nothing to flag" result, not a gap to backfill: items are
-      // the server's surfacing decision, and an empty review is a legitimate outcome.
-      //
-      // Findings are never rendered here. The ones worth showing arrive as items, and every
-      // documented rule is shown again as a verdict in its own section below. Older API versions
-      // also send structural-detector findings in the same array; those are neither shown nor
-      // counted. Counting documented-rule findings is still what keeps the empty state honest: one
-      // held below the surfacing gate means "nothing met the bar to show you", not "nothing found".
-      const heldBack = docRuleFindings(result).length;
-      // Rules the review could not check are not shown, so they are not counted here either.
-      const verdictCount = shownVerdicts(result).length;
-      if (!reviewRan(result)) {
-        // Nothing was checked, so no cleanliness claim is available to make: "we found nothing"
-        // against an analysis that never ran is a green tick nobody earned, in the one place a
-        // reviewer would most trust it.
-        bodyHtml += `<div class="striffs-arch-review-panel__good">
+    // Surfaced review items were removed in 1.5.0. The analysis stopped populating them -- every
+    // review arrived with an empty list -- so the only thing the section ever produced was a
+    // banner announcing its own emptiness, directly above the documented rules that carry the
+    // actual result. The rules are the review now.
+    //
+    // The two states kept below are the ones that say something a reader could not otherwise
+    // know. "No review recorded" distinguishes a review that never ran from one that ran and
+    // found nothing, which is the one claim this panel must never blur. "Nothing surfaced for
+    // review" reports documented-rule findings that were recorded but held below the bar, which
+    // is not the same as there being none. A review that ran and simply has rules to show adds
+    // no banner at all: the rules speak for themselves.
+    const heldBack = docRuleFindings(result).length;
+    if (!reviewRan(result)) {
+      bodyHtml += `<div class="striffs-arch-review-panel__good">
         <div class="striffs-arch-review-panel__good-icon">–</div>
         <div style="font-size:15px;font-weight:600;margin-bottom:6px;">No review recorded</div>
         <div>No review is available for this changeset, so there is nothing to report either way.</div>
       </div>`;
-      } else if (heldBack > 0) {
-        bodyHtml += `<div class="striffs-arch-review-panel__good">
+    } else if (heldBack > 0) {
+      bodyHtml += `<div class="striffs-arch-review-panel__good">
         <div class="striffs-arch-review-panel__good-icon">✓</div>
         <div style="font-size:15px;font-weight:600;margin-bottom:6px;">Nothing surfaced for review</div>
         <div>${heldBack === 1
           ? "1 documented-rule finding was recorded, but it did not meet the bar to raise here."
           : `${heldBack} documented-rule findings were recorded, but none met the bar to raise here.`}</div>
       </div>`;
-      } else if (verdictCount > 0) {
-        // The rules below carry the verdict. A tick here beside a rule the change breaks, or one
-        // that was already broken, would contradict the section it introduces.
-        const atRisk = computeDocRuleCoverage(result).atRisk > 0;
-        bodyHtml += `<div class="striffs-arch-review-panel__good">
+    } else if (shownVerdicts(result).length > 0) {
+      // The rules' own verdict, in one line. This is what the removed "No review items" banner was
+      // actually carrying: its icon was decided by the rules, not by the items it was named after --
+      // a tick only when every rule shown holds, and a dash the moment one does not, so a clean
+      // result is never claimed over a rule this change breaks or left already broken. Dropping it
+      // with the items would have taken the summary with the section that never had anything in it.
+      const atRisk = computeDocRuleCoverage(result).atRisk > 0;
+      bodyHtml += `<div class="striffs-arch-review-panel__good">
         <div class="striffs-arch-review-panel__good-icon">${atRisk ? "–" : "✓"}</div>
-        <div style="font-size:15px;font-weight:600;margin-bottom:6px;">No review items</div>
-        <div>Nothing in this changeset was raised for review. The documented rules below show how it fared against this repository's docs.</div>
+        <div style="font-size:15px;font-weight:600;margin-bottom:6px;">${atRisk
+          ? "Documented rules at risk"
+          : "Documented rules hold"}</div>
+        <div>${atRisk
+          ? "This changeset is checked against this repository's docs below."
+          : "Every documented rule checked against this changeset still holds."}</div>
       </div>`;
-      } else {
-        // The review checks a change against what the repository's own docs state, not against
-        // general structural heuristics. With no documented rule to check, "no concerns were
-        // found" would claim a check that never happened.
-        bodyHtml += `<div class="striffs-arch-review-panel__good">
-        <div class="striffs-arch-review-panel__good-icon">–</div>
-        <div style="font-size:15px;font-weight:600;margin-bottom:6px;">No review items</div>
-        <div>Nothing was raised for review, and no documented rules were checked against this changeset.</div>
-      </div>`;
-      }
     }
 
     // Documented rules below the items: the same order the check run uses, so a reviewer moving
@@ -9737,7 +9579,6 @@
               changedComponents: 1,
               totalComponents: 1
             } : undefined),
-            surfacedItems: extras.surfacedItems || [],
             // Findings and doc verdicts are fixtures rather than live data on purpose: a real PR may
             // legitimately produce neither, so asserting against the live payload alone could never
             // tell an empty result apart from a section that stopped rendering.
@@ -9755,16 +9596,8 @@
           const pendingResult = makeResult('PENDING', originalSvg, { aiReviewId: 'manual-pending' });
           const readyResult = makeResult('READY', originalSvg, {
             aiReviewId: 'manual-ready',
-            // One surfaced documented-rule item, plus a structural-detector finding of the kind
-            // older API versions still send: the panel has to show the first and ignore the second.
-            surfacedItems: [{
-              itemId: 'manual-f1',
-              priority: 'STRUCTURAL_REGRESSION',
-              title: 'Manual smoke surfaced item',
-              whyShown: 'Manual smoke why',
-              reviewAction: 'Manual smoke action',
-              docConflict: false
-            }],
+            // A documented-rule finding, plus a structural-detector finding of the kind older API
+            // versions still send: the panel counts the first and ignores the second.
             findings: [
               {
                 findingId: 'manual-f1',
@@ -10001,13 +9834,10 @@
                 overviewIsCountsPlaceholder: /^Reviewed \d+ components? and \d+ relationships?/i.test(overview),
                 overviewRendered: overview.length > 0 && panelText.includes('OVERVIEW'),
                 findingsCount: Array.isArray(result?.findings) ? result.findings.length : 0,
-                surfacedCount: Array.isArray(result?.surfacedItems) ? result.surfacedItems.length : 0,
                 docVerdictCount: Array.isArray(result?.docFactVerdicts) ? result.docFactVerdicts.length : 0,
-                // Items the panel is meant to show; the server can mark one as not for the extension.
-                extensionItemCount: Array.isArray(result?.surfacedItems)
-                  ? result.surfacedItems.filter(i => i && i.showInExtension !== false).length
-                  : 0,
                 panelHasStructuralChecks: panelText.includes('STRUCTURAL CHECKS'),
+                // Both sections were removed; a published extension meeting an older API that still
+                // sends their data must render neither.
                 panelHasReviewItems: panelText.includes('REVIEW ITEMS'),
                 panelHasDocumentedRules: panelText.includes('DOCUMENTED RULES'),
                 panelRuleRowCount: panel

@@ -2205,12 +2205,11 @@ const setRemoteConfigUrlData = async (jsonObj) => {
     // These assert against the real API response rather than a fixture, so they are the only
     // check that the server is still sending what the panel is built to render.
     //
-    // Scoped to a review that actually surfaced something. They were written when a quiet review
-    // skipped this whole block, so they never had to consider one; a counts placeholder is the
-    // server's correct answer when the model found nothing to say, and failing on it would be
-    // failing on the model's judgment rather than on the panel's rendering.
-    if (liveAiReviewResult.surfacedCount === 0) {
-      skip(`Live AI review overview: backend surfaced no review items, so there is no model account to check`);
+    // Scoped to a review that checked something. A counts placeholder is the server's correct
+    // answer when the model found nothing to say, and failing on it would be failing on the
+    // model's judgment rather than on the panel's rendering.
+    if (liveAiReviewResult.docVerdictCount === 0) {
+      skip(`Live AI review overview: backend checked no documented rules, so there is no model account to check`);
     } else if (!liveAiReviewResult.overviewRendered) {
       fail(`Live AI review returned no overview to render (length ${liveAiReviewResult.overviewLength})`);
     } else if (liveAiReviewResult.overviewIsCountsPlaceholder) {
@@ -2222,18 +2221,18 @@ const setRemoteConfigUrlData = async (jsonObj) => {
       pass(`Live AI review returns a model-written overview (${liveAiReviewResult.overviewLength} chars)`);
     }
 
-    // Structural checks are no longer part of the review. The section must stay gone whatever the
-    // server sends -- an older API still includes detector findings -- and whatever it surfaced
-    // for the extension must still render.
+    // Structural checks and surfaced review items are both gone from the review. Each section must
+    // stay gone whatever the server sends -- an older API still includes detector findings, and the
+    // response may still carry surfacedItems -- so these assert absence against the live payload.
     if (liveAiReviewResult.panelHasStructuralChecks) {
       fail(`Live AI review panel rendered a structural checks section (${liveAiReviewResult.findingsCount} findings in the response)`);
     } else {
       pass(`Live AI review panel renders no structural checks section (${liveAiReviewResult.findingsCount} findings in the response)`);
     }
-    if (liveAiReviewResult.extensionItemCount > 0 && !liveAiReviewResult.panelHasReviewItems) {
-      fail(`Live AI review surfaced ${liveAiReviewResult.extensionItemCount} review item(s) but the panel rendered none`);
-    } else if (liveAiReviewResult.extensionItemCount > 0) {
-      pass(`Live AI review panel renders review items (${liveAiReviewResult.extensionItemCount})`);
+    if (liveAiReviewResult.panelHasReviewItems) {
+      fail('Live AI review panel rendered a review items section, which was removed in 1.5.0');
+    } else {
+      pass('Live AI review panel renders no review items section');
     }
 
     // Documented rules depend on the repo having docs stating rules the change reached, so their

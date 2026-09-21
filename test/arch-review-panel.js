@@ -168,13 +168,14 @@ const DETECTOR_TRACES = ['STRUCTURAL CHECKS', '✅ clean', '👀', '❗', 'obser
 
   const detectorTracesIn = (text) => DETECTOR_TRACES.filter(t => text.includes(t));
 
-  console.log('\ncurrent API — review items plus documented rules');
+  console.log('\ncurrent API — documented rules are the review');
   {
     const { text } = await render(CURRENT);
-    check('renders the review item', text.includes('Controller reaches the repository directly'));
-    check('marks it as a doc conflict', /doc conflict/i.test(text) && text.includes('architecture.md'));
-    check('review items render above documented rules',
-      text.indexOf('REVIEW ITEMS') >= 0 && text.indexOf('REVIEW ITEMS') < text.indexOf('DOCUMENTED RULES'));
+    // Surfaced items were removed in 1.5.0. A response that still carries them -- this one does --
+    // must render none of it: not the section, not an item's title, not a doc-conflict badge.
+    check('renders no review items section', !text.includes('REVIEW ITEMS'));
+    check('renders nothing from a surfaced item',
+      !text.includes('Controller reaches the repository directly') && !/doc conflict/i.test(text));
     check('renders a documented-rule violation', text.includes('❌ broken by this change'));
     check('renders a rule the change did not break', text.includes('✅ holds'));
     check('violations sort above the rules that held',
@@ -220,8 +221,9 @@ const DETECTOR_TRACES = ['STRUCTURAL CHECKS', '✅ clean', '👀', '❗', 'obser
       detectorTracesIn(legacy.text).join(', '));
     check('no detector finding reaches the panel',
       !['Package cycle introduced', 'Hub forming', 'Complexity rose', 'Registry'].some(t => legacy.text.includes(t)));
-    check('still renders the review item and documented rules',
-      legacy.text.includes('Controller reaches the repository directly') && legacy.text.includes('❌ broken by this change'));
+    check('still renders the documented rules, and no surfaced item',
+      legacy.text.includes('❌ broken by this change')
+      && !legacy.text.includes('Controller reaches the repository directly'));
     // The only difference between the two payloads is what the panel no longer shows, so the
     // rendered panel must be identical.
     check('renders exactly what the current API response renders', legacy.text === current.text);
@@ -234,7 +236,11 @@ const DETECTOR_TRACES = ['STRUCTURAL CHECKS', '✅ clean', '👀', '❗', 'obser
     check('does not name a detector finding', !text.includes('OrderService') && !text.includes('Efferent coupling'));
     check('does NOT claim a clean pass',
       !text.includes('Everything looks good') && !text.includes('No architectural concerns were found'));
-    check('says no documented rules were checked', text.includes('no documented rules were checked'));
+    // Nothing is claimed either way: no rule was checked, so there is no verdict line and no rules
+    // section. What was not checked is said on the findings button, not invented here.
+    check('renders no documented rules section', !text.includes('DOCUMENTED RULES'));
+    check('claims no verdict over rules it never checked',
+      !text.includes('Documented rules hold') && !text.includes('✓'), text);
   }
 
   console.log('\ndocumented-rule finding held below the surfacing gate');
@@ -252,8 +258,9 @@ const DETECTOR_TRACES = ['STRUCTURAL CHECKS', '✅ clean', '👀', '❗', 'obser
     // rule. "No concerns were found" would claim a check that never happened.
     check('does NOT claim a clean pass',
       !text.includes('Everything looks good') && !text.includes('No architectural concerns were found'));
-    check('says nothing was raised', text.includes('No review items'));
-    check('says no documented rules were checked', text.includes('no documented rules were checked'));
+    check('claims no verdict over rules it never checked',
+      !text.includes('Documented rules hold') && !text.includes('✓'), text);
+    check('renders no review items section', !text.includes('REVIEW ITEMS'));
     check('shows the overview', text.includes('billing module'));
     check('renders no structural checks section', !text.includes('STRUCTURAL CHECKS'));
   }
@@ -262,7 +269,7 @@ const DETECTOR_TRACES = ['STRUCTURAL CHECKS', '✅ clean', '👀', '❗', 'obser
   {
     const { text } = await render(MINIMAL);
     check('renders the overview', text.includes('Only an overview.'));
-    check('says nothing was raised', text.includes('No review items'));
+    check('renders no review items section', !text.includes('REVIEW ITEMS'));
     check('renders no documented rules section', !text.includes('DOCUMENTED RULES'));
     check('renders no structural checks section', !text.includes('STRUCTURAL CHECKS'));
     check('leaks no undefined/null/NaN', !/\bundefined\b|\bnull\b|\bNaN\b/.test(text), text);
@@ -405,7 +412,7 @@ const DETECTOR_TRACES = ['STRUCTURAL CHECKS', '✅ clean', '👀', '❗', 'obser
     check('the panel does not open by itself', !s.panelOpen);
     const opened = await clickFindings();
     check('a click opens the panel on the review', opened.panelOpen
-      && opened.panelText.includes('Controller reaches the repository directly'));
+      && opened.panelText.includes('❌ broken by this change'));
     const closed = await clickFindings();
     check('a second click closes it', !closed.panelOpen);
   }
@@ -478,7 +485,7 @@ const DETECTOR_TRACES = ['STRUCTURAL CHECKS', '✅ clean', '👀', '❗', 'obser
     check('the panel still does not open by itself', !after.panelOpen);
     const opened = await clickFindings();
     check('a click opens the panel on the review that arrived late', opened.panelOpen
-      && opened.panelText.includes('Controller reaches the repository directly'));
+      && opened.panelText.includes('❌ broken by this change'));
     await clickFindings();
   }
 
@@ -530,7 +537,11 @@ const DETECTOR_TRACES = ['STRUCTURAL CHECKS', '✅ clean', '👀', '❗', 'obser
     const s = await loadSettled({ result: analysis('PENDING'), replies: [readyReply(QUIET)] }, 'Findings');
     check('the button carries no count', s.text === 'Findings' && !s.disabled, s.text);
     const opened = await clickFindings();
-    check('the panel says no documented rules were checked', opened.panelText.includes('no documented rules were checked'));
+    check('the panel claims no verdict over rules it never checked',
+      !opened.panelText.includes('Documented rules hold') && !opened.panelText.includes('✓'),
+      opened.panelText);
+    check('and the button tooltip is where that is said',
+      /no documented rules were checked/i.test(opened.title), opened.title);
     await clickFindings();
   }
 
