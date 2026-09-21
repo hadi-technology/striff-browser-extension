@@ -1,6 +1,9 @@
-// popup.js — token management, cache clearing, debug mode
+// popup.js — token management, GitHub App install, cache clearing, debug mode
 
 const DEBUG_KEY = "striffsDebug";
+// GitHub's own install flow for the App. /installations/new picks the account or organisation to
+// install onto; it sends a signed-out user through the login first and back here afterwards.
+const APP_INSTALL_URL = "https://github.com/apps/striff-app/installations/new";
 const shared = window.StriffsUiShared;
 
 // Status display
@@ -148,6 +151,23 @@ async function init() {
       setBusy(false);
     }
   });
+
+  // Install the GitHub App
+  const installAppBtn = document.getElementById("installAppBtn");
+  if (installAppBtn) {
+    installAppBtn.addEventListener("click", () => {
+      // chrome.tabs.create needs no "tabs" permission -- that one only gates reading a tab's url or
+      // title -- but window.open is kept as the fallback for a browser that does not expose it.
+      // Either way the popup closes as the tab opens, which is why no status is set here.
+      try {
+        if (chrome?.tabs?.create) chrome.tabs.create({ url: APP_INSTALL_URL });
+        else window.open(APP_INSTALL_URL, "_blank", "noopener");
+      } catch (e) {
+        console.error("Install link error:", e);
+        window.open(APP_INSTALL_URL, "_blank", "noopener");
+      }
+    });
+  }
 
   // Clear cache
   resetCacheBtn.addEventListener("click", async () => {

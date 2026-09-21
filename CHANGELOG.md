@@ -21,6 +21,9 @@
 - The findings button now spins while the architecture review is being read, instead of sitting
   still on "Reading docs…" with nothing to say whether anything was happening. Only a review still
   running spins: a failed, skipped or timed-out one is an outcome, not work in progress.
+- The popup offers to install the Striffs GitHub App, which checks every pull request as it opens.
+  A pull request that already has its check opens with that analysis instead of waiting for a new
+  one, and reviewers see the result whether or not they have the extension.
 - Moving to another pull request while a diagram is still being generated no longer lets the old
   one land on the new page. An analysis can run for minutes, and a move during it left the result
   that finally arrived looking current: it rendered the previous pull request's diagram, and its
