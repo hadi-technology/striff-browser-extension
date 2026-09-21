@@ -18,6 +18,7 @@ test('content scripts include shared metadata and config helpers before main bun
     'src/pr-metadata-utils.js',
     'src/striffs-config-utils.js',
     'src/plantuml-utils.js',
+    'src/review-state-utils.js',
     'src/striffs.js'
   ]);
 });

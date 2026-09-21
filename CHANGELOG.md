@@ -1,5 +1,86 @@
 # Changelog
 
+## 1.4.0
+
+- The diagram no longer waits for the architecture review. It used to be held back for up to two and
+  a half minutes so it could arrive with its findings, which on a large repository made the review's
+  length the load's length — on JabRef the analysis was ready in 26 seconds and the review took 308.
+  The diagram now appears as soon as it is ready, and the review is collected behind it: the findings
+  button reads "Reading docs…" while it runs and enables itself when it lands, with no reload.
+- The architecture review is now collected for ten minutes rather than five. Nothing waits on the
+  diagram any more, so a long review costs a findings button that says it is still running instead of
+  a diagram nobody can see — and a first read of a large repository's documents no longer just misses
+  the budget and reports "Review didn't finish".
+- The findings button works after the first pull request viewed in a tab. The diagram view kept the
+  click listener it was given on every render, so a second render left two listeners on it, a third
+  three, and a delegated click ran the handler once per listener. Zoom-reset and download did not
+  care, but the findings button toggles the review panel: an even number of listeners opened it and
+  closed it again within the same click, so it looked dead until the page was reloaded.
+- The review panel also no longer loses track of itself. Whether it is open is now read from the
+  panel, not remembered in a flag that outlived the panel whenever the diagram view was rebuilt.
+- The findings button now spins while the architecture review is being read, instead of sitting
+  still on "Reading docs…" with nothing to say whether anything was happening. Only a review still
+  running spins: a failed, skipped or timed-out one is an outcome, not work in progress.
+- The popup offers to install the Striffs GitHub App, which checks every pull request as it opens.
+  A pull request that already has its check opens with that analysis instead of waiting for a new
+  one, and reviewers see the result whether or not they have the extension.
+- Moving to another pull request while a diagram is still being generated no longer lets the old
+  one land on the new page. An analysis can run for minutes, and a move during it left the result
+  that finally arrived looking current: it rendered the previous pull request's diagram, and its
+  operation token and cache entry, over the one on screen. A load is now tied to the pull request it
+  began on and its result is discarded if that changes.
+- On a private repository with no GitHub token set, the Striffs button's tooltip now says the token
+  is required because the repository is private, instead of a bare "Token required".
+
+## 1.3.0
+
+- The extension no longer records or sends usage events. Clicking the Diffs or Striffs tab, panning
+  and zooming the diagram, clicking a component or a file, and opening, leaving or submitting a
+  diagram comment are no longer reported anywhere. Nothing about the diagram, the comment flow or
+  the review changes: the same views open, the same comments are composed, and the review's findings
+  still arrive with the diagram.
+- A public pull request that already has a Striff check from the GitHub App opens with that analysis
+  instead of waiting for a second one, whether or not a GitHub token is set. The upload now names the
+  pull request so the API can find it.
+- Cursor project rules (`.cursor/rules/*.mdc`) count as documentation in the file list the extension
+  falls back to when the API's own list cannot be fetched, so a repository's rules for its coding agent
+  still reach the analysis. The API's list is used whenever it is available.
+
+## 1.2.0
+
+- The "first analysis takes a few minutes" notice is gone. The Striffs button's loading state shows
+  a load in progress, so the only notices a load shows are errors.
+- The review panel no longer has a Structural Checks section. The analysis no longer runs
+  structural detector checks; the panel shows the review summary, the review items and the
+  documented rules. A response from an older API that still carries detector findings renders the
+  same panel, with the findings ignored. When nothing is raised, the panel no longer says
+  "Everything looks good": if no documented rule was checked, it says so.
+- The architecture review no longer has a button of its own to start it. Opening Striffs loads the
+  diagram and its review together, and the diagram shows once, when the review is in. The button
+  beside it then reads "Findings (N rules)" and opens the review panel, which is where the findings
+  are: the documented-rule count no longer sits over the diagram. The first review of a repository
+  reads its documents and can take several minutes, so after two and a half minutes the diagram
+  shows anyway, the button reads "Reading docs…", and it enables itself when the review arrives. A
+  review that failed, did not finish, or did not run says so on the button rather than showing an
+  empty result.
+- Documented rules the review could not check are no longer shown, in the panel or on the Findings
+  button. The panel lists the rules this pull request breaks, restores, leaves holding, or finds
+  already broken, and the button counts only those. A rule that could not be checked is never shown
+  as holding.
+- When a doc edit retires documented rules, or states them again, the review panel lists them under
+  the doc that changed. It is a note, not a finding: the Findings button's count and result do not
+  change, and its tooltip mentions the edit.
+- A private repository no longer fails its first load with "Failed downloading base zip: Failed to
+  download zip: 404". Whether a repository is private is now asked of GitHub rather than read off
+  the page, whose signals can be missing after GitHub navigates in place: with a token the load goes
+  straight to token-based generation, and without one it says a token is needed. A failed analysis
+  request is always shown as a readable message, never as its raw error text.
+- With the review panel open, the whole diagram can be scrolled into view. The panel covered the
+  diagram's right edge, which could not be scrolled out from under it. The bottom row can also be
+  scrolled clear of the zoom and download controls.
+- The helpful/unhelpful buttons under review notes on the diagram are gone, along with the feedback
+  they sent. The review's findings are in the Findings panel rather than drawn on the diagram.
+
 ## 1.1.0
 
 - The wait for a first analysis is explained when it starts. The only notice appeared 30 seconds

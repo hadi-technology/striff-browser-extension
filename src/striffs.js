@@ -12,18 +12,19 @@
   // ---------- Constants / State ----------
   S.MAX_UNAUTH_ZIP_SIZE_MB = 50;
   S.CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
-  // Deliberately shorter than the server's own bound on a review
-  // (striff.ai.review.augmentation-timeout-seconds=900): a reviewer watching an indeterminate
-  // spinner for fifteen minutes is a worse outcome than an early "gave up" message, and the
-  // review is not lost when we stop waiting -- it completes server-side and the next load of the
-  // PR picks it up as READY. The old 2-minute ceiling predates the docs-aware path (three
-  // sequential model calls) and the review call moving to high reasoning effort, so it fired on
-  // reviews that were merely slow rather than broken.
-  S.ENRICHMENT_POLL_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+  // How long the review is collected, counted from when the collection opened. A load no longer
+  // waits for the review before rendering -- the diagram goes up as soon as it arrives and this
+  // budget is spent entirely in the background -- so the cost of a long one is a findings button
+  // that reads "Reading docs…" for a while, not a diagram nobody can see. That is cheap enough to
+  // cover the reviews that actually occur: a first read of a repository's documents took 308s on
+  // JabRef, which the previous five-minute budget missed by seconds and reported as "didn't
+  // finish". Still bounded rather than endless, and nothing is lost at the bound -- the review
+  // completes server-side and the next load of the PR picks it up as READY.
+  S.REVIEW_COLLECTION_TIMEOUT_MS = 10 * 60 * 1000;
 
   // Derived from the constant rather than written out, so raising the budget to follow the server
   // cannot leave the message quoting a number that stopped being true.
-  S.formatPollTimeout = function formatPollTimeout(ms = S.ENRICHMENT_POLL_TIMEOUT_MS) {
+  S.formatPollTimeout = function formatPollTimeout(ms = S.REVIEW_COLLECTION_TIMEOUT_MS) {
     const totalSeconds = Math.round(Number(ms) / 1000);
     if (totalSeconds < 60) return `${totalSeconds} second${totalSeconds === 1 ? "" : "s"}`;
     const minutes = Math.round(totalSeconds / 60);
@@ -69,19 +70,19 @@
   S.__recentPanAt = 0;
   S.__aiReviewStatus = null;
   S.__aiReviewId = null;
-  S.__aiReviewPollTimer = null;
-  S.__aiReviewPollInFlight = false;
   S.__aiReviewLastCompletedReviewId = null;
   S.__aiReviewOperationId = null;
-  S.__aiReviewPollStartedAt = null;
+  S.__aiReviewReason = null;
+  S.__aiReviewWarmupRequired = false;
+  // Bumped to cancel whatever review collection is running: a collection only acts while the value
+  // it started with is still current.
+  S.__reviewCollection = 0;
   S.__lastEnrichmentResult = null;
-  S.__archReviewPanelOpen = false;
   S.__supportedExtensionsForUi = S.__supportedExtensionsForUi ||
     (Array.isArray(S.DEFAULT_SUPPORTED_EXTS) ? [...S.DEFAULT_SUPPORTED_EXTS] : []);
   S.PAN_CLICK_DEBOUNCE_MS = 250;
   S.ZOOM_MIN = 0.1;
   S.ZOOM_MAX = 50;
-  S.REVIEW_NOTE_FEEDBACK_ZOOM_THRESHOLD = 0.9;
   S.ZOOM_IN = 1.2;
   S.ZOOM_OUT = 0.85;
   S.FOCUS_MIN_ZOOM = 0.8;
@@ -95,9 +96,6 @@
   S.CACHE_CLEAR_FLAG_KEY = BgUtils.CLEAR_FLAG_KEY || 'striffsCacheClearAt';
   S.CACHE_CLEAR_SEEN_KEY = BgUtils.CACHE_CLEAR_SEEN_KEY || 'striffsCacheClearSeenAt';
   S.STRIFFS_CACHE_DB = BgUtils.INDEXEDDB_NAME || 'striffs-cache-db';
-  S.ENGAGEMENT_SCHEMA_VERSION = 2;
-  S.ENGAGEMENT_COMPONENT_IDS_LIMIT = 80;
-  S.ENGAGEMENT_ZOOM_IDLE_MS = 220;
   S.__remoteConfig = null;
   S.__remoteConfigFetchedAt = 0;
   S.__remoteConfigUrl = null;
@@ -105,17 +103,12 @@
   S.__disabledByRemote = false;
   S.__debugEnabled = false;
   S.__testModeEnabled = false;
-  S.__engagementCtx = S.__engagementCtx || {
-    sessionId: null,
+  // The per-operation access token the API issues with an analysis. It authorises the review
+  // status reads for that operation, and nothing else the extension does.
+  S.__operationTokenCtx = S.__operationTokenCtx || {
     operationId: null,
-    engagementWriteToken: null
+    operationAccessToken: null
   };
-  S.__engagementSentCount = Number(S.__engagementSentCount || 0);
-  S.__engagementAckCount = Number(S.__engagementAckCount || 0);
-  S.__engagementFailedCount = Number(S.__engagementFailedCount || 0);
-  S.__engagementSkippedCount = Number(S.__engagementSkippedCount || 0);
-  S.__reviewNoteVotes = S.__reviewNoteVotes || new Map();
-  S.__reviewNoteFeedbackFrame = Number(S.__reviewNoteFeedbackFrame || 0);
 
   // ---------- Comment component selection state ----------
   S.COMMENT_MAX_SELECTION = 10;
@@ -293,8 +286,16 @@
     return null;
   };
 
+  // Height to keep clear below the diagram for the controls floating over the scroll area's bottom
+  // right: their own height, plus the gap below them.
+  S.floatingControlsReserve = () => {
+    const height = document.getElementById("striffs-controls-wrap")?.offsetHeight || 0;
+    return height > 0 ? height + 16 : 0;
+  };
+
   S.syncZoomedSvgLayout = (view, svg) => {
     if (!svg) return false;
+    S.watchDiagramViewport?.(view);
     const zoom = S.clampZoom(Number(S.__striffsZoom) || 1);
     const base = S.getSvgBaseSize?.(svg);
     const wrap = svg.parentElement;
@@ -306,11 +307,33 @@
     wrap.style.width = `${scaledWidth}px`;
     wrap.style.height = `${scaledHeight}px`;
     wrap.style.minWidth = view ? `${Math.max(view.clientWidth || 0, scaledWidth)}px` : `${scaledWidth}px`;
-    wrap.style.minHeight = view ? `${Math.max(view.clientHeight || 0, scaledHeight)}px` : `${scaledHeight}px`;
+    // Room below the diagram as tall as the floating controls lets its bottom edge be scrolled clear
+    // of them, without giving a diagram that already fits anything to scroll.
+    const reserve = S.floatingControlsReserve?.() || 0;
+    wrap.style.minHeight = view ? `${Math.max((view.clientHeight || 0) - reserve, scaledHeight)}px` : `${scaledHeight}px`;
+    wrap.style.marginBottom = `${reserve}px`;
     svg.style.width = `${base.width}px`;
     svg.style.height = `${base.height}px`;
-    S.queueReviewNoteFeedbackLayout?.();
     return true;
+  };
+
+  // Re-derives the zoomed diagram's scrollable extent from the scroll area's current size, keeping the
+  // zoom and the scroll position.
+  S.refreshDiagramLayout = () => {
+    const view = S.getStriffScrollEl?.();
+    return view && S.__striffsSvg ? S.syncZoomedSvgLayout(view, S.__striffsSvg) : false;
+  };
+
+  // The scroll area changes size when a side panel opens, closes or is dragged wider, and when the
+  // window is resized. A panel narrows the scroll area rather than covering it, and the diagram's
+  // extent has to follow each change or its far edge sits out of reach. Deferred a frame, so the
+  // re-layout this causes is not reported back to the observer within the same frame.
+  S.watchDiagramViewport = (view) => {
+    if (!view || S.__watchedDiagramViewport === view || typeof ResizeObserver !== "function") return;
+    S.__diagramViewportObserver?.disconnect?.();
+    S.__watchedDiagramViewport = view;
+    S.__diagramViewportObserver = new ResizeObserver(() => requestAnimationFrame(() => S.refreshDiagramLayout()));
+    S.__diagramViewportObserver.observe(view);
   };
 
   S.applyZoomAtPoint = (view, svg, next, clientX, clientY) => {
@@ -327,7 +350,6 @@
     S.syncZoomedSvgLayout?.(view, svg);
     view.scrollLeft = (x * scaleRatio) - (clientX - rect.left);
     view.scrollTop = (y * scaleRatio) - (clientY - rect.top);
-    S.queueReviewNoteFeedbackLayout?.();
     return true;
   };
 
@@ -371,7 +393,8 @@
       if (!view || !svg) return false;
       const pad = 24;
       const viewW = Math.max(0, (view.clientWidth || 0) - pad);
-      const viewH = Math.max(0, (view.clientHeight || 0) - pad);
+      // Fitted above the floating controls, not under them.
+      const viewH = Math.max(0, (view.clientHeight || 0) - pad - (S.floatingControlsReserve?.() || 0));
       if (!viewW || !viewH) return false;
       let svgW = 0;
       let svgH = 0;
@@ -397,162 +420,17 @@
     }
   };
 
-  const makeClientSessionId = () => {
-    try {
-      if (window.crypto && typeof window.crypto.randomUUID === "function") {
-        return window.crypto.randomUUID();
-      }
-    } catch {}
-    return `sess-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-  };
-
-  S.ensureEngagementSessionId = () => {
-    const existing = S.__engagementCtx?.sessionId;
-    if (existing) return existing;
-    let stored = "";
-    try {
-      stored = sessionStorage.getItem("striffsEngagementSessionId") || "";
-    } catch {}
-    const next = stored || makeClientSessionId();
-    try {
-      sessionStorage.setItem("striffsEngagementSessionId", next);
-    } catch {}
-    S.__engagementCtx.sessionId = next;
-    return next;
-  };
-
-  S.getExtensionVersion = S.getExtensionVersion || (() => {
-    try {
-      const manifest = chrome?.runtime?.getManifest?.();
-      const raw = String(manifest?.version || "").trim();
-      return raw || null;
-    } catch {
-      return null;
-    }
-  });
-
-  S.makeEngagementEventId = S.makeEngagementEventId || (() => {
-    try {
-      if (window.crypto && typeof window.crypto.randomUUID === "function") {
-        return `eng-${window.crypto.randomUUID()}`;
-      }
-    } catch {}
-    return `eng-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-  });
-
-  S.normalizeEngagementValue = S.normalizeEngagementValue || ((value, depth = 0) => {
-    const maxDepth = 5;
-    const maxArrayItems = 120;
-    if (value === undefined) return undefined;
-    if (value === null) return null;
-    if (depth > maxDepth) return null;
-
-    const valueType = typeof value;
-    if (valueType === "string") return value;
-    if (valueType === "boolean") return value;
-    if (valueType === "number") return Number.isFinite(value) ? value : null;
-    if (valueType === "bigint") return String(value);
-    if (valueType === "function" || valueType === "symbol") return undefined;
-    if (Array.isArray(value)) {
-      const out = [];
-      const limit = Math.min(value.length, maxArrayItems);
-      for (let i = 0; i < limit; i += 1) {
-        const normalizedItem = S.normalizeEngagementValue?.(value[i], depth + 1);
-        if (normalizedItem !== undefined) out.push(normalizedItem);
-      }
-      return out;
-    }
-    if (valueType === "object") {
-      const out = {};
-      for (const [key, child] of Object.entries(value)) {
-        if (!key) continue;
-        const normalizedChild = S.normalizeEngagementValue?.(child, depth + 1);
-        if (normalizedChild !== undefined) out[String(key)] = normalizedChild;
-      }
-      return out;
-    }
-    return String(value);
-  });
-
-  S.normalizeEngagementObject = S.normalizeEngagementObject || ((obj) => {
-    if (!obj || typeof obj !== "object" || Array.isArray(obj)) return {};
-    const normalized = S.normalizeEngagementValue?.(obj, 0);
-    if (!normalized || typeof normalized !== "object" || Array.isArray(normalized)) return {};
-    return normalized;
-  });
-
-  S.parsePullNumber = S.parsePullNumber || ((value) => {
-    const parsed = Number(value);
-    if (!Number.isInteger(parsed) || parsed <= 0) return null;
-    return parsed;
-  });
-
-  S.buildEngagementPayload = S.buildEngagementPayload || ((eventType, eventPayload = {}, metadataPayload = {}) => {
-    const type = String(eventType || "").trim();
-    if (!type) return null;
-    const meta = S.extractPRMetadata?.() || {};
-    const owner = meta?.owner ? String(meta.owner) : null;
-    const repo = meta?.repo ? String(meta.repo) : null;
-    const pullNumber = S.parsePullNumber?.(meta?.pull_number);
-    const currentView = S.getCurrentView?.() || null;
-    const zoom = Number.isFinite(Number(S.__striffsZoom)) ? Number(S.__striffsZoom) : 1;
-    const attrs = S.normalizeEngagementObject?.(eventPayload);
-    const extra = S.normalizeEngagementObject?.(metadataPayload);
-    const now = Date.now();
-    const sessionId = S.ensureEngagementSessionId?.() || null;
-
-    return {
-      schemaVersion: Number(S.ENGAGEMENT_SCHEMA_VERSION || 1),
-      eventId: S.makeEngagementEventId?.() || null,
-      eventType: type,
-      source: "striff-browser-extension",
-      extensionVersion: S.getExtensionVersion?.() || null,
-      operationId: String(S.__engagementCtx?.operationId || "").trim() || null,
-      sessionId,
-      occurredAtMs: now,
-      occurredAt: new Date(now).toISOString(),
-      repository: {
-        owner,
-        name: repo,
-        pullNumber
-      },
-      context: {
-        pageUrl: location.href,
-        currentView,
-        zoom
-      },
-      attributes: attrs,
-      extra,
-      event: { ...(attrs || {}), type },
-      metadata: {
-        ...(extra || {}),
-        pageUrl: location.href,
-        owner,
-        repo,
-        pull_number: pullNumber,
-        currentView,
-        zoom
-      },
-      clientTimestamp: now
-    };
-  });
-
-  S.syncEngagementDebugState = () => {
+  S.syncOperationTokenDebugState = () => {
     try {
       const root = document.documentElement;
       if (!root) return;
-      const ctx = S.__engagementCtx || {};
-      root.dataset.striffsEngagementHasOperationId = String(Boolean(String(ctx.operationId || '').trim()) ? 1 : 0);
-      root.dataset.striffsEngagementHasToken = String(Boolean(String(ctx.engagementWriteToken || '').trim()) ? 1 : 0);
-      root.dataset.striffsEngagementLastError = String(S.__lastEngagementContextError || '');
-      root.dataset.striffsEngagementSent = String(Number(S.__engagementSentCount || 0));
-      root.dataset.striffsEngagementAck = String(Number(S.__engagementAckCount || 0));
-      root.dataset.striffsEngagementFailed = String(Number(S.__engagementFailedCount || 0));
-      root.dataset.striffsEngagementSkipped = String(Number(S.__engagementSkippedCount || 0));
-      root.dataset.striffsEngagementLastEventType = String(S.__engagementLastEventType || '');
+      const ctx = S.__operationTokenCtx || {};
+      root.dataset.striffsOperationTokenHasOperationId = String(Boolean(String(ctx.operationId || '').trim()) ? 1 : 0);
+      root.dataset.striffsOperationTokenHasToken = String(Boolean(String(ctx.operationAccessToken || '').trim()) ? 1 : 0);
+      root.dataset.striffsOperationTokenLastError = String(S.__lastOperationTokenError || '');
     } catch {}
   };
-  S.syncEngagementDebugState?.();
+  S.syncOperationTokenDebugState?.();
 
   S.syncSaveDebugState = (status = "", extra = {}) => {
     try {
@@ -593,19 +471,14 @@
   };
   S.syncDiagramClickDebugState?.();
 
+  // Review notes: boxes that older API versions draw into the diagram. A diagram from one, or read
+  // back from the cache, can still carry them, so they are kept out of navigation, comment selection
+  // and the visible-component count.
   S.REVIEW_NOTE_TOKEN = "AI_REVIEW";
-  S.REVIEW_NOTE_PREFIX = "AI_REVIEW_NOTE_";
   S.REVIEW_NOTE_ALIASES = /^(?:AI_REVIEW_NOTE_|surfaced_note_)\d/i;
   S.isReviewNoteQualifiedName = (value) => {
     const qn = String(value || "").trim();
     return qn.includes(S.REVIEW_NOTE_TOKEN) || S.REVIEW_NOTE_ALIASES.test(qn);
-  };
-
-  S.extractReviewNoteId = (value) => {
-    const qn = String(value || "").trim();
-    if (!qn) return null;
-    const match = qn.match(/(?:AI_REVIEW_NOTE_|surfaced_note_)([A-Z0-9_-]+)/i);
-    return match?.[1] ? String(match[1]).toLowerCase() : null;
   };
 
   S.isReviewNoteNode = (node) => {
@@ -616,199 +489,16 @@
     return S.isReviewNoteQualifiedName(entity.getAttribute?.("data-qualified-name"));
   };
 
-  S.getReviewNoteEntities = (svg = S.__striffsSvg) => {
-    if (!svg?.querySelectorAll) return [];
-    const nodes = svg.querySelectorAll("g.entity[data-qualified-name]") || [];
-    return Array.from(nodes).filter((node) =>
-      S.isReviewNoteQualifiedName?.(node.getAttribute?.("data-qualified-name"))
-    );
-  };
-
-  S.extractReviewNoteText = (node) => {
-    if (!node?.querySelectorAll) return "";
-    const texts = Array.from(node.querySelectorAll("text") || [])
-      .map((textNode) => String(textNode?.textContent || "").trim())
-      .filter(Boolean);
-    return texts.join(" ").replace(/\s+/g, " ").trim();
-  };
-
-  S.reviewNoteFeedbackIcon = (vote) => {
-    // Light colors: green #bff7ce for thumbs up, red #ffd5dc for thumbs down
-    const bgColor = vote === "up" ? "#bff7ce" : "#ffd5dc";
-    // Border colors: darkcyan for thumbs up, darkred for thumbs down
-    const borderColor = vote === "up" ? "darkcyan" : "darkred";
-    const emoji = vote === "up" ? "👍" : "👎";
-    // Use em-based sizing so it scales with the transform
-    return `<span style="background-color: ${bgColor}; padding: 0.25em 0.4em; border-radius: 4px; display: inline-block; border: 1px solid ${borderColor}; font-size: 1em;">${emoji}</span>`;
-  };
-
-  S.clearReviewNoteFeedback = () => {
+  S.logOperationTokenUnavailable = (reason = "", extra = {}) => {
     try {
-      if (Number(S.__reviewNoteFeedbackFrame || 0) > 0) {
-        (window.cancelAnimationFrame || clearTimeout)(S.__reviewNoteFeedbackFrame);
-      }
-    } catch {}
-    S.__reviewNoteFeedbackFrame = 0;
-    try {
-      document.querySelectorAll?.(".striffs-note-feedback-layer").forEach((layer) => layer.remove?.());
-    } catch {}
-    // Also clear the votes cache when fully clearing feedback
-    S.__reviewNoteVotes?.clear?.();
-  };
-
-  S.positionReviewNoteFeedback = () => {
-    const svg = S.__striffsSvg;
-    const wrap = svg?.parentElement;
-    if (!svg || !wrap) return false;
-    let layer = wrap.querySelector?.(".striffs-note-feedback-layer");
-    if (!layer) {
-      layer = document.createElement("div");
-      layer.className = "striffs-note-feedback-layer";
-      wrap.appendChild(layer);
-    }
-    // Only clear shells that haven't been voted on (preserve "thank you" messages)
-    const existingShells = layer.querySelectorAll(".striffs-note-feedback");
-    existingShells.forEach(shell => {
-      if (!shell.hasAttribute("data-voted")) {
-        shell.remove();
-      }
-    });
-    const zoom = Number(S.__striffsZoom) || 1;
-    const feedbackThreshold = Number(S.REVIEW_NOTE_FEEDBACK_ZOOM_THRESHOLD) || 1.5;
-    const notes = S.getReviewNoteEntities?.(svg) || [];
-    for (const note of notes) {
-      const qn = String(note.getAttribute?.("data-qualified-name") || "").trim();
-      const noteId = S.extractReviewNoteId?.(qn);
-      if (!noteId) continue;
-      // Hide feedback buttons when zoomed out — only show when user is reading notes
-      if (zoom < feedbackThreshold) continue;
-      // Skip if we already have a shell for this note (including thank you messages)
-      if (layer.querySelector(`[data-note-qualified-name="${qn}"]`)) {
-        continue;
-      }
-      try {
-        const bbox = note.getBBox?.();
-        if (!bbox) continue;
-        const shell = document.createElement("div");
-        shell.className = "striffs-note-feedback";
-        shell.setAttribute("data-note-qualified-name", qn);
-        // Position below the note box. The shell's right edge aligns with the note's
-        // right edge so the copy button sits just inside the note boundary.
-        const verticalOffset = 4;
-        const paddingRight = 4;
-        shell.style.left = `${bbox.x * zoom}px`;
-        shell.style.top = `${(bbox.y + bbox.height + verticalOffset) * zoom}px`;
-        shell.style.width = `${(bbox.width - paddingRight) * zoom}px`;
-        shell.setAttribute("data-note-id", noteId);
-
-        const currentVote = S.__reviewNoteVotes?.get?.(noteId) || null;
-        // If already voted, don't show buttons
-        if (currentVote) continue;
-
-        const noteText = S.extractReviewNoteText?.(note) || "";
-
-        // --- Left group: vote buttons ---
-        const leftGroup = document.createElement("span");
-        leftGroup.className = "striffs-note-feedback-left";
-
-        const createVoteButton = (vote, icon, label) => {
-          const btn = document.createElement("button");
-          btn.type = "button";
-          btn.className = `striffs-note-feedback-btn striffs-note-feedback-btn--${vote}`;
-          btn.setAttribute("data-vote", vote);
-          btn.setAttribute("aria-label", label);
-          btn.title = label;
-          btn.innerHTML = S.reviewNoteFeedbackIcon(vote);
-          btn.addEventListener("click", (event) => {
-            event.preventDefault();
-            event.stopPropagation();
-            S.__reviewNoteVotes?.set?.(noteId, vote);
-            S.emitEngagementEvent?.("ai_note_feedback", {
-              noteId,
-              vote,
-              noteQualifiedName: qn
-            }, {
-              noteText,
-              noteQualifiedName: qn
-            });
-
-            // Show toast instead of inline text
-            S.toast?.("Thanks for the feedback!", "success", { timeoutMs: 2000 });
-
-            // Hide only the vote buttons, keep the copy button visible
-            const voteButtons = leftGroup.querySelectorAll(".striffs-note-feedback-btn");
-            voteButtons.forEach(b => b.style.display = "none");
-            leftGroup.style.display = "none";
-
-            // Mark as voted
-            shell.setAttribute("data-voted", "true");
-          });
-          return btn;
-        };
-
-        leftGroup.appendChild(createVoteButton("up", "thumbsup", "Helpful AI note"));
-        leftGroup.appendChild(createVoteButton("down", "thumbsdown", "Unhelpful AI note"));
-        shell.appendChild(leftGroup);
-
-        // --- Right group: copy button ---
-        const rightGroup = document.createElement("span");
-        rightGroup.className = "striffs-note-feedback-right";
-
-        const copyBtn = document.createElement("button");
-        copyBtn.type = "button";
-        copyBtn.className = "striffs-note-feedback-btn striffs-note-feedback-btn--copy";
-        copyBtn.setAttribute("aria-label", "Copy note to clipboard");
-        copyBtn.title = "Copy note to clipboard";
-        const copyIconHtml = `<span style="background-color: #ddf4ff; padding: 0.25em 0.4em; border-radius: 4px; display: inline-block; border: 1px solid #0969da; font-size: 1em;">📋</span>`;
-        copyBtn.innerHTML = copyIconHtml;
-        copyBtn.addEventListener("click", (event) => {
-          event.preventDefault();
-          event.stopPropagation();
-          if (!noteText) return;
-          navigator.clipboard.writeText(noteText).then(() => {
-            copyBtn.innerHTML = `<span style="background-color: #dafbe1; padding: 0.25em 0.4em; border-radius: 4px; display: inline-block; border: 1px solid #1a7f37; font-size: 1em;">✓</span>`;
-            setTimeout(() => {
-              copyBtn.innerHTML = copyIconHtml;
-            }, 1500);
-          }).catch(() => {});
-        });
-        rightGroup.appendChild(copyBtn);
-        shell.appendChild(rightGroup);
-        layer.appendChild(shell);
-      } catch (e) {
-        // Skip notes that can't be positioned
-        continue;
-      }
-    }
-    return true;
-  };
-
-  S.queueReviewNoteFeedbackLayout = () => {
-    try {
-      if (Number(S.__reviewNoteFeedbackFrame || 0) > 0) {
-        (window.cancelAnimationFrame || clearTimeout)(S.__reviewNoteFeedbackFrame);
-      }
-    } catch {}
-    const schedule = window.requestAnimationFrame || ((fn) => setTimeout(fn, 16));
-    // Use double RAF to ensure SVG is fully rendered before positioning
-    S.__reviewNoteFeedbackFrame = schedule(() => {
-      schedule(() => {
-        S.__reviewNoteFeedbackFrame = 0;
-        S.positionReviewNoteFeedback?.();
-      });
-    });
-  };
-
-  S.logEngagementCollectionBlocked = (reason = "", extra = {}) => {
-    try {
-      S.debugDump?.("engagement collection blocked", {
+      S.debugDump?.("operation token unavailable", {
         reason: String(reason || "").trim() || "unknown",
         ...(extra || {})
       });
     } catch {}
   };
 
-  S.extractEngagementContextFromPayload = (payload) => {
+  S.extractOperationTokenFromPayload = (payload) => {
     const candidates = [
       payload,
       payload?.result,
@@ -818,8 +508,6 @@
       payload?.body,
       payload?.meta,
       payload?.metadata,
-      payload?.engagement,
-      payload?.engagementContext,
       payload?.context,
       payload?.review,
       payload?.aiReview,
@@ -836,119 +524,60 @@
     };
     return {
       operationId: readFirst(["operationId", "operationID", "operation_id"]),
-      engagementWriteToken: readFirst([
-        "engagementWriteToken",
-        "engagementToken",
-        "engagement_write_token",
-        "engagement_token"
-      ])
+      operationAccessToken: readFirst(["operationAccessToken", "operation_access_token"])
     };
   };
 
-  S.updateEngagementContextFromResult = (result) => {
-    const prev = S.__engagementCtx || {};
-    const sessionId = S.ensureEngagementSessionId?.() || prev.sessionId || null;
-    const extracted = S.extractEngagementContextFromPayload?.(result) || {};
+  S.updateOperationTokenFromResult = (result) => {
+    const prev = S.__operationTokenCtx || {};
+    const extracted = S.extractOperationTokenFromPayload?.(result) || {};
     const opId = String(extracted.operationId || "").trim();
-    const providedToken = String(extracted.engagementWriteToken || "").trim();
+    const providedToken = String(extracted.operationAccessToken || "").trim();
     if (!opId) {
-      S.__engagementCtx = {
-        sessionId,
+      S.__operationTokenCtx = {
         operationId: null,
-        engagementWriteToken: null
+        operationAccessToken: null
       };
-      S.__lastEngagementContextError = "missing operationId";
-      S.cwarn?.("Engagement context missing operationId", {
+      S.__lastOperationTokenError = "missing operationId";
+      S.cwarn?.("Operation token context missing operationId", {
         hasToken: Boolean(providedToken),
         resultKeys: result && typeof result === "object" ? Object.keys(result).slice(0, 30) : []
       });
-      S.syncEngagementDebugState?.();
-      S.logEngagementCollectionBlocked?.("missing operationId", {
+      S.syncOperationTokenDebugState?.();
+      S.logOperationTokenUnavailable?.("missing operationId", {
         hasOperationId: false,
         hasToken: Boolean(providedToken)
       });
       return false;
     }
-    S.__engagementCtx = {
-      sessionId,
+    S.__operationTokenCtx = {
       operationId: opId,
-      engagementWriteToken: providedToken || prev.engagementWriteToken || null
+      operationAccessToken: providedToken || prev.operationAccessToken || null
     };
-    if (!S.__engagementCtx.engagementWriteToken) {
-      S.__lastEngagementContextError = "missing engagementWriteToken";
-      S.cwarn?.("Engagement context missing engagementWriteToken", {
+    if (!S.__operationTokenCtx.operationAccessToken) {
+      S.__lastOperationTokenError = "missing operationAccessToken";
+      S.cwarn?.("Operation token context missing operationAccessToken", {
         operationId: opId,
         resultKeys: result && typeof result === "object" ? Object.keys(result).slice(0, 30) : []
       });
-      S.syncEngagementDebugState?.();
-      S.logEngagementCollectionBlocked?.("missing engagementWriteToken", {
+      S.syncOperationTokenDebugState?.();
+      S.logOperationTokenUnavailable?.("missing operationAccessToken", {
         hasOperationId: true,
         hasToken: false,
         operationId: opId
       });
       return false;
     }
-    S.__lastEngagementContextError = null;
-    S.persistEngagementContextForCurrentPr?.();
-    S.syncEngagementDebugState?.();
+    S.__lastOperationTokenError = null;
+    S.persistOperationTokenForCurrentPr?.();
+    S.syncOperationTokenDebugState?.();
     // Re-apply comment affordances now that operationId is available
-    // (fixes race when engagement context arrives after SVG render)
+    // (fixes race when the operation context arrives after SVG render)
     if (!prev.operationId && S.__striffsSvg && !S.__commentState?.active) {
       try { S.applyCommentAffordances?.(); } catch {}
       S.updateCommentButtonVisibility?.();
     }
     return true;
-  };
-
-  S.getViewableComponents = (limit = S.ENGAGEMENT_COMPONENT_IDS_LIMIT || 80) => {
-    const max = Number.isFinite(Number(limit)) ? Math.max(1, Number(limit)) : 80;
-    const view = S.getStriffScrollEl?.();
-    const svg = S.__striffsSvg || view?.querySelector?.("svg");
-    if (!view || !svg) {
-      return { ids: [], total: 0, truncated: false };
-    }
-    const viewport = view.getBoundingClientRect?.();
-    if (!viewport) {
-      return { ids: [], total: 0, truncated: false };
-    }
-    const out = [];
-    const uniq = new Set();
-    let total = 0;
-    const nodes = svg.querySelectorAll?.("g.entity[data-qualified-name]") || [];
-    for (const node of nodes) {
-      const id = node.getAttribute?.("data-qualified-name");
-      if (!id || uniq.has(id) || S.isReviewNoteQualifiedName?.(id)) continue;
-      const rect = node.getBoundingClientRect?.();
-      if (!rect) continue;
-      const offscreen =
-        rect.right < viewport.left ||
-        rect.left > viewport.right ||
-        rect.bottom < viewport.top ||
-        rect.top > viewport.bottom;
-      if (offscreen) continue;
-      total += 1;
-      uniq.add(id);
-      if (out.length < max) out.push(id);
-    }
-    return { ids: out, total, truncated: total > out.length };
-  };
-
-  S.capturePanZoomSnapshot = (limit = S.ENGAGEMENT_COMPONENT_IDS_LIMIT || 80) => {
-    const view = S.getStriffScrollEl?.();
-    const visible = S.getViewableComponents?.(limit) || { ids: [], total: 0, truncated: false };
-    const x = Number(view?.scrollLeft || 0);
-    const y = Number(view?.scrollTop || 0);
-    return {
-      coordinates: { x, y },
-      zoom: Number(S.__striffsZoom) || 1,
-      viewport: {
-        width: Number(view?.clientWidth || 0),
-        height: Number(view?.clientHeight || 0)
-      },
-      viewableComponentIds: visible.ids || [],
-      viewableComponentCount: Number(visible.total || 0),
-      viewableComponentIdsTruncated: Boolean(visible.truncated)
-    };
   };
 
   // ---------- Logging ----------
@@ -968,7 +597,7 @@
   };
 
   // Convert hyphenated names to dotted format (e.g., "my-component" -> "my.component")
-  // Used for component qualified names in telemetry and display
+  // Used for component qualified names in debug state and display
   S.toDottedName = (name) => {
     if (!name) return null;
     return String(name).replace(/-/g, '.');
@@ -1062,76 +691,6 @@
 
   S.loadDebugFlag?.();
   S.loadTestFlag?.().then(() => S.syncTestHarnessState?.()).catch(() => {});
-
-  S.emitEngagementEvent = (eventType, eventPayload = {}, metadataPayload = {}) => {
-    try {
-      const type = String(eventType || "").trim();
-      if (!type) return false;
-      const ctx = S.__engagementCtx || {};
-      const operationId = String(ctx.operationId || "").trim();
-      const engagementWriteToken = String(ctx.engagementWriteToken || "").trim();
-      if (!operationId || !engagementWriteToken) {
-        S.logEngagementCollectionBlocked?.("missing operation/token", {
-          type,
-          hasOperationId: Boolean(operationId),
-          hasToken: Boolean(engagementWriteToken)
-        });
-        S.syncEngagementDebugState?.();
-        return false;
-      }
-      const payload = S.buildEngagementPayload?.(type, eventPayload, metadataPayload);
-      if (!payload) {
-        S.__engagementSkippedCount = Number(S.__engagementSkippedCount || 0) + 1;
-        S.logEngagementCollectionBlocked?.("failed to build engagement payload", { type });
-        S.syncEngagementDebugState?.();
-        return false;
-      }
-      if (typeof S.bgRequest !== "function") {
-        S.__engagementSkippedCount = Number(S.__engagementSkippedCount || 0) + 1;
-        S.logEngagementCollectionBlocked?.("missing background bridge", { type });
-        S.syncEngagementDebugState?.();
-        return false;
-      }
-      S.__engagementSentCount = Number(S.__engagementSentCount || 0) + 1;
-      S.__engagementLastEventType = type;
-      S.syncEngagementDebugState?.();
-      S.bgRequest({
-        type: "recordEngagementEvent",
-        operationId,
-        engagementToken: engagementWriteToken,
-        payload
-      }, S.TIMEOUTS?.message || 7000).then((resp) => {
-        if (resp?.ok === true || resp?.success === true) {
-          S.__engagementAckCount = Number(S.__engagementAckCount || 0) + 1;
-          S.syncEngagementDebugState?.();
-          return;
-        }
-        S.__engagementFailedCount = Number(S.__engagementFailedCount || 0) + 1;
-        S.debugDump?.("engagement send returned non-ok", {
-          type,
-          response: resp || null
-        });
-        S.syncEngagementDebugState?.();
-      }).catch((err) => {
-        S.__engagementFailedCount = Number(S.__engagementFailedCount || 0) + 1;
-        S.debugDump?.("engagement send failed", { type, error: String(err?.message || err) });
-        S.syncEngagementDebugState?.();
-      });
-      return true;
-    } catch (e) {
-      S.debugDump?.("engagement emit failed", { error: String(e?.message || e) });
-      S.syncEngagementDebugState?.();
-      return false;
-    }
-  };
-
-  S.getEngagementCounters = () => ({
-    sent: Number(S.__engagementSentCount || 0),
-    ack: Number(S.__engagementAckCount || 0),
-    failed: Number(S.__engagementFailedCount || 0),
-    skipped: Number(S.__engagementSkippedCount || 0),
-    lastEventType: S.__engagementLastEventType || null
-  });
 
   S.getPrimaryDiagramSvg = () => {
     if (S.__striffsSvg && document.body.contains(S.__striffsSvg)) return S.__striffsSvg;
@@ -1397,17 +956,20 @@
 
   // ---------- Utils ----------
   S.sleep = (ms) => new Promise(r => setTimeout(r, ms));
-  S.cancelEnrichmentPolling = (reason = "") => {
-    if (S.__aiReviewPollTimer) {
-      clearTimeout(S.__aiReviewPollTimer);
-      S.__aiReviewPollTimer = null;
-    }
-    S.__aiReviewPollInFlight = false;
-    S.__aiReviewPollStartedAt = null;
+  // Stops any review collection in flight, and invalidates any load that began before it: whatever
+  // that load would render belongs to a page the user has left.
+  S.cancelReviewCollection = (reason = "") => {
+    S.__reviewCollection += 1;
     if (reason && S.isDebug?.()) {
-      S.cinfo?.("Enrichment polling cancelled", { reason });
+      S.cinfo?.("Review collection cancelled", { reason });
     }
   };
+
+  // Whether `generation` is still the one in force. A move to another pull request, a cache clear and
+  // the remote kill switch all bump the counter, so anything that began on an older generation --
+  // a load's result, a review being collected -- belongs to a page that is no longer on screen.
+  S.isReviewGenerationCurrent = (generation) =>
+    generation === S.__reviewCollection && !S.__disabledByRemote;
 
   // ---------- Cache clearing (per-page) ----------
   S.clearLocalDiagramCaches = async (opts = {}) => {
@@ -1497,11 +1059,10 @@
     try { setTimeout(() => { S.__suppressViewPersist = false; }, 2000); } catch {}
 
     if (resetLiveDiagram) {
-        S.cancelEnrichmentPolling?.("clear-local-cache");
+        S.cancelReviewCollection?.("clear-local-cache");
         S.__striffsReady = false;
         S.__striffsNoChanges = false;
         S.__striffsSvg = null;
-      S.clearReviewNoteFeedback?.();
       S.__striffsPathToComponentId?.clear?.();
       S.__striffsComponentIdToFile?.clear?.();
       S.__striffsComponentIdToDiffId?.clear?.();
@@ -1526,9 +1087,9 @@
     S.__supportedExtensionsFetchedAt = 0;
     S.__supportedExtensionsPromise = null;
     S.__suppressCacheWritesUntil = Date.now() + 2000;
-    S.__engagementRefreshPromise = null;
-    S.__lastEngagementContextError = null;
-    S.__engagementCtx = { sessionId: null, operationId: null, engagementWriteToken: null };
+    S.__operationTokenRefreshPromise = null;
+    S.__lastOperationTokenError = null;
+    S.__operationTokenCtx = { operationId: null, operationAccessToken: null };
 
     // Clear IndexedDB cache
     try {
@@ -1562,7 +1123,7 @@
       if (!ts) return false;
       const seen = Math.max(Number(S.__cacheClearSeenAt || 0), Number(seenAt || 0));
       if (ts > seen) {
-        S.cancelEnrichmentPolling?.("global-cache-clear");
+        S.cancelReviewCollection?.("global-cache-clear");
         await S.clearLocalDiagramCaches({ preserveClearFlag: true });
         S.__cacheClearSeenAt = ts;
         try {
@@ -1691,7 +1252,7 @@
     }
   };
 
-  S.fetchAiReviewStatus = async ({ operationId, engagementToken, timeoutMs } = {}) => {
+  S.fetchAiReviewStatus = async ({ operationId, operationToken, timeoutMs } = {}) => {
     // Returns the reply rather than throwing on it: both pollers branch on
     // resp.status, and a 403 has to stop the poll rather than retry a request
     // that can never succeed. bgRequest throwing made those branches dead code
@@ -1700,7 +1261,7 @@
       return await S.bgRequest({
         type: "fetchAiReviewStatus",
         operationId,
-        engagementToken,
+        operationToken,
         timeoutMs
       }, timeoutMs ?? 15000);
     } catch (e) {
@@ -2133,8 +1694,6 @@
             download: 'M8 1.75a.75.75 0 0 1 .75.75v6.19l1.72-1.72a.75.75 0 1 1 1.06 1.06l-3 3a.75.75 0 0 1-1.06 0l-3-3a.75.75 0 0 1 1.06-1.06l1.72 1.72V2.5A.75.75 0 0 1 8 1.75ZM2 12.25c0-.414.336-.75.75-.75h10.5a.75.75 0 0 1 .75.75v1.5A1.25 1.25 0 0 1 12.75 15H3.25A1.25 1.25 0 0 1 2 13.75Z',
             reset: 'M8 1.75a6.25 6.25 0 1 1-4.42 1.83.75.75 0 1 1 1.06 1.06A4.75 4.75 0 1 0 8 3.25c-1.15 0-2.2.41-3.02 1.09l1.02 1.02a.75.75 0 1 1-1.06 1.06l-2.5-2.5a.75.75 0 0 1 0-1.06l2.5-2.5a.75.75 0 1 1 1.06 1.06l-.88.88A6.22 6.22 0 0 1 8 1.75Z',
             save: 'M8 1.75a.75.75 0 0 1 .75.75v6.19l1.72-1.72a.75.75 0 1 1 1.06 1.06l-3 3a.75.75 0 0 1-1.06 0l-3-3a.75.75 0 0 1 1.06-1.06l1.72 1.72V2.5A.75.75 0 0 1 8 1.75ZM2 12.25c0-.414.336-.75.75-.75h10.5a.75.75 0 0 1 .75.75v1.5A1.25 1.25 0 0 1 12.75 15H3.25A1.25 1.25 0 0 1 2 13.75Z',
-            'thumbsup': 'M8.347 1.631A1.75 1.75 0 0 1 10 3.375V6h2.68a1.82 1.82 0 0 1 1.79 2.146l-.765 4.593A2.75 2.75 0 0 1 11 15H5.72a2.75 2.75 0 0 1-1.887-.75l-.59-.554A1.75 1.75 0 0 1 2.7 12.42V7.75C2.7 6.784 3.484 6 4.45 6H6.5V3.92c0-.354.107-.7.307-.992ZM4.45 7.5a.25.25 0 0 0-.25.25v4.67c0 .07.03.136.08.184l.591.554c.237.222.549.342.872.342H11c.61 0 1.13-.439 1.23-1.04l.766-4.593a.32.32 0 0 0-.316-.377H9.25A.75.75 0 0 1 8.5 6.75V3.375a.25.25 0 0 0-.472-.121l-1.22 2.135a.75.75 0 0 1-.652.381Z',
-            'thumbsdown': 'M7.653 14.369A1.75 1.75 0 0 1 6 12.625V10H3.32A1.82 1.82 0 0 1 1.53 7.854l.765-4.593A2.75 2.75 0 0 1 5 1h5.28c.695 0 1.364.266 1.887.75l.59.554c.356.333.558.799.558 1.276v4.67c0 .966-.784 1.75-1.75 1.75H9.5v2.08c0 .354-.107.7-.307.992ZM5 2.5c-.61 0-1.13.439-1.23 1.04l-.766 4.593a.32.32 0 0 0 .316.377H6.75A.75.75 0 0 1 7.5 9.25v3.375a.25.25 0 0 0 .472.121l1.22-2.135a.75.75 0 0 1 .652-.381h1.706a.25.25 0 0 0 .25-.25V3.58a.252.252 0 0 0-.08-.185l-.591-.554a1.25 1.25 0 0 0-.872-.341Z'
         };
 
         // Custom SVG markup for special icons (returns full SVG instead of path data)
@@ -2240,19 +1799,11 @@
         }
 
         const onDiffClick = () => {
-            S.emitEngagementEvent?.("diffs_button_pressed", {
-                fromView: S.getCurrentView?.() || null
-            });
             S.showDiffView();
             S.saveActiveTab('diffs');
         };
 
         const onStriffClick = async () => {
-            S.emitEngagementEvent?.("striffs_button_pressed", {
-                fromView: S.getCurrentView?.() || null,
-                ready: Boolean(S.__striffsReady && S.__striffsSvg),
-                disabledByRemote: Boolean(S.__disabledByRemote)
-            });
               if (S.__disabledByRemote) {
                   S.disableStriffsButton();
                   return;
@@ -2283,7 +1834,7 @@
             // Early check for private repo without token
             const token = await S.getStoredToken?.();
             if (!token && S.isPrivateRepo?.()) {
-                S.updateStriffButton({ neutral: true, disabled: true, tooltip: "Token required" });
+                S.updateStriffButton({ neutral: true, disabled: true, tooltip: "Token required: this repo is private" });
                 return;
             }
 
@@ -2340,7 +1891,6 @@
     // Button state / label updater
     S.updateStriffButton = function updateStriffButton({
         loading = false,
-        enriching = false,
         success = false,
         failure = false,
         disabled = false,
@@ -2350,7 +1900,6 @@
     }) {
         S.__lastStriffsButtonState = {
             loading,
-            enriching,
             success,
             failure,
             disabled,
@@ -2442,7 +1991,9 @@
                 "Analyzing": "Analyzing",
                 "Fetching": "Fetching",
                 "Generating": "Analyzing Changes",
-                "Enriching": "Analyzing",
+                // Waiting for the architecture review, so the diagram renders once with its findings.
+                "Reviewing": "Checking Docs",
+                "Reading Docs": "Reading Docs",
                 "Loading": "Loading",
                 "default": "Loading"
             };
@@ -2514,19 +2065,6 @@
         if (S.__generatingInterval) {
             clearInterval(S.__generatingInterval);
             S.__generatingInterval = null;
-        }
-
-        if (enriching) {
-            ensureProgressBar();
-            const currentIndicator = btn.querySelector('.striffs-running-indicator');
-            const currentLabel = btn.querySelector('.striffs-local-btn-label');
-
-            if (currentIndicator && currentLabel) {
-                currentLabel.textContent = "Analyzing";
-            } else {
-                updateButtonContent(loadingIndicator("Analyzing"));
-            }
-            return;
         }
 
         if (failure) {
@@ -2674,6 +2212,7 @@
         el.addEventListener('mouseleave', () => {
             if (pending == null) pending = setTimeout(remove, Math.min(actualTimeout, 4000));
         });
+        return () => { clearTimeout(pending); remove(); };
     };
 
     // Compute and set #striff-diagram-view height (~80% viewport)
@@ -2946,11 +2485,13 @@
     border: 1px solid #444;
     background-color: #f8f8f8;
   }
+  /* Width auto, not 100%: a side panel narrows the surface with a margin, and a fixed width would
+     ignore that margin and leave the scroll area running on underneath the panel. */
   #striffs-surface{
     display:flex;
     gap:16px;
     align-items:stretch;
-    width:100%;
+    width:auto;
     height:100%;
     position: relative;
   }
@@ -2972,34 +2513,28 @@
     opacity: 0.5;
     cursor: not-allowed;
   }
-  /* Always-on documented-rule coverage headline on the diagram surface. Overlays the
-     top-left of the diagram view so it stays visible without opening the side panel and
-     is not pushed by the panel (which occupies the right). */
-  #striffs-coverage-headline{
-    position: absolute;
-    top: 10px;
-    left: 10px;
-    z-index: 3;
-    max-width: 60%;
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 6px 10px;
-    font-size: 12px;
-    font-weight: 600;
-    line-height: 1.2;
-    color: #ffdead;
-    background: rgba(14,14,14,0.94);
-    border: 1px solid #5a5a5a;
-    border-radius: 8px;
-    pointer-events: none;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+  /* A review still being read is working, not spent: it keeps nearly full strength so the spinner
+     is legible, while staying un-clickable. The outcome states keep the flat 0.5 above. */
+  #striffs-arch-review-btn:disabled.is-busy{
+    opacity: 0.9;
   }
-  #striffs-coverage-headline.striffs-coverage-headline--risk{
-    color: #ffd7a8;
-    border-color: #b35900;
+  /* The shared indicator is amber on a light button; this one sits on solid blue, so it draws
+     itself in the button's own text colour instead. */
+  .striffs-running-indicator--on-accent{
+    margin-right: 0;
+    width: 12px;
+    height: 12px;
+    flex: 0 0 12px;
+  }
+  .striffs-running-indicator--on-accent::before{
+    border-top-color: currentColor;
+    border-right-color: color-mix(in srgb, currentColor 45%, transparent);
+  }
+  .striffs-running-indicator--on-accent .striffs-running-indicator__dot{
+    width: 4px;
+    height: 4px;
+    background: currentColor;
+    box-shadow: none;
   }
   #striffs-scroll{
     position: relative;
@@ -3084,96 +2619,16 @@
   .striffs-zoom-reset:hover{
     background: var(--button-default-bgColor-hover, #eef1f4);
   }
+  /* vertical-align top: on the baseline, an inline block leaves a descender's gap below it, a few
+     pixels of scroll into nothing. */
   #striff-diagram-view .striff-svg-wrap{
     position: relative;
     display: inline-block;
+    vertical-align: top;
     width: auto;
     height: auto;
     min-width: 100%;
     min-height: 100%;
-  }
-  #striff-diagram-view .striffs-note-feedback-layer{
-    position: absolute;
-    inset: 0;
-    pointer-events: none;
-    z-index: 2;
-  }
-  #striff-diagram-view .striffs-note-feedback{
-    position: absolute;
-    display: flex;
-    flex-direction: row;
-    align-items: center;
-    justify-content: space-between;
-    pointer-events: auto;
-    box-sizing: border-box;
-    overflow: hidden;
-  }
-  #striff-diagram-view .striffs-note-feedback-left{
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    flex-shrink: 0;
-  }
-  #striff-diagram-view .striffs-note-feedback-right{
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    flex-shrink: 0;
-    margin-left: auto;
-  }
-  #striff-diagram-view .striffs-note-feedback-btn{
-    appearance: none;
-    border: none;
-    background: transparent;
-    color: #656d76;
-    border-radius: 4px;
-    padding: 2px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    cursor: pointer;
-    transition: all .15s ease;
-    font-size: 14px;
-    line-height: 1;
-  }
-  #striff-diagram-view .striffs-note-feedback-btn:hover{
-    background: #d0d7de;
-    color: #24292f;
-    transform: scale(1.1);
-    box-shadow: 0 1px 3px rgba(0,0,0,0.12);
-  }
-  #striff-diagram-view .striffs-note-feedback-btn:active{
-    transform: scale(0.95);
-  }
-  #striff-diagram-view .striffs-note-feedback-btn--up:hover{
-    background: #dafbe1;
-    color: #1a7f37;
-  }
-  #striff-diagram-view .striffs-note-feedback-btn--down:hover{
-    background: #ffebe9;
-    color: #cf222e;
-  }
-  #striff-diagram-view .striffs-note-feedback-btn--copy:hover{
-    background: #ddf4ff;
-    color: #0969da;
-  }
-  #striff-diagram-view .striffs-note-feedback-thanks{
-    font-size: 11px;
-    color: #656d76;
-    white-space: nowrap;
-    padding: 4px 8px;
-    animation: striffsThanksFade 0.3s ease;
-  }
-  @keyframes striffsThanksFade{
-    from { opacity: 0; transform: translateY(4px); }
-    to { opacity: 1; transform: translateY(0); }
-  }
-  #striff-diagram-view .striffs-note-feedback-btn svg{
-    width: 14px;
-    height: 14px;
-  }
-  #striff-diagram-view .striffs-note-feedback-icon{
-    display: block;
   }
   #striff-diagram-view svg{
     width: auto;
@@ -3384,10 +2839,9 @@
       </div>`;
 
     S.getStriffsContainerMarkup = (contentHtml = '<p>Loading Striffs...</p>') => `
-      <div id="striffs-coverage-headline" role="status" aria-live="polite" style="display:none;"></div>
       <div id="striffs-controls-wrap">
         <div id="striffs-controls">
-          <button id="striffs-arch-review-btn" type="button" class="striffs-ctl-btn" title="Run AI architecture review on this diagram" style="display:none;">AI Review</button>
+          <button id="striffs-arch-review-btn" type="button" class="striffs-ctl-btn" title="Open the architecture review" style="display:none;" disabled>Findings</button>
           <button id="striffs-comment-btn" type="button" class="striffs-ctl-btn" title="Comment on diagram" style="display:none;">
             ${S.octicon('comment')}
           </button>
@@ -3481,7 +2935,18 @@
         };
         if (!striffView.__striffsZoomBound || !striffView.__striffsZoomBoundScrollEl || !striffView.contains(striffView.__striffsZoomBoundScrollEl)) {
             striffView.__striffsZoomBound = true;
-            striffView.addEventListener('click', (event) => {
+            // The re-bind below used to leave the previous listener in place. The scroll element is
+            // replaced when the container's markup is rewritten -- which is what this guard detects
+            // -- but striffView itself survives, so every re-render added another click listener
+            // beside the last. A delegated click then ran the handler once per listener: harmless
+            // for zoom-reset and download, which do the same thing however often they run, but the
+            // findings button toggles, so an even number of listeners opened the panel and closed it
+            // again within the one click. The button appeared dead, and only a reload -- which built
+            // a fresh view with a single listener -- brought it back.
+            if (striffView.__striffsViewClickHandler) {
+                striffView.removeEventListener('click', striffView.__striffsViewClickHandler);
+            }
+            striffView.__striffsViewClickHandler = (event) => {
                 const target = event?.target;
                 if (!(target instanceof Element)) return;
                 if (target.closest?.('#striffs-zoom-reset')) {
@@ -3492,9 +2957,12 @@
                     runDownloadAction();
                 }
                 if (target.closest?.('#striffs-arch-review-btn')) {
-                    S.triggerArchitectureReview?.();
+                    // The review lands on the button behind the diagram, so the button only opens
+                    // and closes what has already arrived.
+                    if (S.__aiReviewStatus === "READY") S.toggleArchReviewPanel?.();
                 }
-            });
+            };
+            striffView.addEventListener('click', striffView.__striffsViewClickHandler);
             let isPanning = false;
             let panStartX = 0;
             let panStartY = 0;
@@ -3504,68 +2972,11 @@
             let panDistance = 0;
             let lastMouseX = 0;
             let lastMouseY = 0;
-            let panOp = null;
-            let zoomOp = null;
-            let zoomFinalizeTimer = 0;
             const scrollEl = striffView.querySelector('#striffs-scroll') || striffView;
             striffView.__striffsZoomBoundScrollEl = scrollEl;
-            const normalizePanZoomSnapshot = (snap) => {
-                const safe = snap || {};
-                return {
-                    coordinates: safe.coordinates || { x: Number(scrollEl.scrollLeft || 0), y: Number(scrollEl.scrollTop || 0) },
-                    zoom: Number(safe.zoom || S.__striffsZoom || 1),
-                    viewport: safe.viewport || { width: Number(scrollEl.clientWidth || 0), height: Number(scrollEl.clientHeight || 0) },
-                    viewableComponentIds: Array.isArray(safe.viewableComponentIds) ? safe.viewableComponentIds : [],
-                    viewableComponentCount: Number(safe.viewableComponentCount || 0),
-                    viewableComponentIdsTruncated: Boolean(safe.viewableComponentIdsTruncated)
-                };
-            };
-            const emitPanZoomOperation = (operation, startedAt, startSnap, endSnap, extraEvent = {}) => {
-                const start = normalizePanZoomSnapshot(startSnap);
-                const end = normalizePanZoomSnapshot(endSnap);
-                const durationMs = Math.max(0, Date.now() - Number(startedAt || Date.now()));
-                S.emitEngagementEvent?.("pan_zoom_operation", {
-                    operation,
-                    durationMs,
-                    startCoordinates: start.coordinates,
-                    endCoordinates: end.coordinates,
-                    zoomStart: start.zoom,
-                    zoomEnd: end.zoom,
-                    ...extraEvent
-                }, {
-                    viewportStart: start.viewport,
-                    viewportEnd: end.viewport,
-                    initialViewableComponents: start.viewableComponentIds,
-                    initialViewableComponentCount: start.viewableComponentCount,
-                    initialViewableComponentIdsTruncated: start.viewableComponentIdsTruncated,
-                    endingViewableComponents: end.viewableComponentIds,
-                    endingViewableComponentCount: end.viewableComponentCount,
-                    endingViewableComponentIdsTruncated: end.viewableComponentIdsTruncated
-                });
-            };
-            const finalizeZoomOperation = () => {
-                if (!zoomOp) return;
-                if (zoomFinalizeTimer) {
-                    clearTimeout(zoomFinalizeTimer);
-                    zoomFinalizeTimer = 0;
-                }
-                const end = S.capturePanZoomSnapshot?.();
-                emitPanZoomOperation("zoom", zoomOp.startedAt, zoomOp.start, end, {
-                    wheelSteps: Number(zoomOp.wheelSteps || 0)
-                });
-                zoomOp = null;
-            };
-            const scheduleZoomFinalize = () => {
-                if (zoomFinalizeTimer) clearTimeout(zoomFinalizeTimer);
-                zoomFinalizeTimer = window.setTimeout(
-                    finalizeZoomOperation,
-                    Number(S.ENGAGEMENT_ZOOM_IDLE_MS || 220)
-                );
-            };
             scrollEl.addEventListener('mousedown', (e) => {
                 if (e.button !== 0) return;
                 if (e.target && e.target.closest && e.target.closest('#striffs-controls')) return;
-                finalizeZoomOperation();
                 isPanning = true;
                 panMoved = false;
                 panDistance = 0;
@@ -3575,10 +2986,6 @@
                 lastMouseY = e.clientY;
                 panScrollLeft = scrollEl.scrollLeft;
                 panScrollTop = scrollEl.scrollTop;
-                panOp = {
-                    startedAt: Date.now(),
-                    start: S.capturePanZoomSnapshot?.()
-                };
                 striffView.classList.add('is-panning');
                 e.preventDefault();
             });
@@ -3601,18 +3008,9 @@
                 striffView.classList.remove('is-panning');
                 if (panMoved && panDistance > 10) {
                     S.__recentPanAt = Date.now();
-                    emitPanZoomOperation(
-                        "pan",
-                        panOp?.startedAt,
-                        panOp?.start,
-                        S.capturePanZoomSnapshot?.(),
-                        { distancePx: Math.round(panDistance) }
-                    );
                 }
-                panOp = null;
                 panMoved = false;
                 panDistance = 0;
-                S.queueReviewNoteFeedbackLayout?.();
             });
             scrollEl.addEventListener('wheel', (e) => {
                 const svg = S.__striffsSvg || striffView.querySelector('#striffs-content svg');
@@ -3630,17 +3028,7 @@
                 const clientY = atBottom
                     ? (scrollEl.getBoundingClientRect().top + viewportHeight / 2)
                     : e.clientY;
-                if (!zoomOp) {
-                    zoomOp = {
-                        startedAt: Date.now(),
-                        start: S.capturePanZoomSnapshot?.(),
-                        wheelSteps: 0
-                    };
-                }
-                const didApply = S.applyZoomAtPoint(scrollEl, svg, next, e.clientX, clientY);
-                if (!didApply) return;
-                zoomOp.wheelSteps = Number(zoomOp.wheelSteps || 0) + 1;
-                scheduleZoomFinalize();
+                S.applyZoomAtPoint(scrollEl, svg, next, e.clientX, clientY);
             }, { passive: false });
         }
         return striffView;
@@ -3701,7 +3089,6 @@
     S.__striffsNoChanges = true;
     S.__striffsReady = false;
     S.__striffsSvg = null;
-    S.clearReviewNoteFeedback?.();
     S.setAutoGenerateIntent?.(false);
     S.__striffsPathToComponentId?.clear?.();
     S.__striffsComponentIdToFile?.clear?.();
@@ -3721,7 +3108,7 @@
   };
 
   S.showStriffView = () => {
-    S.restoreEngagementContextFromCachedPayload?.();
+    S.restoreOperationTokenFromCachedPayload?.();
     if (S.__striffsNoChanges) {
       return S.applyNoChangesUiState?.("No changes were found");
     }
@@ -4972,13 +4359,6 @@
       } catch {}
     }
 
-    S.emitEngagementEvent?.("diagram_component_clicked", {
-      componentQualifiedName: dottedQn || null,
-      mappedFile: file || null,
-      hasMappedFile: Boolean(file),
-      diffId: diffId || null,
-      hasDiffTarget: Boolean(diffId)
-    });
     if (!file) {
       S.cwarn?.('Striffs component click: no file mapped for component', { id: qn });
       S.syncDiagramClickDebugState?.("missing-file", {
@@ -5339,8 +4719,8 @@
         if (typeof result.error === "string" && result.error.trim()) return result.error.trim();
         if (result.message === "error") return "Invalid response.";
         if (!Array.isArray(result.striffs)) return "Invalid Striffs response: missing striffs array.";
-        // operationId and engagementWriteToken are optional — their absence
-        // only affects telemetry, not diagram rendering.
+        // operationId and the operation access token are optional — their absence
+        // only affects the review status reads, not diagram rendering.
         return null;
     };
 
@@ -5356,14 +4736,14 @@
     };
 
     S.syncAiReviewStateFromResult = (result, { cachedStatus = null } = {}) => {
-        const engagement = S.extractEngagementContextFromPayload?.(result) || {};
+        const operationCtx = S.extractOperationTokenFromPayload?.(result) || {};
         const status = cachedStatus || S.getAiReviewStatusFromResult?.(result) || null;
         S.__aiReviewStatus = status;
         S.__aiReviewId = String(
             result?.aiReviewId || result?.ai_review_id || ""
         ).trim() || null;
         S.__aiReviewOperationId = String(
-            engagement.operationId || ""
+            operationCtx.operationId || ""
         ).trim() || null;
         if (status === "READY" && S.__aiReviewId) {
             S.__aiReviewLastCompletedReviewId = S.__aiReviewId;
@@ -5389,7 +4769,7 @@
       } catch (e) {
         cwarn("applyHoverability failed", e);
       }
-      // Show + affordances whenever SVG is visible (do NOT gate on engagement
+      // Show + affordances whenever SVG is visible (do NOT gate on the operation
       // context — the affordances are purely visual; the panel open is gated).
       if (!S.__commentState?.active) {
         S.applyCommentAffordances?.();
@@ -5407,21 +4787,21 @@
     return `striffs:${id.owner}/${id.repo}#${id.pull_number}`;
   };
 
-  S.engagementCacheKey = () => {
+  S.operationTokenCacheKey = () => {
     const key = S.cacheKey?.();
-    return key ? `${key}:engagement` : null;
+    return key ? `${key}:operation-token` : null;
   };
 
-  S.persistEngagementContextForCurrentPr = () => {
+  S.persistOperationTokenForCurrentPr = () => {
     try {
-      const key = S.engagementCacheKey?.();
+      const key = S.operationTokenCacheKey?.();
       if (!key) return false;
-      const operationId = String(S.__engagementCtx?.operationId || '').trim();
-      const engagementWriteToken = String(S.__engagementCtx?.engagementWriteToken || '').trim();
-      if (!operationId || !engagementWriteToken) return false;
+      const operationId = String(S.__operationTokenCtx?.operationId || '').trim();
+      const operationAccessToken = String(S.__operationTokenCtx?.operationAccessToken || '').trim();
+      if (!operationId || !operationAccessToken) return false;
       localStorage.setItem(key, JSON.stringify({
         operationId,
-        engagementWriteToken,
+        operationAccessToken,
         savedAt: Date.now()
       }));
       return true;
@@ -5430,10 +4810,10 @@
     }
   };
 
-  S.restoreEngagementContextFromCachedPayload = () => {
+  S.restoreOperationTokenFromCachedPayload = () => {
     try {
-      const existingCtx = S.__engagementCtx || {};
-      if (String(existingCtx.operationId || '').trim() && String(existingCtx.engagementWriteToken || '').trim()) {
+      const existingCtx = S.__operationTokenCtx || {};
+      if (String(existingCtx.operationId || '').trim() && String(existingCtx.operationAccessToken || '').trim()) {
         return true;
       }
       const key = S.cacheKey?.();
@@ -5441,27 +4821,26 @@
       const raw = localStorage.getItem(key);
       const parsed = raw ? JSON.parse(raw) : null;
       let cachedOperationId = String(parsed?.cachedOperationId || '').trim();
-      let cachedEngagementWriteToken = String(parsed?.cachedEngagementWriteToken || '').trim();
-      if (!cachedOperationId || !cachedEngagementWriteToken) {
-        const engagementKey = S.engagementCacheKey?.();
-        const engagementRaw = engagementKey ? localStorage.getItem(engagementKey) : null;
-        if (engagementRaw) {
+      let cachedOperationAccessToken = String(parsed?.cachedOperationAccessToken || '').trim();
+      if (!cachedOperationId || !cachedOperationAccessToken) {
+        const tokenKey = S.operationTokenCacheKey?.();
+        const tokenRaw = tokenKey ? localStorage.getItem(tokenKey) : null;
+        if (tokenRaw) {
           try {
-            const engagementParsed = JSON.parse(engagementRaw);
-            cachedOperationId = cachedOperationId || String(engagementParsed?.operationId || '').trim();
-            cachedEngagementWriteToken = cachedEngagementWriteToken || String(engagementParsed?.engagementWriteToken || '').trim();
+            const tokenParsed = JSON.parse(tokenRaw);
+            cachedOperationId = cachedOperationId || String(tokenParsed?.operationId || '').trim();
+            cachedOperationAccessToken = cachedOperationAccessToken || String(tokenParsed?.operationAccessToken || '').trim();
           } catch {}
         }
       }
-      if (!cachedOperationId || !cachedEngagementWriteToken) return false;
-      S.__engagementCtx = {
-        sessionId: S.ensureEngagementSessionId?.() || existingCtx.sessionId || null,
+      if (!cachedOperationId || !cachedOperationAccessToken) return false;
+      S.__operationTokenCtx = {
         operationId: cachedOperationId,
-        engagementWriteToken: cachedEngagementWriteToken
+        operationAccessToken: cachedOperationAccessToken
       };
-      S.__lastEngagementContextError = null;
-      S.persistEngagementContextForCurrentPr?.();
-      S.syncEngagementDebugState?.();
+      S.__lastOperationTokenError = null;
+      S.persistOperationTokenForCurrentPr?.();
+      S.syncOperationTokenDebugState?.();
       return true;
     } catch {
       return false;
@@ -5471,7 +4850,7 @@
   S.prScopeKey = S.cacheKey;
 
   S.resetPrScopedState = (reason = 'unknown') => {
-    try { S.cancelEnrichmentPolling?.(`pr-scope-change:${reason}`); } catch {}
+    try { S.cancelReviewCollection?.(`pr-scope-change:${reason}`); } catch {}
     try { S.exitCommentMode?.(); } catch {}
 
     // This only runs when the PR scope actually changed (its sole callers are the
@@ -5492,27 +4871,16 @@
     S.__aiReviewStatus = null;
     S.__aiReviewId = null;
     S.__aiReviewOperationId = null;
-    S.__aiReviewPollInFlight = false;
-    if (S.__aiReviewPollTimer) {
-      try { clearTimeout(S.__aiReviewPollTimer); } catch {}
-      S.__aiReviewPollTimer = null;
-    }
+    S.__aiReviewReason = null;
+    S.__aiReviewWarmupRequired = false;
 
-    // Reset engagement counters on PR navigation
-    S.__engagementSentCount = 0;
-    S.__engagementAckCount = 0;
-    S.__engagementFailedCount = 0;
-    S.__engagementSkippedCount = 0;
-
-    // Preserve the session id, but clear the per-operation ids/tokens.
+    // Clear the per-operation id and token.
     try {
-      const sessionId = S.ensureEngagementSessionId?.() || S.__engagementCtx?.sessionId || null;
-      S.__engagementCtx = { sessionId, operationId: null, engagementWriteToken: null };
+      S.__operationTokenCtx = { operationId: null, operationAccessToken: null };
     } catch {}
 
     S.__lastEnrichmentResult = null;
 
-    try { S.clearReviewNoteFeedback?.(); } catch {}
     try { S.__striffsPathToComponentId?.clear?.(); } catch {}
     try { S.__striffsComponentIdToFile?.clear?.(); } catch {}
     try { S.__striffsComponentIdToDiffId?.clear?.(); } catch {}
@@ -5640,28 +5008,31 @@
           return false;
 	        }
           const cachedOperationId = String(parsed?.cachedOperationId || '').trim();
-          const cachedEngagementWriteToken = String(parsed?.cachedEngagementWriteToken || '').trim();
-	        S.updateEngagementContextFromResult?.(parsed.result);
-          if ((cachedOperationId || cachedEngagementWriteToken) && !String(S.__engagementCtx?.engagementWriteToken || '').trim()) {
-            const prevCtx = S.__engagementCtx || {};
-            S.__engagementCtx = {
-              sessionId: S.ensureEngagementSessionId?.() || prevCtx.sessionId || null,
+          const cachedOperationAccessToken = String(parsed?.cachedOperationAccessToken || '').trim();
+	        S.updateOperationTokenFromResult?.(parsed.result);
+          if ((cachedOperationId || cachedOperationAccessToken) && !String(S.__operationTokenCtx?.operationAccessToken || '').trim()) {
+            const prevCtx = S.__operationTokenCtx || {};
+            S.__operationTokenCtx = {
               operationId: String(prevCtx.operationId || cachedOperationId || '').trim() || null,
-              engagementWriteToken: String(prevCtx.engagementWriteToken || cachedEngagementWriteToken || '').trim() || null
+              operationAccessToken: String(prevCtx.operationAccessToken || cachedOperationAccessToken || '').trim() || null
             };
-            if (S.__engagementCtx.operationId && S.__engagementCtx.engagementWriteToken) {
-              S.__lastEngagementContextError = null;
+            if (S.__operationTokenCtx.operationId && S.__operationTokenCtx.operationAccessToken) {
+              S.__lastOperationTokenError = null;
             }
-            S.syncEngagementDebugState?.();
+            S.syncOperationTokenDebugState?.();
           }
-          if (!String(S.__engagementCtx?.engagementWriteToken || '').trim()) {
-            S.restoreEngagementContextFromCachedPayload?.();
+          if (!String(S.__operationTokenCtx?.operationAccessToken || '').trim()) {
+            S.restoreOperationTokenFromCachedPayload?.();
           } else {
-            S.persistEngagementContextForCurrentPr?.();
+            S.persistOperationTokenForCurrentPr?.();
           }
-          S.syncAiReviewStateFromResult?.(parsed.result, {
+          const cachedReviewStatus = S.syncAiReviewStateFromResult?.(parsed.result, {
             cachedStatus: String(parsed?.cachedAiReviewStatus || "").trim().toUpperCase() || null
           });
+          // A diagram cached before its review finished is not the finished result, so it is not shown
+          // here. The load that a 'stale' cache triggers reads the same entry and waits for the review,
+          // so the diagram renders once, with its findings.
+          if (cachedReviewStatus === "PENDING" || cachedReviewStatus === "RUNNING") return false;
 	        const container = S.ensureStriffContainer();
 	        if (!container) return false;
 	        const rendered = S.renderStriffsInto(container, parsed.result);
@@ -5670,12 +5041,8 @@
 	        S.__striffsReady = true;
 	        S.__lastFetchedUpdatedAt = updated_at;
 	        S.setAutoGenerateIntent?.(true);
-          // Restore enrichment result for panel if cached diagram was enriched
-          if (S.__aiReviewStatus === "READY") {
-            S.__lastEnrichmentResult = parsed.result;
-          }
           S.updateStriffButton({ success: true, tooltip: "View" });
-          S.updateArchReviewButton?.();
+          S.setReviewState?.(cachedReviewStatus, parsed.result);
 	        return true;
 	      };
 
@@ -5812,7 +5179,6 @@
         const State = S.state;
         State?.resetTooLarge?.();
         S.__striffsSvg = null;
-        S.clearReviewNoteFeedback?.();
         const content = target.querySelector("#striffs-content") || target;
         content.innerHTML = `<div id="striffs-status">Rendering diagram…</div>`;
 
@@ -5877,8 +5243,6 @@
                     if (!didFit) {
                       S.syncZoomedSvgLayout?.(scrollEl, svg);
                     }
-                    // Trigger feedback layout after SVG is sized
-                    setTimeout(() => S.queueReviewNoteFeedbackLayout?.(), 50);
                     try {
                       if (S.isDebug?.()) {
                         S.__debugSvgText = null;
@@ -5902,9 +5266,6 @@
                     S.applyHoverability(); // now colors clickable text; also applies comment affordances
                     S.reapplySelectionHighlights?.();
                     S.applyPendingFocus?.();
-                    S.queueReviewNoteFeedbackLayout?.();
-                    // Also trigger after a short delay to ensure proper positioning
-                    setTimeout(() => S.queueReviewNoteFeedbackLayout?.(), 100);
                 }
 
                 const s = document.getElementById("striffs-status");
@@ -5964,13 +5325,7 @@
 	      return;
 	    }
 	    if (S.__striffsReady && S.__striffsSvg) {
-        if (S.__aiReviewStatus === "PENDING" || S.__aiReviewStatus === "RUNNING") {
-          S.updateStriffButton({
-            enriching: true,
-            tooltip: "Analyzing"
-          });
-          return;
-        }
+        // A review still arriving is the findings button's to show; this one is about the diagram.
 	      S.updateStriffButton({
 	        success: true,
 	        tooltip: "Striffs loaded. Click to view."
@@ -6000,7 +5355,7 @@
 
   S.isCommentModeAvailable = function isCommentModeAvailable() {
     if (!S.__striffsSvg) return false;
-    const opId = String(S.__engagementCtx?.operationId || "").trim();
+    const opId = String(S.__operationTokenCtx?.operationId || "").trim();
     return Boolean(opId);
   };
 
@@ -6032,15 +5387,15 @@
   S.enterCommentMode = async function enterCommentMode() {
     if (S.__commentState.active) { S.clog?.('[comment] already active'); return; }
 
-    let opId = String(S.__engagementCtx?.operationId || "").trim();
+    let opId = String(S.__operationTokenCtx?.operationId || "").trim();
     S.clog?.('[comment] enterCommentMode', { opId, hasOpId: !!opId });
 
-    // Lazily fetch engagement context if missing
+    // Lazily fetch the operation context if missing
     if (!opId) {
       S.toast?.("Loading operation context...", "info", { timeoutMs: 4000 });
       try {
-        await S.refreshEngagementContextFromFreshResult?.(S.extractPRMetadata?.());
-        opId = String(S.__engagementCtx?.operationId || "").trim();
+        await S.refreshOperationTokenFromFreshResult?.(S.extractPRMetadata?.());
+        opId = String(S.__operationTokenCtx?.operationId || "").trim();
       } catch {}
       if (!opId) {
         S.toast?.("Cannot enter comment mode: unable to obtain operation context.", "warning", { timeoutMs: 5000 });
@@ -6067,7 +5422,6 @@
     S.openCommentPanel?.();
     const commentBtn = document.getElementById('striffs-comment-btn');
     if (commentBtn) commentBtn.classList.add('is-active');
-    S.emitEngagementEvent?.("comment_mode_entered", {});
   };
 
   S.exitCommentMode = function exitCommentMode() {
@@ -6083,7 +5437,6 @@
       if (wasActive) {
         S.clearAllSelectionHighlights?.();
         S.removeCommentAffordances?.();
-        S.emitEngagementEvent?.("comment_mode_exited", {});
       }
     } catch (err) {
       S.cwarn?.("[exitCommentMode] cleanup error", err);
@@ -6251,7 +5604,7 @@
     const seq = ++S.__commentState.requestSeq;
 
     let svg = null;
-    const opId = operationId || S.__engagementCtx?.operationId;
+    const opId = operationId || S.__operationTokenCtx?.operationId;
     if (opId) {
       try {
         const componentList = selectedIds.join(",");
@@ -6326,7 +5679,7 @@
       await S.enterCommentMode?.();
     }
 
-    if (!S.__commentState.active) { S.clog?.('[comment-click] abort: not active after enter attempt', { opId: S.__engagementCtx?.operationId || '' }); return false; }
+    if (!S.__commentState.active) { S.clog?.('[comment-click] abort: not active after enter attempt', { opId: S.__operationTokenCtx?.operationId || '' }); return false; }
     S.clog?.('[comment-click] toggling', qn, { selectedIds: [...S.__commentState.selectedIds] });
     S.toggleComponentSelection?.(qn);
     return true;
@@ -6614,11 +5967,6 @@
     if (S.__commentState.submitting) return;
     S.__commentState.submitting = true;
     updateSubmitState(document.getElementById(PANEL_ID));
-
-    S.emitEngagementEvent?.("comment_submitted", {
-      componentCount: selectedIds.length,
-      componentIds: selectedIds.slice(0, 10)
-    });
 
     try {
       await fillComposer(previewSvg);
@@ -7566,6 +6914,20 @@
         color:var(--fgColor-muted,#6e7781);
         margin-bottom:10px;
       }
+      .striffs-arch-review-panel__doc-change{
+        font-size:12px;
+        line-height:1.45;
+        padding:8px 10px;
+        margin-top:10px;
+        border-radius:6px;
+        background:var(--bgColor-muted,#f6f8fa);
+        color:var(--fgColor-default,#1f2328);
+        overflow-wrap:anywhere;
+      }
+      .striffs-arch-review-panel__doc-change-list{
+        margin:6px 0 0;
+        padding-left:18px;
+      }
       /* --- Documented rules --- */
       .striffs-arch-review-panel__rule{
         padding:10px 12px;
@@ -7593,9 +6955,6 @@
         border-left-color:rgba(154,103,0,.5);
         background:rgba(255,248,197,.35);
       }
-      /* Advisory rows are deliberately colourless: any pass/fail palette would read as a verdict,
-         and nothing verified these. */
-      .striffs-arch-review-panel__rule--advisory{ border-left-color:rgba(110,118,129,.35); }
       .striffs-arch-review-panel__rule-head{
         display:flex;
         align-items:baseline;
@@ -7636,44 +6995,6 @@
         padding-top:10px;
         border-top:1px dashed var(--borderColor-muted,#d8dee4);
       }
-      /* --- Structural checks --- */
-      .striffs-arch-review-panel__check{
-        padding:7px 10px;
-        border-radius:6px;
-        margin-bottom:4px;
-        background:#f8fafc;
-      }
-      .striffs-arch-review-panel__check--clean{ background:transparent; }
-      .striffs-arch-review-panel__check--flagged{ background:rgba(255,235,233,.5); }
-      .striffs-arch-review-panel__check-head{
-        display:flex;
-        align-items:baseline;
-        justify-content:space-between;
-        gap:8px;
-      }
-      .striffs-arch-review-panel__check-name{
-        font-size:13px;
-        color:var(--fgColor-default,#1f2328);
-      }
-      .striffs-arch-review-panel__check--clean .striffs-arch-review-panel__check-name{
-        color:var(--fgColor-muted,#6e7781);
-      }
-      .striffs-arch-review-panel__check-verdict{
-        font-size:12px;
-        white-space:nowrap;
-        color:var(--fgColor-muted,#6e7781);
-      }
-      .striffs-arch-review-panel__check--flagged .striffs-arch-review-panel__check-verdict{
-        font-weight:600;
-        color:var(--fgColor-default,#1f2328);
-      }
-      .striffs-arch-review-panel__check-detail{
-        margin-top:4px;
-        font-size:12px;
-        line-height:1.4;
-        color:var(--fgColor-muted,#6e7781);
-        overflow-wrap:anywhere;
-      }
       .striffs-arch-review-panel__footer{
         padding:10px 16px;
         border-top:1px solid var(--borderColor-muted,#d8dee4);
@@ -7692,6 +7013,7 @@
 (async () => {
   const S = (window.Striffs = window.Striffs || {});
   const { cwarn, cerr } = S;
+  const ReviewState = globalThis.StriffsReviewStateUtils;
   const TIMEOUTS = S.TIMEOUTS || {};
   const timeoutFor = (key, fallback) =>
     typeof TIMEOUTS[key] === "number" ? TIMEOUTS[key] : fallback;
@@ -7800,13 +7122,6 @@
         });
       }
 
-      // Convert hyphenated back to dotted for telemetry (more readable/standard)
-      const dottedComponentId = S.toDottedName(mappedComponentId);
-      S.emitEngagementEvent?.("file_explorer_item_clicked_in_striffs_view", {
-        filePath: normalizedPath,
-        mappedComponentId: dottedComponentId,
-        hasMappedComponent: Boolean(mappedComponentId)
-      });
       if (mappedComponentId) {
         try {
           const root = document.documentElement;
@@ -7841,7 +7156,7 @@
           targetNode.closest?.("g.entity[data-qualified-name]");
         if (!target) return false;
         const qn = target.getAttribute("data-qualified-name");
-        // Convert hyphenated to dotted for engagement telemetry and debug state
+        // Convert hyphenated to dotted for debug state
         const dottedQn = S.toDottedName(qn);
         if (S.isReviewNoteQualifiedName?.(qn)) {
           S.syncDiagramClickDebugState?.("ignored-note", {
@@ -7927,7 +7242,7 @@
             }
           }
         }
-        // Route affordance clicks to comment handler regardless of engagement
+        // Route affordance clicks to comment handler regardless of operation
         // context availability — enterCommentMode handles context fetch lazily.
         if (affTarget) {
           S.clog?.('[diagram-click] affordance clicked');
@@ -8410,7 +7725,7 @@
       if (!key) return false;
       localStorage.removeItem(key);
       localStorage.removeItem(`striffsCacheMeta:${key}`);
-      localStorage.removeItem(`${key}:engagement`);
+      localStorage.removeItem(`${key}:operation-token`);
       return true;
     } catch {
       return false;
@@ -8475,18 +7790,18 @@
     return parsed.result || null;
   }
 
-  function buildCacheableResultWithEngagement(result) {
+  function buildCacheableResultWithOperationToken(result) {
     if (!result || typeof result !== 'object') return result;
-    const currentCtx = S.__engagementCtx || {};
+    const currentCtx = S.__operationTokenCtx || {};
     const currentOperationId = String(
       S.__aiReviewOperationId || currentCtx.operationId || ''
     ).trim();
-    const currentToken = String(currentCtx.engagementWriteToken || '').trim();
+    const currentToken = String(currentCtx.operationAccessToken || '').trim();
     if (!currentOperationId && !currentToken) return result;
 
-    const extracted = S.extractEngagementContextFromPayload?.(result) || {};
+    const extracted = S.extractOperationTokenFromPayload?.(result) || {};
     const existingOperationId = String(extracted.operationId || '').trim();
-    const existingToken = String(extracted.engagementWriteToken || '').trim();
+    const existingToken = String(extracted.operationAccessToken || '').trim();
     if (existingOperationId && existingToken) return result;
 
     const cachedResult = Array.isArray(result) ? result.slice() : { ...result };
@@ -8494,7 +7809,7 @@
       cachedResult.operationId = currentOperationId;
     }
     if (!existingToken && currentToken) {
-      cachedResult.engagementWriteToken = currentToken;
+      cachedResult.operationAccessToken = currentToken;
     }
     return cachedResult;
   }
@@ -8505,12 +7820,12 @@
     try {
       const key = S.cacheKey();
       if (!key) return false;
-        const cacheableResult = buildCacheableResultWithEngagement(result);
+        const cacheableResult = buildCacheableResultWithOperationToken(result);
 	      const payload = {
 	        result: cacheableResult,
           cachedAiReviewStatus: S.getAiReviewStatusFromResult?.(result),
-          cachedOperationId: String(S.__aiReviewOperationId || S.__engagementCtx?.operationId || '').trim() || null,
-          cachedEngagementWriteToken: String(S.__engagementCtx?.engagementWriteToken || '').trim() || null,
+          cachedOperationId: String(S.__aiReviewOperationId || S.__operationTokenCtx?.operationId || '').trim() || null,
+          cachedOperationAccessToken: String(S.__operationTokenCtx?.operationAccessToken || '').trim() || null,
 	        updated_at: updatedAt,
 	        commit_count: commitCount != null ? commitCount : null,
 	        savedAt: Date.now(),
@@ -8525,11 +7840,11 @@
       };
       try { window.__striffsCacheMeta = payload.savedAt; window.__striffsCacheKey = key; } catch {}
       setCacheDataset(payload.savedAt);
-      if (payload.cachedOperationId && payload.cachedEngagementWriteToken) {
+      if (payload.cachedOperationId && payload.cachedOperationAccessToken) {
         try {
-          localStorage.setItem(`${key}:engagement`, JSON.stringify({
+          localStorage.setItem(`${key}:operation-token`, JSON.stringify({
             operationId: payload.cachedOperationId,
-            engagementWriteToken: payload.cachedEngagementWriteToken,
+            operationAccessToken: payload.cachedOperationAccessToken,
             savedAt: payload.savedAt
           }));
         } catch {}
@@ -8592,42 +7907,27 @@
     return escHtml(s).replace(/`([^`]+)`/g, '<code class="striffs-arch-review-panel__code">$1</code>');
   }
 
-  // Reviewer-facing names for the fixed detector roster, mirroring
-  // CheckRunFormatter.STRUCTURAL_CHECK_NAMES / DOC_CHECK_NAMES so the panel and the check run
-  // name the same check the same way on the same PR. Order matters: it is the order clean rows
-  // render in. A detector absent from this map is absent from the API's roster too -- an
-  // unrecognized id is skipped rather than shown under its raw enum name.
-  const STRUCTURAL_CHECK_NAMES = [
-    ["NEW_PACKAGE_CYCLE", "Package cycles"],
-    ["CYCLIC_DEPENDENCY_SEED", "Cycle seeds"],
-    ["NEW_DIRECTIONAL_BOUNDARY_CROSSING", "Boundary crossings"],
-    ["MODULE_BOUNDARY_VIOLATION", "Module boundaries"],
-    ["LAYER_SKIP", "Layer integrity"],
-    ["PRODUCTION_DEPENDS_ON_TEST", "Production → test edges"],
-    ["STABLE_CONTRACT_CHANGE", "Public contract stability"],
-    ["INTERFACE_TO_CONCRETE_DOWNGRADE", "Interface downgrades"],
-    ["ENCAPSULATION_DROP", "Encapsulation"],
-    ["HUB_FORMATION", "Hub formation"],
-    ["WMC_GROWTH", "Complexity growth"],
-    ["INSTABILITY_SPIKE", "Coupling stability"]
-  ];
-  // Doc-tier checks render above the structural roster -- a rule the team wrote down outranks a
-  // generic heuristic -- and never render a clean row: the evaluator records violations only, so
-  // "held" cannot be derived from the absence of one.
-  const DOC_CHECK_NAMES = [
-    ["DOC_DEPENDENCY_RULE", "Documented dependency rules"],
-    ["DOC_ARCHITECTURE_ADVISORY", "Documented intentions"]
-  ];
+  // Finding kinds that come from the repository's documented rules. Older API versions also send
+  // structural-detector findings in the same array; the panel no longer shows those, so a finding
+  // of any other kind is ignored. DOC_DEPENDENCY_RULE is an earlier name for a documented-rule
+  // finding, kept so an older response is read the same way.
+  const DOC_RULE_FINDING_KINDS = new Set(["DOCUMENTED_RULE", "DOC_DEPENDENCY_RULE", "DOC_ARCHITECTURE_ADVISORY"]);
+
+  function docRuleFindings(result) {
+    const findings = Array.isArray(result?.findings) ? result.findings : [];
+    return findings.filter(f => f && DOC_RULE_FINDING_KINDS.has(String(f.detectorId || "").trim().toUpperCase()));
+  }
 
   /**
-   * Whether the deterministic detectors actually ran for this result. Mirrors
-   * CheckRunFormatter.reviewRan: a populated review summary is only ever written by a completed
-   * pass, and findings can only come from live detectors. Absent both, rendering the roster would
-   * present "didn't check" as "checked, clean" -- the one claim this panel must never make.
+   * Whether a review actually ran for this result. A populated review summary is only ever written
+   * by a completed pass, and findings or documented-rule verdicts can only come from one. Absent
+   * all three, any "nothing to flag" wording would present "didn't check" as "checked, clean" --
+   * the one claim this panel must never make.
    */
   function reviewRan(result) {
     if (result?.reviewSummary && Object.keys(result.reviewSummary).length > 0) return true;
-    return Array.isArray(result?.findings) && result.findings.length > 0;
+    if (Array.isArray(result?.findings) && result.findings.length > 0) return true;
+    return Array.isArray(result?.docFactVerdicts) && result.docFactVerdicts.length > 0;
   }
 
   function shortDocPath(path) {
@@ -8636,10 +7936,62 @@
     return slash < 0 ? s : s.slice(slash + 1);
   }
 
-  function simpleName(fqn) {
-    const s = String(fqn || "");
-    const dot = s.lastIndexOf(".");
-    return dot < 0 ? s : s.slice(dot + 1);
+  // The outcomes a documented rule is shown with: what this PR did to it, or found it already doing.
+  // A rule the review could not check -- UNCLEAR, or any status this extension does not know -- is not
+  // shown at all, and so can never be shown as holding.
+  const SHOWN_RULE_STATUSES = new Set(["VIOLATED", "RESTORED", "PRE_EXISTING", "MAINTAINED"]);
+  function shownVerdicts(result) {
+    const verdicts = Array.isArray(result?.docFactVerdicts) ? result.docFactVerdicts : [];
+    return verdicts.filter(v => v && SHOWN_RULE_STATUSES.has(String(v.status || "").trim().toUpperCase()));
+  }
+
+  // Documented rules a doc edit retired or restored, grouped by doc in the order they arrive.
+  // Optional: older API versions do not send it. Informational: a retired rule is one its doc no
+  // longer states, so it is not a rule this change could break, and it says nothing about whether the
+  // change is clean. An entry without a doc, a statement or a known change says nothing.
+  const DOC_RULE_CHANGES_SHOWN_PER_DOC = 10;
+  function docRuleChangesByDoc(result) {
+    const entries = Array.isArray(result?.docRuleChanges) ? result.docRuleChanges : [];
+    const byDoc = new Map();
+    for (const entry of entries) {
+      const path = String(entry?.docPath || "").trim();
+      const statement = String(entry?.statement || "").trim();
+      const change = String(entry?.change || "").trim().toLowerCase();
+      if (!path || !statement || (change !== "retired" && change !== "restored")) continue;
+      if (!byDoc.has(path)) byDoc.set(path, { path, retired: [], restored: [] });
+      byDoc.get(path)[change].push({ statement, evidence: String(entry?.evidence || "").trim() });
+    }
+    return [...byDoc.values()];
+  }
+
+  const docRuleChangeCount = (result, change) =>
+    docRuleChangesByDoc(result).reduce((n, doc) => n + doc[change].length, 0);
+
+  function buildDocRuleChangesHtml(docs) {
+    const rules = (n) => `${n} documented rule${n === 1 ? "" : "s"}`;
+    const shown = (items) => ({
+      items: items.slice(0, DOC_RULE_CHANGES_SHOWN_PER_DOC),
+      more: Math.max(0, items.length - DOC_RULE_CHANGES_SHOWN_PER_DOC)
+    });
+    return docs.map((doc) => {
+      const name = escHtml(shortDocPath(doc.path));
+      let out = "";
+      if (doc.retired.length > 0) {
+        const n = doc.retired.length;
+        const { items, more } = shown(doc.retired);
+        out += `<div class="striffs-arch-review-panel__doc-change">📝 ${name} changed and no longer states ${rules(n)}, which ${n === 1 ? "is" : "are"} retired and no longer checked:
+          <ul class="striffs-arch-review-panel__doc-change-list">${items.map((r) =>
+            `<li>${escHtmlWithCode(r.statement)}${r.evidence ? ` — ${escHtml(r.evidence)}` : ""}</li>`).join("")}${
+            more > 0 ? `<li>+${more} more</li>` : ""}</ul>
+        </div>`;
+      }
+      if (doc.restored.length > 0) {
+        const { items, more } = shown(doc.restored);
+        out += `<div class="striffs-arch-review-panel__doc-change">📝 ${name} states ${rules(doc.restored.length)} again: ${items.map((r) =>
+          `${escHtmlWithCode(r.statement)}${r.evidence ? ` (${escHtml(r.evidence)})` : ""}`).join("; ")}${more > 0 ? `; +${more} more` : ""}</div>`;
+      }
+      return out;
+    }).join("");
   }
 
   /**
@@ -8651,49 +8003,38 @@
    * on filtering for a `tier` and a `RAISED` status that no longer arrive -- so every row, including
    * violations, rendered as "nothing stood out".
    *
-   * Four states, because the server sends four. An earlier revision here collapsed this to a binary
-   * on the premise that "the server drops rules that govern nothing in the change before they reach
-   * a verdict". That premise is wrong: `touchesChange` is a FIELD on the verdict, and only the
-   * GitHub check-run formatter filters on it -- `AIReviewController` and `StriffResponseAssembler`
-   * both hand this payload the complete record. A scrapy review sends 15 UNCLEAR rows out of 20, and
-   * under the binary every one of them rendered "not broken by this change".
+   * Four outcomes are shown: broken by this change, restored by it, already broken, and holding. The
+   * review is best-effort, and a reader is shown what it checked, not what it could not: a rule it
+   * could not check is left out. Above all, such a rule never renders as holding -- an abstention
+   * shown as a pass is a clean bill of health nobody earned. "Already broken" stays distinct from
+   * "holds" for the same reason.
    *
-   * "Couldn't tell" must stay distinct from "not broken", and "already broken" from both. Folding
-   * any of them into the pass state turns an abstention, or a live violation, into a clean bill of
-   * health in the one place a reader would most trust it.
-   *
-   * Absent entirely when no statements were checked -- an empty section implies the docs were
-   * consulted and found silent, which is a different claim from not having consulted them.
+   * Absent entirely when no rule is shown and no doc edit changed any -- an empty section implies the
+   * docs were consulted and found silent, which is a different claim from not having consulted them.
    */
   function buildDocumentedRulesHtml(result) {
-    const verdicts = Array.isArray(result?.docFactVerdicts) ? result.docFactVerdicts.filter(Boolean) : [];
-    if (verdicts.length === 0) return "";
+    const verdicts = shownVerdicts(result);
+    const changes = docRuleChangesByDoc(result);
+    if (verdicts.length === 0 && changes.length === 0) return "";
 
     // What this PR did, together: what it broke, then what it fixed. Then the debt it inherited,
-    // then what it left standing, then what could not be checked. Mirrors CheckRunFormatter's row
-    // order so the panel and the check run do not disagree about what matters.
-    const ORDER = { VIOLATED: 0, RESTORED: 1, PRE_EXISTING: 2, MAINTAINED: 3, UNCLEAR: 4 };
-    const rank = v => (v.status in ORDER ? ORDER[v.status] : ORDER.UNCLEAR);
-    const sorted = verdicts.slice().sort((a, b) => rank(a) - rank(b));
+    // then what it left standing -- the check run's order, so the two surfaces do not disagree about
+    // what matters.
+    const ORDER = { VIOLATED: 0, RESTORED: 1, PRE_EXISTING: 2, MAINTAINED: 3 };
+    const statusOf = v => String(v.status || "").trim().toUpperCase();
+    const sorted = verdicts.slice().sort((a, b) => ORDER[statusOf(a)] - ORDER[statusOf(b)]);
 
     const html = sorted.map(v => {
-      const violated = v.status === "VIOLATED";
-      const alreadyBroken = v.status === "PRE_EXISTING";
-      const held = v.status === "MAINTAINED";
-      // The fifth outcome this fallback was written for. RESTORED means the document asserted
-      // something the code lacked and this change supplied it, so rendering it as "couldn't check"
-      // -- which is what an unrecognised status gets -- said the opposite of the truth about the
-      // one row worth congratulating.
-      const restored = v.status === "RESTORED";
-      // An unrecognised status still falls in with "couldn't tell" rather than with "holds": a
-      // server that grows a sixth outcome must not have it render as a pass here.
-      const modifier = violated ? "fail" : restored ? "restored"
-        : alreadyBroken ? "stale" : held ? "pass" : "advisory";
+      const status = statusOf(v);
+      const violated = status === "VIOLATED";
+      const alreadyBroken = status === "PRE_EXISTING";
+      // RESTORED: the document asserted something the code lacked, and this change supplied it.
+      const restored = status === "RESTORED";
+      const modifier = violated ? "fail" : restored ? "restored" : alreadyBroken ? "stale" : "pass";
       const verdict = violated ? "❌ broken by this change"
         : restored ? "✨ restored by this change"
         : alreadyBroken ? "⚠️ already broken, not by this PR"
-        : held ? "✅ holds"
-        : "💭 couldn't check";
+        : "✅ holds";
       // A pre-existing violation carries its witnessing edges too -- they are the whole value of
       // the row. The last entry is the edge; the first is the explanatory note.
       const detail = (violated || alreadyBroken || restored) && Array.isArray(v.evidence) && v.evidence.length > 0
@@ -8709,157 +8050,36 @@
         </div>`;
     }).join("");
 
+    const note = verdicts.length
+      ? `<div class="striffs-arch-review-panel__section-note">Rules quoted from this repository's own docs and checked against the dependency graph this PR produces. A rule shown as holding is not broken by this PR, which says nothing about the rest of the codebase; one shown as already broken is broken in the code checked, but not by this PR; one shown as restored was broken before this PR and is not now.</div>`
+      : "";
     return `<div class="striffs-arch-review-panel__section">
       <div class="striffs-arch-review-panel__section-title">Documented Rules</div>
-      <div class="striffs-arch-review-panel__section-note">Rules quoted from this repository's own docs and checked against the dependency graph this PR produces. A rule shown as holding was not broken anywhere in that graph; one shown as already broken was broken before this PR too; one shown as restored was broken before and is not now.</div>
+      ${note}
       ${html}
+      ${buildDocRuleChangesHtml(changes)}
     </div>`;
   }
 
   /**
-   * Coverage counts for the documented-rule headline. Pure -- no DOM, no side effects -- so it can
-   * be unit-tested directly. Mirrors buildDocumentedRulesHtml's reading of result.docFactVerdicts.
+   * Counts over the documented rules the panel shows; the findings button shows the total. Pure -- no
+   * DOM, no side effects -- so it can be unit-tested directly.
    *
-   * A verdict is "at risk" when VIOLATED (broken by this change) or PRE_EXISTING (already broken);
-   * "upheld" when MAINTAINED (held) or RESTORED (fixed by this change). UNCLEAR ("couldn't tell")
-   * is counted on its own and never folded into either -- the same distinction the panel draws, and
-   * for the same reason: calling an abstention a pass is the one claim this surface must not make.
+   * A shown rule is "at risk" when VIOLATED (broken by this change) or PRE_EXISTING (already broken),
+   * and "upheld" when MAINTAINED (holds) or RESTORED (fixed by this change). A rule the review could
+   * not check is not shown, so it is not counted either.
    */
   function computeDocRuleCoverage(result) {
     const verdicts = Array.isArray(result?.docFactVerdicts) ? result.docFactVerdicts.filter(Boolean) : [];
-    let atRisk = 0, upheld = 0, unclear = 0;
+    let atRisk = 0, upheld = 0;
     for (const v of verdicts) {
       const status = String(v?.status || "").trim().toUpperCase();
       if (status === "VIOLATED" || status === "PRE_EXISTING") atRisk += 1;
       else if (status === "MAINTAINED" || status === "RESTORED") upheld += 1;
-      else if (status === "UNCLEAR") unclear += 1;
     }
-    return { total: verdicts.length, atRisk, upheld, unclear };
+    return { total: atRisk + upheld, atRisk, upheld };
   }
   S.computeDocRuleCoverage = computeDocRuleCoverage;
-
-  /**
-   * The resolved headline text for a coverage count. Pure. Empty string when there are no
-   * documented rules, so the caller renders nothing rather than an empty "0 documented rules" row.
-   */
-  function formatDocRuleHeadline(coverage) {
-    const total = Number(coverage?.total || 0);
-    if (total <= 0) return "";
-    const rules = `${total} documented rule${total === 1 ? "" : "s"}`;
-    const atRisk = Number(coverage?.atRisk || 0);
-    return atRisk > 0 ? `${rules} · ${atRisk} at risk` : `${rules} · all upheld`;
-  }
-  S.formatDocRuleHeadline = formatDocRuleHeadline;
-
-  /**
-   * Progressive documented-rule coverage headline on the diagram surface (issue #14, change 2).
-   * Always-on, click-free: shows "Checking documented rules…" while the server-side review is
-   * running and resolves to the counts once the payload carries verdicts. Hidden entirely when
-   * there is no review (SKIPPED/null) or the review carries zero documented rules -- an empty
-   * headline would imply the docs were consulted and found silent, a different claim from not
-   * having a review to report.
-   */
-  S.updateDocRuleHeadline = function updateDocRuleHeadline(result, { status = null } = {}) {
-    const el = document.getElementById("striffs-coverage-headline");
-    if (!el) return;
-    if (S.__disabledByRemote) { el.style.display = "none"; return; }
-    const s = String(status == null ? (S.__aiReviewStatus || "") : status).trim().toUpperCase();
-    const coverage = computeDocRuleCoverage(result);
-    // Resolved counts win: once verdicts are present, show them regardless of polling status.
-    if (coverage.total > 0) {
-      el.textContent = formatDocRuleHeadline(coverage);
-      el.classList.toggle("striffs-coverage-headline--risk", coverage.atRisk > 0);
-      el.style.display = "";
-      return;
-    }
-    // No verdicts yet: show progress only while the server actually has a review running.
-    if (s === "PENDING" || s === "RUNNING") {
-      // Reading a repository's documents into rules is the slow part of a review, minutes rather than
-      // seconds, and it gave no sign of that. striff-api says when it has not read this repository's
-      // documents yet (aiReviewWarmupRequired, token route only); otherwise say it can take a while.
-      el.textContent = result?.aiReviewWarmupRequired === true
-        ? "Reading this repository's documents for the first time. This review takes a few minutes."
-        : "Checking documented rules… this can take a few minutes.";
-      el.classList.remove("striffs-coverage-headline--risk");
-      el.style.display = "";
-      return;
-    }
-    // READY-with-no-rules, SKIPPED, or no review: show no rule headline.
-    el.classList.remove("striffs-coverage-headline--risk");
-    el.style.display = "none";
-  };
-
-  /**
-   * The deterministic check roster and how each fared. Showing which checks ran is what makes the
-   * empty result legible: "nothing surfaced" is a much weaker statement on its own than beside the
-   * twelve checks that produced it.
-   *
-   * Findings held below the surfacing gate appear as observations rather than items, which is not
-   * the same as routing around the server's surfacing decision -- an observation row states that a
-   * detector saw something and that it was not judged worth raising, which is exactly what the
-   * check run says about the same finding.
-   */
-  function buildStructuralChecksHtml(result) {
-    if (!reviewRan(result)) return "";
-    const findings = Array.isArray(result?.findings) ? result.findings.filter(Boolean) : [];
-    const surfacedIds = new Set(
-      (Array.isArray(result?.surfacedItems) ? result.surfacedItems : [])
-        .map(i => i?.itemId).filter(Boolean));
-
-    const byDetector = new Map();
-    findings.forEach(f => {
-      const id = String(f.detectorId || "");
-      if (!id) return;
-      if (!byDetector.has(id)) byDetector.set(id, []);
-      byDetector.get(id).push(f);
-    });
-
-    const strongestExample = (observations) => {
-      const first = observations[0];
-      if (!first) return "";
-      const components = Array.isArray(first.affectedComponents)
-        ? first.affectedComponents
-        : (first.affectedComponents ? Object.values(first.affectedComponents) : []);
-      const component = components.filter(Boolean).slice().sort()[0];
-      const title = first.title || "";
-      return component ? `\`${simpleName(component)}\`: ${title}` : title;
-    };
-
-    const checkRow = (name, verdict, detail, state) => `<div class="striffs-arch-review-panel__check striffs-arch-review-panel__check--${state}">
-      <div class="striffs-arch-review-panel__check-head">
-        <span class="striffs-arch-review-panel__check-name">${escHtml(name)}</span>
-        <span class="striffs-arch-review-panel__check-verdict">${verdict}</span>
-      </div>
-      ${detail ? `<div class="striffs-arch-review-panel__check-detail">${escHtmlWithCode(detail)}</div>` : ""}
-    </div>`;
-
-    const rows = (roster, skipCleanRows) => {
-      const flagged = [], observed = [], clean = [];
-      roster.forEach(([detectorId, name]) => {
-        const checkFindings = byDetector.get(detectorId) || [];
-        const flaggedCount = checkFindings.filter(f => surfacedIds.has(f.findingId)).length;
-        const observations = checkFindings.filter(f => !surfacedIds.has(f.findingId));
-        if (flaggedCount > 0) {
-          const extra = observations.length > 0
-            ? ` · 👀 ${observations.length} observation${observations.length === 1 ? "" : "s"}`
-            : "";
-          flagged.push(checkRow(name, `❗ ${flaggedCount} flagged${extra}`, "see Review Items above", "flagged"));
-        } else if (observations.length > 0) {
-          observed.push(checkRow(name, `👀 ${observations.length} observation${observations.length === 1 ? "" : "s"}`,
-            strongestExample(observations), "observed"));
-        } else if (!skipCleanRows) {
-          clean.push(checkRow(name, "✅ clean", "", "clean"));
-        }
-      });
-      return flagged.join("") + observed.join("") + clean.join("");
-    };
-
-    return `<div class="striffs-arch-review-panel__section">
-      <div class="striffs-arch-review-panel__section-title">Structural Checks</div>
-      <div class="striffs-arch-review-panel__section-note">Deterministic checks run against the changed scope of this PR. Observations are context, not violations.</div>
-      ${rows(DOC_CHECK_NAMES, true)}${rows(STRUCTURAL_CHECK_NAMES, false)}
-    </div>`;
-  }
 
   function buildArchReviewPanelHtml(result) {
     const summary = result?.reviewSummary || {};
@@ -8918,54 +8138,58 @@
         }).join("")}
       </div>`;
     } else {
-      // An empty item list is a real "nothing to flag" result, not a gap to backfill. Under the
-      // fact-first model (striff-api ADR-022) deterministic facts are the sole origin of
-      // user-visible items, and an empty review is a legitimate outcome.
+      // An empty item list is a real "nothing to flag" result, not a gap to backfill: items are
+      // the server's surfacing decision, and an empty review is a legitimate outcome.
       //
-      // We deliberately do NOT fall back to result.findings here. That array carries every
-      // detector finding regardless of surfacing tier, including the evidence-only detectors
-      // whose precision has not been measured yet. Rendering them would route around the
-      // server's surfacing decision and make this panel contradict the check run on the same
-      // PR -- which is the credibility the fact-first model exists to protect.
-      //
-      // Counting them is not rendering them, though, and the count is what keeps this honest.
-      // "No architectural concerns were found" asserts the detectors found nothing, which is a
-      // different claim from "nothing met the bar to show you" -- and the wrong one whenever
-      // evidence exists. striff-api draws exactly this distinction in its own headline
-      // (AIReviewResultMapper), so stating the stronger claim here would have the panel
-      // contradict the check run on the same PR.
-      const heldBack = Array.isArray(result?.findings) ? result.findings.length : 0;
+      // Findings are never rendered here. The ones worth showing arrive as items, and every
+      // documented rule is shown again as a verdict in its own section below. Older API versions
+      // also send structural-detector findings in the same array; those are neither shown nor
+      // counted. Counting documented-rule findings is still what keeps the empty state honest: one
+      // held below the surfacing gate means "nothing met the bar to show you", not "nothing found".
+      const heldBack = docRuleFindings(result).length;
+      // Rules the review could not check are not shown, so they are not counted here either.
+      const verdictCount = shownVerdicts(result).length;
       if (!reviewRan(result)) {
-        // Nothing was checked, so no cleanliness claim is available to make. This is the same
-        // distinction the Structural Checks roster is suppressed on just below, and the stronger
-        // of the two errors: "we found nothing" against an analysis that never ran is a green
-        // tick nobody earned, in the one place a reviewer would most trust it.
+        // Nothing was checked, so no cleanliness claim is available to make: "we found nothing"
+        // against an analysis that never ran is a green tick nobody earned, in the one place a
+        // reviewer would most trust it.
         bodyHtml += `<div class="striffs-arch-review-panel__good">
         <div class="striffs-arch-review-panel__good-icon">–</div>
         <div style="font-size:15px;font-weight:600;margin-bottom:6px;">No review recorded</div>
-        <div>No structural analysis is available for this changeset, so there is nothing to report either way.</div>
+        <div>No review is available for this changeset, so there is nothing to report either way.</div>
       </div>`;
       } else if (heldBack > 0) {
         bodyHtml += `<div class="striffs-arch-review-panel__good">
         <div class="striffs-arch-review-panel__good-icon">✓</div>
         <div style="font-size:15px;font-weight:600;margin-bottom:6px;">Nothing surfaced for review</div>
         <div>${heldBack === 1
-          ? "1 evidence-only finding was recorded as context, but it did not meet the bar to raise here."
-          : `${heldBack} evidence-only findings were recorded as context, but none met the bar to raise here.`}</div>
+          ? "1 documented-rule finding was recorded, but it did not meet the bar to raise here."
+          : `${heldBack} documented-rule findings were recorded, but none met the bar to raise here.`}</div>
+      </div>`;
+      } else if (verdictCount > 0) {
+        // The rules below carry the verdict. A tick here beside a rule the change breaks, or one
+        // that was already broken, would contradict the section it introduces.
+        const atRisk = computeDocRuleCoverage(result).atRisk > 0;
+        bodyHtml += `<div class="striffs-arch-review-panel__good">
+        <div class="striffs-arch-review-panel__good-icon">${atRisk ? "–" : "✓"}</div>
+        <div style="font-size:15px;font-weight:600;margin-bottom:6px;">No review items</div>
+        <div>Nothing in this changeset was raised for review. The documented rules below show how it fared against this repository's docs.</div>
       </div>`;
       } else {
+        // The review checks a change against what the repository's own docs state, not against
+        // general structural heuristics. With no documented rule to check, "no concerns were
+        // found" would claim a check that never happened.
         bodyHtml += `<div class="striffs-arch-review-panel__good">
-        <div class="striffs-arch-review-panel__good-icon">✓</div>
-        <div style="font-size:15px;font-weight:600;margin-bottom:6px;">Everything looks good</div>
-        <div>No architectural concerns were found in this changeset.</div>
+        <div class="striffs-arch-review-panel__good-icon">–</div>
+        <div style="font-size:15px;font-weight:600;margin-bottom:6px;">No review items</div>
+        <div>Nothing was raised for review, and no documented rules were checked against this changeset.</div>
       </div>`;
       }
     }
 
-    // Documented rules above structural checks, and both below the items: the same order the
-    // check run uses, so a reviewer moving between the two surfaces reads the same PR the same way.
+    // Documented rules below the items: the same order the check run uses, so a reviewer moving
+    // between the two surfaces reads the same PR the same way.
     bodyHtml += buildDocumentedRulesHtml(result);
-    bodyHtml += buildStructuralChecksHtml(result);
 
     // Footer stats
     const changed = summary.changedComponents || 0;
@@ -9005,14 +8229,15 @@
     panel.setAttribute("aria-hidden", "false");
     panel.classList.add("striffs-arch-review-panel--open");
     void panel.offsetHeight;
-    // Push diagram content left
+    // Narrow the diagram's surface by the panel's width, so the scroll area ends where the panel begins
+    // and every part of the diagram can be scrolled clear of it. The scroll area's resize observer
+    // re-derives the diagram's extent as the margin animates.
     if (host) {
       host.querySelectorAll(":scope > #striffs-controls-wrap, :scope > #striffs-surface").forEach(s => {
         s.style.marginRight = "400px";
         s.style.transition = "margin-right .25s ease";
       });
     }
-    S.__archReviewPanelOpen = true;
   };
 
   S.closeArchReviewPanel = function closeArchReviewPanel() {
@@ -9026,301 +8251,165 @@
         s.style.marginRight = "";
       });
     }
-    S.__archReviewPanelOpen = false;
   };
 
+  /**
+   * Whether the panel is open, read from the panel itself rather than remembered.
+   *
+   * The panel is a child of the diagram view, so everything that rebuilds that view -- a move to
+   * another pull request, a cache clear, a fresh render -- takes the panel with it. A boolean left
+   * over from the last time it was opened then said "open" about a node that no longer existed, and
+   * the findings button spent every click trying to close it: nothing happened, and nothing ever
+   * would, because closing bails out early when there is no panel and so never cleared the flag
+   * either. Only a reload fixed it, by rebuilding the state the flag lived in.
+   */
+  S.isArchReviewPanelOpen = () => Boolean(
+    document.getElementById(ARCH_PANEL_ID)?.classList.contains("striffs-arch-review-panel--open")
+  );
+
   S.toggleArchReviewPanel = function toggleArchReviewPanel() {
-    if (S.__archReviewPanelOpen) {
+    if (S.isArchReviewPanelOpen()) {
       S.closeArchReviewPanel?.();
     } else {
       S.openArchReviewPanel?.();
     }
   };
 
-  // --- Architecture Review button (manual enrichment trigger) ---
+  // --- Findings button: opens the review that arrived with the diagram ---
   S.updateArchReviewButton = function updateArchReviewButton() {
     const btn = document.getElementById("striffs-arch-review-btn");
     if (!btn) return;
-    const view = S.getCurrentView?.();
     const diagramReady = S.__striffsReady && S.__striffsSvg;
-    const enriching = S.__aiReviewStatus === "PENDING" || S.__aiReviewStatus === "RUNNING";
-    const reviewReady = S.__aiReviewStatus === "READY";
-    const commentActive = S.__commentState?.active;
-
-    if (view === "striffs" && diagramReady) {
-      btn.style.display = "";
-      // With auto-poll (issue #14), the button reflects state and opens the panel rather than
-      // starting the work. "Analyzing…" whenever a poll is active -- whether the render auto-
-      // started it or the user clicked -- then a "view" affordance carrying the rule count.
-      const polling = Boolean(S.__aiReviewPollTimer || S.__aiReviewPollInFlight);
-      if (enriching && polling) {
-        btn.textContent = "Analyzing…";
-        btn.disabled = true;
-        btn.title = "Architecture review is running";
-      } else if (reviewReady) {
-        const n = Number(computeDocRuleCoverage(S.__lastEnrichmentResult).total || 0);
-        btn.textContent = n > 0 ? `View review (${n} rule${n === 1 ? "" : "s"})` : "View AI Review";
-        btn.disabled = commentActive;
-        btn.title = "View the architecture review";
-      } else {
-        btn.textContent = "AI Review";
-        btn.disabled = commentActive;
-        btn.title = "Run AI architecture review on this diagram";
-      }
-    } else {
+    if (S.__disabledByRemote || S.getCurrentView?.() !== "striffs" || !diagramReady) {
       btn.style.display = "none";
+      return;
     }
+    const state = ReviewState.reviewButtonState({
+      status: S.__aiReviewStatus,
+      ruleCount: computeDocRuleCoverage(S.__lastEnrichmentResult).total,
+      retiredCount: docRuleChangeCount(S.__lastEnrichmentResult, "retired"),
+      restoredCount: docRuleChangeCount(S.__lastEnrichmentResult, "restored"),
+      warmup: S.__aiReviewWarmupRequired,
+      reason: S.__aiReviewReason
+    });
+    const busy = state.busy === true;
+    btn.style.display = "";
+    btn.title = state.title;
+    btn.disabled = !state.enabled || Boolean(S.__commentState?.active);
+    btn.classList.toggle("is-busy", busy);
+    // The label already says the review is running; aria-busy says it to assistive technology
+    // without the text having to change on every poll.
+    if (busy) btn.setAttribute("aria-busy", "true");
+    else btn.removeAttribute("aria-busy");
+
+    // Rewriting the button's contents restarts the spinner's animation from its first frame, and
+    // this function runs on every view change and comment-mode toggle as well as on a review
+    // landing -- so the contents are replaced only when they actually differ. Rebuilding
+    // unconditionally left the spinner stuttering back to the top instead of turning.
+    if (btn.dataset.striffsLabel === state.text && (btn.dataset.striffsBusy === "1") === busy) return;
+    btn.dataset.striffsLabel = state.text;
+    btn.dataset.striffsBusy = busy ? "1" : "0";
+    btn.textContent = "";
+    if (busy) {
+      // Nodes rather than markup, and decorative: the label stays the button's only text, so
+      // textContent still reads exactly as the state's label for anything that inspects it.
+      const indicator = document.createElement("span");
+      indicator.className = "striffs-running-indicator striffs-running-indicator--on-accent";
+      indicator.setAttribute("aria-hidden", "true");
+      const dot = document.createElement("span");
+      dot.className = "striffs-running-indicator__dot";
+      indicator.appendChild(dot);
+      btn.appendChild(indicator);
+    }
+    btn.appendChild(document.createTextNode(state.text));
   };
 
-  S.triggerArchitectureReview = async function triggerArchitectureReview() {
-    const btn = document.getElementById("striffs-arch-review-btn");
-
-    // If review is already complete, toggle the results panel instead
-    if (S.__aiReviewStatus === "READY" && S.__lastEnrichmentResult) {
-      S.toggleArchReviewPanel?.();
-      return;
-    }
-
-    if (btn) btn.disabled = true;
-
-    let operationId = String(S.__engagementCtx?.operationId || "").trim();
-    let engagementWriteToken = String(S.__engagementCtx?.engagementWriteToken || "").trim();
-
-    // If engagement context is missing, try to obtain it via a fresh API call
-    // before starting enrichment polling.
-    if (!operationId || !engagementWriteToken) {
-      S.toast?.("Obtaining operation context...", "info", { timeoutMs: 4000 });
-      try {
-        const refreshed = await S.refreshEngagementContextFromFreshResult?.(S.extractPRMetadata?.());
-        if (!refreshed) {
-          S.toast?.("Cannot start review: unable to obtain operation context.", "warning", { timeoutMs: 5000 });
-          if (btn) btn.disabled = false;
-          return;
-        }
-        operationId = String(S.__engagementCtx?.operationId || "").trim();
-        engagementWriteToken = String(S.__engagementCtx?.engagementWriteToken || "").trim();
-      } catch {
-        S.toast?.("Cannot start review: unable to obtain operation context.", "warning", { timeoutMs: 5000 });
-        if (btn) btn.disabled = false;
-        return;
-      }
-    }
-
-    if (!operationId || !engagementWriteToken) {
-      S.toast?.("Cannot start review: missing operation context. Try reloading the page.", "warning", { timeoutMs: 5000 });
-      if (btn) btn.disabled = false;
-      return;
-    }
-    S.toast?.("Executing architecture review...", "info", { timeoutMs: 4000 });
-    S.__aiReviewStatus = "PENDING";
-    S.__aiReviewPollStartedAt = Date.now();
-    // Manual trigger: the user asked for the review, so its READY branch opens the panel.
-    S.__aiReviewPollAuto = false;
-    S.updateStriffButton?.({ enriching: true, tooltip: "Analyzing" });
-    S.startEnrichmentPolling?.({ immediate: true, reason: "manual-button" });
+  /**
+   * Records where the review stands and shows it on the findings button, along with the payload the
+   * panel opens onto. status is the server's review status, or TIMED_OUT / UNAVAILABLE; result is the
+   * payload that carries the review, or the reason there is none.
+   */
+  S.setReviewState = function setReviewState(status, result) {
+    S.__aiReviewStatus = status || null;
+    S.__aiReviewReason = String(result?.aiReviewErrorMessage || "").trim() || null;
+    S.__aiReviewWarmupRequired = result?.aiReviewWarmupRequired === true;
+    S.__lastEnrichmentResult = status === "READY" ? result : null;
     S.updateArchReviewButton?.();
   };
 
-  S.refreshDiagramWithEnrichment = async (result, meta = null) => {
-    const container = S.ensureStriffContainer?.();
-    if (!container) return false;
-    const scrollEl = container.querySelector('#striffs-scroll') || container;
-    const previousScrollTop = Number(scrollEl.scrollTop || 0);
-    const previousScrollLeft = Number(scrollEl.scrollLeft || 0);
-    const previousZoom = Number(S.__striffsZoom || 1);
-    const rendered = S.renderStriffsInto(container, result);
-    if (!rendered) return false;
-    if (S.__striffsSvg) {
-      S.__striffsZoom = previousZoom;
-      S.syncZoomedSvgLayout?.(scrollEl, S.__striffsSvg);
+  /**
+   * Opens a collection of the review the server started with this analysis. It never starts or
+   * requests a review: it reads the operation's review status, and stops when the review ends, its
+   * deadline passes, or the page moves on (another PR, a new load, the remote kill switch).
+   *
+   * `generation` is the load's, so the collection is tied to the load that began it rather than to
+   * the moment it was opened. Capturing it here instead would re-validate a load the page had
+   * already moved past, and then collect its review onto the pull request the user moved to.
+   */
+  async function openReviewCollection(meta, generation = S.__reviewCollection) {
+    const isCurrent = () => S.isReviewGenerationCurrent(generation);
+    const context = () => ({
+      operationId: String(S.__operationTokenCtx?.operationId || "").trim(),
+      operationToken: String(S.__operationTokenCtx?.operationAccessToken || "").trim()
+    });
+    let { operationId, operationToken } = context();
+    if (!operationId || !operationToken) {
+      // The analysis response can arrive before its access token is attached; a fresh read of the
+      // same analysis usually carries it.
+      await S.refreshOperationTokenFromFreshResult?.(meta);
+      ({ operationId, operationToken } = context());
     }
-    try {
-      scrollEl.scrollTop = previousScrollTop;
-      scrollEl.scrollLeft = previousScrollLeft;
-    } catch {}
-    // Cache the enriched diagram so it persists across view switches and reloads
-    S.__lastEnrichmentResult = result;
-    try { writeCachedDiagram(result, meta); } catch (e) { S.cwarn?.('[enrichment] cache write failed', e); }
-    if (S.getCurrentView?.() === 'striffs') {
-      S.toast?.("Architecture review complete.", "info", { timeoutMs: 3000 });
-    }
-    // Complete the progress bar when enrichment is done
-    const btn = document.querySelector("#striffs-btn");
-    const progressBar = btn?.querySelector('.striffs-progress-bar');
-    if (progressBar && !progressBar.classList.contains('complete')) {
-      progressBar.classList.add('complete');
-      setTimeout(() => {
-        const wrap = btn?.querySelector('.striffs-progress-wrap');
-        if (wrap) wrap.remove();
-      }, 500);
-    }
-    S.updateDocRuleHeadline?.(result, { status: S.__aiReviewStatus });
-    S.updateArchReviewButton?.();
-    return true;
-  };
-
-  // Auto-collect the server-side review the diagram payload reports as running (issue #14,
-  // change 1). This starts NO new server compute -- it polls an already-running job. Respects the
-  // remote kill switch and the SKIPPED guard, and never double-starts a poll already in flight.
-  S.maybeAutoStartReviewPolling = ({ status = null } = {}) => {
-    if (S.__disabledByRemote) return false;
-    const s = String(status == null ? (S.__aiReviewStatus || "") : status).trim().toUpperCase();
-    // Only PENDING/RUNNING are pollable. SKIPPED/NOT_REQUESTED map to null upstream
-    // (getAiReviewStatusFromResult) and never reach here; READY needs no poll.
-    if (!(s === "PENDING" || s === "RUNNING")) return false;
-    if (S.__aiReviewPollTimer || S.__aiReviewPollInFlight) return false;
-    S.__aiReviewStatus = s;
-    if (!S.__aiReviewPollStartedAt) S.__aiReviewPollStartedAt = Date.now();
-    // Auto-started: its READY branch must NOT auto-open the side panel (the panel stays opt-in).
-    S.__aiReviewPollAuto = true;
-    return S.startEnrichmentPolling?.({ immediate: true, reason: "auto-render" }) !== false;
-  };
-
-  S.startEnrichmentPolling = ({ immediate = false, reason = "" } = {}) => {
-    if (S.__aiReviewPollTimer) {
-      clearTimeout(S.__aiReviewPollTimer);
-      S.__aiReviewPollTimer = null;
-    }
-    const status = String(S.__aiReviewStatus || "").trim().toUpperCase();
-    const operationId = String(S.__engagementCtx?.operationId || S.__aiReviewOperationId || "").trim();
-    const engagementToken = String(S.__engagementCtx?.engagementWriteToken || "").trim();
-    if (!(status === "PENDING" || status === "RUNNING")) {
-      S.cinfo?.("Enrichment polling skipped: status not pollable", { status, reason });
-      return false;
-    }
-    if (!operationId || !engagementToken) {
-      S.cwarn?.("Enrichment polling skipped: missing engagement context", {
-        status,
-        operationId,
-        hasEngagementToken: Boolean(engagementToken),
-        reason
-      });
-      return false;
-    }
-    const expectedOperationId = operationId;
-    const pollDelayMs = immediate ? 0 : Math.max(1000, Number(S.__lastAiReviewPollAfterMs || 5000));
-
-    // Initialize poll start time if this is a new polling session
-    if (!S.__aiReviewPollStartedAt) {
-      S.__aiReviewPollStartedAt = Date.now();
-    }
-
-    const poll = async () => {
-      if (S.__aiReviewPollInFlight) return;
-
-      // Check if polling has exceeded the timeout
-      if (S.__aiReviewPollStartedAt && (Date.now() - S.__aiReviewPollStartedAt) > S.ENRICHMENT_POLL_TIMEOUT_MS) {
-        S.cancelEnrichmentPolling?.("timeout");
-        S.__aiReviewStatus = "FAILED";
-        // We stopped waiting; the server did not stop working. Its own bound on a review is
-        // longer than ours, so the likely state here is "still running", not "failed" -- and it
-        // finishes into the operation record, which the next load of this PR reads back as READY.
-        // Saying "failed" would send the reviewer looking for a problem that does not exist.
-        S.updateStriffButton?.({ success: true, tooltip: "AI review is taking longer than usual. Reload the page to check for it. Base diagram is still available." });
-        S.updateArchReviewButton?.();
-        S.toast?.(`AI review is still running after ${S.formatPollTimeout?.() || "a while"} — reload the page to pick it up once it finishes.`, "neutral", { timeoutMs: 6000 });
-        return;
-      }
-
-      if (String(S.__engagementCtx?.operationId || S.__aiReviewOperationId || "").trim() !== expectedOperationId) {
-        S.cancelEnrichmentPolling?.("operation-mismatch");
-        S.__aiReviewStatus = null;
-        S.updateArchReviewButton?.();
-        return;
-      }
-      S.__aiReviewPollInFlight = true;
-      try {
-        const resp = await S.fetchAiReviewStatus?.({
-          operationId: expectedOperationId,
-          engagementToken,
-          timeoutMs: 15000
-        });
-        if (!resp?.ok) {
-          S.cwarn?.("AI review status poll failed", {
-            status: Number(resp?.status || 0) || null,
-            error: String(resp?.error || ""),
-            operationId: expectedOperationId,
-            ctxOperationId: String(S.__engagementCtx?.operationId || "").trim() || null,
-            aiReviewOperationId: String(S.__aiReviewOperationId || "").trim() || null,
-            hasEngagementToken: Boolean(engagementToken)
-          });
-          if (Number(resp?.status || 0) === 403) {
-            S.cancelEnrichmentPolling?.("poll-forbidden");
-            S.__aiReviewStatus = "FAILED";
-            S.updateStriffButton?.({ success: true, tooltip: "AI review unavailable. Authorization required." });
-            S.updateArchReviewButton?.();
-            return;
-          }
-          const retryMs = Math.max(2000, Number(S.__lastAiReviewPollAfterMs || 5000));
-          S.__aiReviewPollTimer = setTimeout(() => S.startEnrichmentPolling?.({ immediate: true, reason: "retry-error" }), retryMs);
-          return;
-        }
-        const result = resp.json || {};
-        const nextStatus = S.syncAiReviewStateFromResult?.(result);
-        S.__lastAiReviewPollAfterMs = Number(result?.aiReviewPollAfterMs || result?.pollAfterMs || 5000);
-        if (nextStatus === "READY") {
-          S.cancelEnrichmentPolling?.("ready");
-          if (Array.isArray(result?.striffs) && result.striffs.length > 0) {
-            const meta = S.extractPRMetadata?.() || null;
-            await S.refreshDiagramWithEnrichment?.(result, meta);
-          }
-          S.__lastEnrichmentResult = result;
-          S.updateStriffButton?.({ success: true, tooltip: "View" });
-          S.updateDocRuleHeadline?.(result, { status: "READY" });
-          S.updateArchReviewButton?.();
-          // Panel stays opt-in: only the manual trigger opens it on completion. An auto-started
-          // poll leaves the always-on headline (change 2) as the surface and the button as the
-          // opt-in door -- it does not push the diagram 400px on its own (issue #14, change 4).
-          if (!S.__aiReviewPollAuto) S.openArchReviewPanel?.(result);
-          return;
-        }
-        if (nextStatus === "FAILED") {
-          S.cancelEnrichmentPolling?.("failed");
-          S.updateStriffButton?.({ success: true, tooltip: result?.aiReviewErrorMessage || "AI review failed. Base diagram is still available." });
-          S.updateDocRuleHeadline?.(result, { status: "FAILED" });
-          S.updateArchReviewButton?.();
-          S.toast?.(result?.aiReviewErrorMessage || "Architecture review failed.", "warning", { timeoutMs: 5000 });
-          return;
-        }
-        if (nextStatus === "PENDING" || nextStatus === "RUNNING") {
-          S.updateStriffButton?.({ enriching: true, tooltip: "Analyzing" });
-          const retryMs = Math.max(1000, Number(result?.aiReviewPollAfterMs || result?.pollAfterMs || 5000));
-          S.__aiReviewPollTimer = setTimeout(() => S.startEnrichmentPolling?.({ immediate: true, reason: "continue" }), retryMs);
-          return;
-        }
-        // SKIPPED is terminal but not an error: the server declined to review (too few
-        // components, trivial PR, no analysable diff) and says why. getAiReviewStatusFromResult
-        // maps it to null so the button doesn't flash "Analyzing" on page load, which means it
-        // can never match a branch above — without this case it falls through to the
-        // unexpected-status handler and reports a failure that did not happen.
-        const rawStatus = String(result?.aiReviewStatus || result?.ai_review_status || "").trim().toUpperCase();
-        if (rawStatus === "SKIPPED" || rawStatus === "NOT_REQUESTED") {
-          S.cancelEnrichmentPolling?.("skipped");
-          const why = result?.aiReviewErrorMessage || "Architecture review was not applicable to this PR.";
-          S.updateStriffButton?.({ success: true, tooltip: why });
-          S.updateDocRuleHeadline?.(result, { status: rawStatus });
-          S.updateArchReviewButton?.();
-          S.toast?.(why, "neutral", { timeoutMs: 5000 });
-          return;
-        }
-        S.cancelEnrichmentPolling?.("terminal-unknown");
-        S.__aiReviewStatus = "FAILED";
-        S.updateStriffButton?.({ success: true, tooltip: "AI review returned an unexpected status. Base diagram is still available." });
-        S.updateArchReviewButton?.();
-      } catch (e) {
-        const retryMs = Math.max(2000, Number(S.__lastAiReviewPollAfterMs || 5000));
-        S.__aiReviewPollTimer = setTimeout(() => S.startEnrichmentPolling?.({ immediate: true, reason: "retry-exception" }), retryMs);
-      } finally {
-        S.__aiReviewPollInFlight = false;
-      }
+    const startedAt = Date.now();
+    return {
+      isCurrent,
+      available: Boolean(operationId && operationToken),
+      // Reads until budgetMs after the collection opened.
+      collect: (budgetMs) => ReviewState.collectReview({
+        fetchStatus: () => S.fetchAiReviewStatus({ operationId, operationToken, timeoutMs: 15000 }),
+        sleep: S.sleep,
+        now: () => Date.now(),
+        deadline: startedAt + budgetMs,
+        isCurrent
+      })
     };
+  }
 
-    if (reason && S.isDebug?.()) {
-      S.cinfo?.("Enrichment polling scheduled", { reason, pollDelayMs, operationId: expectedOperationId });
+  /**
+   * Where every running review is collected: the diagram is already on screen with the review marked
+   * as still running, and the review arrives here with no action from the user. Only the findings
+   * button and the panel's data change. The diagram does not carry the review, so it is not rendered
+   * again.
+   */
+  async function finishReviewInBackground(collection, analysis, meta) {
+    const review = await collection.collect(S.REVIEW_COLLECTION_TIMEOUT_MS);
+    if (review.status === "CANCELLED") return;
+    // The analysis's diagrams, which are the ones on screen, with the review's data laid over them.
+    const result = { ...ReviewState.mergeReviewResult(analysis, review.result), striffs: analysis.striffs };
+    if (review.status === "PENDING") {
+      // We stopped waiting; the server did not stop working. The review finishes into the
+      // operation, and the next load of this PR reads it back.
+      S.setReviewState("TIMED_OUT", result);
+      S.toast?.(`The architecture review is still running after ${S.formatPollTimeout()}. Reload the page to pick it up once it finishes.`, "neutral", { timeoutMs: 6000 });
+      return;
     }
-    S.__aiReviewPollTimer = setTimeout(poll, pollDelayMs);
-    return true;
-  };
+    // Cache what a reload should find: the finished review, or why there is none. A review that
+    // could not be read stays cached as running, so the next load tries again.
+    if (review.status !== "UNAVAILABLE") writeCachedDiagram(result, meta);
+    S.setReviewState(review.status, result);
+  }
+
+  // bgRequest throws on a failed reply and carries the reply on the error as err.response. The two
+  // request paths below branch on that reply -- its status and error code decide the token fallback
+  // and the message describeApiError shows -- so they take the reply rather than the throw. Taking
+  // the throw left every failure without a code, and its raw text became the message.
+  async function bgReply(msg, timeoutMs) {
+    try {
+      return await S.bgRequest(msg, timeoutMs);
+    } catch (e) {
+      if (e?.response) return e.response;
+      throw e;
+    }
+  }
 
   async function requestWithToken(token, meta, { quiet = false } = {}) {
     const { owner, repo, pull_number, updated_at } = meta;
@@ -9332,7 +8421,7 @@
     }
     S.cinfo?.("Striffs request (token)", { owner, repo, pull_number, updated_at });
 
-    const resp = await S.bgRequest({
+    const resp = await bgReply({
       type: "fetchStriffsWithToken",
       owner,
       repo,
@@ -9785,10 +8874,11 @@
       S.updateStriffButton({ loading: true, phase: "Generating", tooltip: "Generating" });
     }
     const changedFilesStorageKey = await storeTempChangedFiles(changedFiles);
-    const resp = await S.bgRequest({
+    const resp = await bgReply({
       type: "generateStriffs",
       baseOwner: refs.baseOwner, baseRepo: refs.baseRepo, baseBranch: refs.baseBranch,
       changedFilesStorageKey,
+      pullRequest: { owner: meta.owner, repo: meta.repo, pullNumber: meta.pull_number },
       updated_at,
     }, timeoutFor("bgGenerate", timeoutFor("message", 7000)));
 
@@ -9868,6 +8958,40 @@
       .test(String(err?.message || ''));
   }
 
+  // codeload answers 404 for a private repository fetched without credentials, so on the upload path
+  // this means S.isPrivateRepo() read the page wrong. Its signals come from a full page load and can
+  // be missing after GitHub navigates in place -- observed as a first-click failure on a private repo
+  // that a reload cured.
+  function isBaseZipNotFoundError(err) {
+    return String(err?.errorCode || '').trim().toUpperCase() === 'BASE_ZIP_NOT_FOUND';
+  }
+
+  // Whether a pull request's repository is private, asked of GitHub rather than read off the page. The
+  // page's signals come from a full page load and can be missing after GitHub navigates in place, which
+  // sent private repositories to codeload for a 404. With a token GitHub says so outright; without one
+  // it shows a private repository only as not found. Remembered per repository for the page's life.
+  // When GitHub cannot be asked, the page decides, and the question is asked again next time.
+  const repoPrivacy = new Map();
+  S.resolveRepoPrivacy = async (meta, token) => {
+    const owner = String(meta?.owner || '').trim();
+    const repo = String(meta?.repo || '').trim();
+    if (!owner || !repo) return S.isPrivateRepo?.() === true;
+    const key = `${owner}/${repo}`.toLowerCase();
+    if (repoPrivacy.has(key)) return repoPrivacy.get(key);
+    let answer = null;
+    try {
+      const resp = await fetchJsonWithTimeout(
+        `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`,
+        { token, timeoutMs: timeoutFor('githubRepo', 10000) }
+      );
+      if (resp.ok && typeof resp.body?.private === 'boolean') answer = resp.body.private;
+      else if (!token && resp.status === 404) answer = true;
+    } catch {}
+    if (answer === null) return S.isPrivateRepo?.() === true;
+    repoPrivacy.set(key, answer);
+    return answer;
+  };
+
   // The single analysis entry point.
   //
   // The upload (POST) path is queued and polled to completion in the background, so it is preferred:
@@ -9878,7 +9002,15 @@
   //
   // So: private repo -> token GET; public repo -> upload, with token GET as the size fallback.
   async function requestPrimary(meta, token, { quiet = false } = {}) {
-    const postPrimary = S.POST_PRIMARY_ENABLED === true && !S.isPrivateRepo?.();
+    // GitHub's answer where it can give one, the page's signals where it cannot.
+    const privateRepo = await (S.resolveRepoPrivacy?.(meta, token) ?? S.isPrivateRepo?.());
+    // A private repository is never fetched from codeload, which answers it with 404: with a token it
+    // takes the token GET below, and without one there is no route to take.
+    if (privateRepo && !token) {
+      throw Object.assign(new Error('This repository is private; a GitHub token is needed to analyse it.'),
+        { errorCode: 'PRIVATE_REPO_TOKEN_REQUIRED' });
+    }
+    const postPrimary = S.POST_PRIMARY_ENABLED === true && !privateRepo;
     if (!postPrimary) {
       return token
         ? await requestWithToken(token, meta, { quiet })
@@ -9887,6 +9019,10 @@
     try {
       return await requestWithZips(meta, { quiet });
     } catch (err) {
+      if (token && isBaseZipNotFoundError(err)) {
+        S.cinfo?.('Base ZIP not found (private repo?); falling back to token GET');
+        return await requestWithToken(token, meta, { quiet });
+      }
       if (token && isUploadPathTooLargeError(err)) {
         S.cinfo?.('Upload path refused for size; falling back to token GET', {
           errorCode: err?.errorCode || null,
@@ -9938,6 +9074,18 @@
         tooltip: "Your GitHub token was rejected. It may have expired or been revoked.",
         toast: "<strong>GitHub token rejected.</strong> It may have expired or been revoked. Update it in the extension popup.",
         tone: 'error',
+        disabled: true,
+        waitingForToken: true,
+        htmlToast: true
+      };
+    }
+
+    // Only reached without a token; with one, requestPrimary has already retried on the token GET.
+    if (code === 'BASE_ZIP_NOT_FOUND' || code === 'PRIVATE_REPO_TOKEN_REQUIRED') {
+      return {
+        tooltip: "Token required: this repo is private",
+        toast: "<strong>This repository looks private.</strong> Connect a GitHub token in the extension popup to analyse it.",
+        tone: 'neutral',
         disabled: true,
         waitingForToken: true,
         htmlToast: true
@@ -10063,17 +9211,17 @@
     };
   };
 
-  async function refreshEngagementContextFromFreshResult(meta) {
-    if (S.__engagementRefreshPromise) return S.__engagementRefreshPromise;
-    S.__engagementRefreshPromise = (async () => {
+  async function refreshOperationTokenFromFreshResult(meta) {
+    if (S.__operationTokenRefreshPromise) return S.__operationTokenRefreshPromise;
+    S.__operationTokenRefreshPromise = (async () => {
       try {
         const token = await S.getStoredToken?.();
         if (!token && S.isPrivateRepo?.()) {
-          S.__lastEngagementContextError = "cache refresh unavailable";
-          S.syncEngagementDebugState?.();
-          S.logEngagementCollectionBlocked?.("cache refresh unavailable", {
+          S.__lastOperationTokenError = "cache refresh unavailable";
+          S.syncOperationTokenDebugState?.();
+          S.logOperationTokenUnavailable?.("cache refresh unavailable", {
             privateRepo: true,
-            cachedOperationId: S.__engagementCtx?.operationId || null
+            cachedOperationId: S.__operationTokenCtx?.operationId || null
           });
           return false;
         }
@@ -10091,7 +9239,7 @@
             if (!/Failed to fetch|NetworkError|fetch/i.test(message) || attempt === 3) {
               throw e;
             }
-            S.cwarn?.('Engagement context refresh attempt failed; retrying', {
+            S.cwarn?.('Operation token refresh attempt failed; retrying', {
               attempt,
               error: message
             });
@@ -10102,70 +9250,66 @@
         if (!result && lastError) throw lastError;
         const validationError = S.getStriffsResultValidationError?.(result);
         if (validationError) throw new Error(validationError);
-        const engagementReady = S.updateEngagementContextFromResult?.(result);
-        if (!engagementReady) {
-          S.cwarn?.('Engagement telemetry not available after refresh');
+        const operationTokenReady = S.updateOperationTokenFromResult?.(result);
+        if (!operationTokenReady) {
+          S.cwarn?.('Operation access token not available after refresh');
         }
         const freshStatus = S.syncAiReviewStateFromResult?.(result);
-        // No auto-enrichment on cache refresh — user triggers via Architecture Review button
+        // A refresh renders nothing, so it replaces the cache only with a result that is already
+        // final: one whose review finished, or that has none.
         if (freshStatus === null || freshStatus === "READY") {
-          // Preserve engagement token from existing cache if the fresh result doesn't have one
-          const freshExtracted = S.extractEngagementContextFromPayload?.(result) || {};
-          const freshToken = String(freshExtracted.engagementWriteToken || "").trim();
-          if (!freshToken && S.__engagementCtx?.engagementWriteToken) {
+          // Preserve the operation access token from the existing cache if the fresh result
+          // doesn't carry one.
+          const freshExtracted = S.extractOperationTokenFromPayload?.(result) || {};
+          const freshToken = String(freshExtracted.operationAccessToken || "").trim();
+          if (!freshToken && S.__operationTokenCtx?.operationAccessToken) {
             try {
               const resultObj = result && typeof result === 'object' ? result : {};
-              resultObj.engagementWriteToken = S.__engagementCtx.engagementWriteToken;
+              resultObj.operationAccessToken = S.__operationTokenCtx.operationAccessToken;
             } catch {}
           }
           writeCachedDiagram(result, meta);
         }
-        S.debugDump?.("engagement context refreshed after cache load", {
-          operationId: String(S.__engagementCtx?.operationId || ""),
+        S.debugDump?.("operation token refreshed after cache load", {
+          operationId: String(S.__operationTokenCtx?.operationId || ""),
           loadSource: S.__lastLoadSource || null
         });
         return true;
       } catch (e) {
-        S.cwarn?.('Engagement context refresh failed, keeping existing context from cache', e);
-        S.__lastEngagementContextError = "cache refresh failed (cached context preserved)";
-        S.syncEngagementDebugState?.();
-        S.logEngagementCollectionBlocked?.("cache refresh failed (cached context preserved)", {
+        S.cwarn?.('Operation token refresh failed, keeping existing context from cache', e);
+        S.__lastOperationTokenError = "cache refresh failed (cached context preserved)";
+        S.syncOperationTokenDebugState?.();
+        S.logOperationTokenUnavailable?.("cache refresh failed (cached context preserved)", {
           error: String(e?.message || e),
-          cachedOperationId: S.__engagementCtx?.operationId || null
+          cachedOperationId: S.__operationTokenCtx?.operationId || null
         });
         return false;
       } finally {
-        S.__engagementRefreshPromise = null;
+        S.__operationTokenRefreshPromise = null;
       }
     })();
-    return S.__engagementRefreshPromise;
+    return S.__operationTokenRefreshPromise;
   }
-  S.refreshEngagementContextFromFreshResult = refreshEngagementContextFromFreshResult;
+  S.refreshOperationTokenFromFreshResult = refreshOperationTokenFromFreshResult;
 
-  async function renderStriffsResult(result, meta, { fromCache = false } = {}) {
+  async function renderStriffsResult(result, meta, { fromCache = false, generation = S.__reviewCollection } = {}) {
     const updated_at = meta?.updated_at;
     const validationError = S.getStriffsResultValidationError?.(result);
     if (validationError) {
       throw new Error(validationError);
     }
-	    const engagementReady = S.updateEngagementContextFromResult?.(result);
-	    if (!engagementReady) {
-	      S.cwarn?.('Engagement telemetry not available for this response');
-	      // The initial response can omit the write token even when an operationId
-	      // is present (backend attaches it slightly after operation creation).
-	      // Retry once in the background so telemetry arms without requiring the
-	      // user to trigger AI Review or comment mode first. Once the token lands,
-	      // start the auto-review poll it was blocking (issue #14, change 1).
-	      Promise.resolve(S.refreshEngagementContextFromFreshResult?.(meta))
-	        .then(() => S.maybeAutoStartReviewPolling?.())
-	        .catch?.(() => {});
-	    }
-      const aiReviewStatus = S.syncAiReviewStateFromResult?.(result);
-	    S.debugDump?.("render result payload summary", {
-        aiReviewStatus,
-	      componentFilenames: S.extractApiComponentFilenames?.(result) || [],
-	      fromCache,
-	      striffsCount: Array.isArray(result?.striffs) ? result.striffs.length : 0,
+    // The page moved on while this result was being fetched -- an analysis can run for minutes -- so
+    // it describes a pull request the user has left. Checked here, before anything is written to the
+    // page, the operation-token context or the cache: every one of those would otherwise be the
+    // previous pull request's, laid over the one on screen now.
+    if (!S.isReviewGenerationCurrent(generation)) return;
+    const operationTokenReady = S.updateOperationTokenFromResult?.(result);
+    const analysisStatus = S.syncAiReviewStateFromResult?.(result);
+    S.debugDump?.("render result payload summary", {
+      aiReviewStatus: analysisStatus,
+      componentFilenames: S.extractApiComponentFilenames?.(result) || [],
+      fromCache,
+      striffsCount: Array.isArray(result?.striffs) ? result.striffs.length : 0,
       componentCount: (S.extractApiComponentRecords?.(result) || []).length,
       components: S.extractApiComponentRecords?.(result) || []
     });
@@ -10179,10 +9323,35 @@
       return;
     }
 
+    // One load, one render, and the render never waits for the review. The server starts the
+    // architecture review with every analysis and it is far the slower of the two: on JabRef the
+    // analysis was ready in 26s and the review took 308s. Holding the finished diagram back for it
+    // made the review's length the load's length, which is what a load "taking forever" was. The
+    // diagram now renders as soon as it arrives and the review is collected behind it, enabling the
+    // findings button when it lands.
+    let review = { status: analysisStatus, result: null };
+    let collection = null;
+    if (ReviewState.isReviewPending(analysisStatus)) {
+      collection = await openReviewCollection(meta, generation);
+      // Opening the collection can go to the network for a missing access token; the page may have
+      // moved on while it did.
+      if (!collection.isCurrent()) return;
+      review = collection.available
+        ? { status: "PENDING", result: null }
+        : { status: "UNAVAILABLE", result: null };
+    } else if (!operationTokenReady) {
+      S.cwarn?.('Operation access token not available for this response');
+      // The initial response can omit the access token even when an operationId is present (the
+      // backend attaches it slightly after creating the operation). Retry once in the background so
+      // the token is ready without waiting for comment mode.
+      Promise.resolve(S.refreshOperationTokenFromFreshResult?.(meta)).catch?.(() => {});
+    }
+    const loaded = ReviewState.mergeReviewResult(result, review.result);
+
     S.__striffsNoChanges = false;
     const striffContainer = S.ensureStriffContainer();
     if (striffContainer) {
-      const rendered = S.renderStriffsInto(striffContainer, result);
+      const rendered = S.renderStriffsInto(striffContainer, loaded);
       if (S.state?.isTooLarge?.()) {
         S.__striffsReady = false;
         S.updateStriffButton({ neutral: true, disabled: true, tooltip: "Pull request is too large to display" });
@@ -10192,51 +9361,36 @@
         cerr("Render returned false");
         throw new Error("Failed to render diagram.");
       }
-      // Cache both base and enriched diagrams so the latest state persists.
-      const shouldCache = !fromCache;
-      if (shouldCache) {
-        writeCachedDiagram(result, meta);
-        S.__lastLoadSource = "fresh"; try { document.documentElement.dataset.striffsLoadSource = "fresh"; } catch {}
-      } else {
-        S.__lastLoadSource = "cache"; try { document.documentElement.dataset.striffsLoadSource = "cache"; } catch {}
+      // Cache what was rendered, with the review it carries. A diagram read back from the cache is
+      // written again only when this load read its review.
+      if (!fromCache || review.result) {
+        writeCachedDiagram(loaded, meta);
       }
+      { const v = fromCache ? "cache" : "fresh"; S.__lastLoadSource = v; try { document.documentElement.dataset.striffsLoadSource = v; } catch {} }
     }
 
-	    S.__striffsReady = true;
-	    S.__lastFetchedUpdatedAt = updated_at;
-	    S.setAutoGenerateIntent?.(true);
-      S.updateArchReviewButton?.();
-      // The server auto-starts the documented-rule review and reports its status on the diagram
-      // payload (issue #14). Collect that already-running job instead of waiting for a click:
-      //   READY   -> the payload we just rendered IS the enriched diagram, so keep it (change 3);
-      //   PENDING/RUNNING -> begin background polling now (change 1);
-      //   SKIPPED/NOT_REQUESTED -> aiReviewStatus is null here (getAiReviewStatusFromResult maps
-      //                            them out), so nothing polls and no headline shows (the guard).
-      if (aiReviewStatus === "READY") {
-        S.__lastEnrichmentResult = result;
-      } else if ((aiReviewStatus === "PENDING" || aiReviewStatus === "RUNNING") && engagementReady) {
-        // When engagement context is missing, the background refresh scheduled above starts the
-        // poll once the write token lands; don't start here without the context it needs.
-        S.maybeAutoStartReviewPolling?.({ status: aiReviewStatus });
-      }
-      // Progressive coverage headline on the diagram surface -- click-free (change 2).
-      S.updateDocRuleHeadline?.(result, { status: aiReviewStatus });
-      S.updateArchReviewButton?.();
-      if (aiReviewStatus === "FAILED") {
-        S.updateStriffButton({ success: true, tooltip: result?.aiReviewErrorMessage || "AI enrichment failed. Base Striffs are still available." });
-        return;
-      }
-      // Check raw SKIPPED status for tooltip (getAiReviewStatusFromResult maps it to null)
-      const rawReviewStatus = String(result?.aiReviewStatus || result?.ai_review_status || "").trim().toUpperCase();
-      const skippedMessage = rawReviewStatus === "SKIPPED" && result?.aiReviewErrorMessage
-        ? result.aiReviewErrorMessage
-        : null;
-      S.updateStriffButton({ success: true, tooltip: skippedMessage || "Striffs loaded. Click to view." });
-	  }
+    S.__striffsReady = true;
+    S.__lastFetchedUpdatedAt = updated_at;
+    S.setAutoGenerateIntent?.(true);
+    S.setReviewState(review.status, loaded);
+    S.updateStriffButton({ success: true, tooltip: "Striffs loaded. Click to view." });
+    // The review is slower than the diagram, so it arrives here rather than before the render, and
+    // the findings button enables itself when it lands.
+    if (review.status === "PENDING" && collection?.available) {
+      finishReviewInBackground(collection, loaded, meta)
+        .catch((e) => S.cwarn?.('Background review collection failed', e));
+    }
+  }
+  S.renderStriffsResult = renderStriffsResult;
 
   S.autoFetchStriffs = async () => {
-    S.cancelEnrichmentPolling?.("auto-fetch");
+    // A load already in flight is this load; only a new one supersedes the previous one's review.
     if (S.__autoFetchPromise) return S.__autoFetchPromise;
+    S.cancelReviewCollection?.("auto-fetch");
+    // Captured before the fetch, not after it. The fetch below can run for minutes, and a move to
+    // another pull request during it must invalidate whatever it returns; a generation read after
+    // the fetch would already carry that move and call the stale result current.
+    const loadGeneration = S.__reviewCollection;
     S.__autoFetchPromise = (async () => {
       let terminalErrorMessage = "";
       let skipReconcile = false; // Flag to skip reconcile in finally block
@@ -10278,14 +9432,11 @@
         }
 
         if (!result) {
-          // Not in this browser's cache, so it goes to the server, where a first analysis takes
-          // minutes (177-483s measured, plus any queue). Said now: the only notice used to arrive 30s
-          // in and leave 15s later, so most of the wait had no explanation at all.
-          S.toast?.("Analyzing this pull request. A first analysis takes a few minutes; after that it loads from cache.", "info", { timeoutMs: 20000 });
+          // The Striffs button's loading state is the progress indicator for the whole load.
           result = await requestPrimary(meta, token);
         }
 
-        await renderStriffsResult(result, meta, { fromCache });
+        await renderStriffsResult(result, meta, { fromCache, generation: loadGeneration });
 
         // Ensure diff map is built before we continue
         if (diffMapPromise) await diffMapPromise;
@@ -10459,15 +9610,15 @@
         } }, '*');
         return;
       }
-      if (data.fn === 'getEngagementState') {
-        const ctx = S.__engagementCtx || {};
+      if (data.fn === 'getOperationTokenState') {
+        const ctx = S.__operationTokenCtx || {};
         window.postMessage({ type: 'STRIFFS_TEST_RESULT', id: data.id, result: {
           operationId: String(ctx.operationId || '').trim() || null,
-          engagementWriteToken: String(ctx.engagementWriteToken || '').trim() || null,
+          operationAccessToken: String(ctx.operationAccessToken || '').trim() || null,
           hasOperationId: Boolean(String(ctx.operationId || '').trim()),
-          hasToken: Boolean(String(ctx.engagementWriteToken || '').trim()),
+          hasToken: Boolean(String(ctx.operationAccessToken || '').trim()),
           commentModeAvailable: Boolean(S.isCommentModeAvailable?.()),
-          lastError: S.__lastEngagementContextError || null
+          lastError: S.__lastOperationTokenError || null
         } }, '*');
         return;
       }
@@ -10566,15 +9717,15 @@
 
           const serializer = new XMLSerializer();
           const originalSvg = serializer.serializeToString(currentSvg);
-          const operationId = String(S.__engagementCtx?.operationId || '').trim();
-          const engagementWriteToken = String(S.__engagementCtx?.engagementWriteToken || '').trim();
-          if (!operationId || !engagementWriteToken) {
-            return { ok: false, reason: 'missing-engagement-context', operationId, hasToken: Boolean(engagementWriteToken) };
+          const operationId = String(S.__operationTokenCtx?.operationId || '').trim();
+          const operationAccessToken = String(S.__operationTokenCtx?.operationAccessToken || '').trim();
+          if (!operationId || !operationAccessToken) {
+            return { ok: false, reason: 'missing-operation-token-context', operationId, hasToken: Boolean(operationAccessToken) };
           }
 
           const makeResult = (status, svgText, extras = {}) => ({
             operationId,
-            engagementWriteToken,
+            operationAccessToken,
             aiReviewStatus: status,
             aiReviewPollAfterMs: status === 'READY' || status === 'FAILED' ? null : 25,
             aiReviewId: extras.aiReviewId || `manual-${status.toLowerCase()}`,
@@ -10587,10 +9738,9 @@
               totalComponents: 1
             } : undefined),
             surfacedItems: extras.surfacedItems || [],
-            // Findings and doc verdicts drive the Structural Checks and Documented Rules sections.
-            // They are fixtures rather than live data on purpose: a real PR may legitimately
-            // produce neither, so asserting against the live payload alone could never tell an
-            // empty result apart from a section that stopped rendering.
+            // Findings and doc verdicts are fixtures rather than live data on purpose: a real PR may
+            // legitimately produce neither, so asserting against the live payload alone could never
+            // tell an empty result apart from a section that stopped rendering.
             findings: extras.findings || [],
             docFactVerdicts: extras.docFactVerdicts || [],
             striffs: [{
@@ -10601,11 +9751,12 @@
             }]
           });
 
-          const enrichedSvg = originalSvg.replace('<svg', '<svg data-manual-enriched="1"');
-          const readyResult = makeResult('READY', enrichedSvg, {
+          // The analysis as the server first reports it: the diagram, with its review still running.
+          const pendingResult = makeResult('PENDING', originalSvg, { aiReviewId: 'manual-pending' });
+          const readyResult = makeResult('READY', originalSvg, {
             aiReviewId: 'manual-ready',
-            // One surfaced finding and one held below the gate, so the checks section has to
-            // render a flagged row and an observation row rather than an all-clean roster.
+            // One surfaced documented-rule item, plus a structural-detector finding of the kind
+            // older API versions still send: the panel has to show the first and ignore the second.
             surfacedItems: [{
               itemId: 'manual-f1',
               priority: 'STRUCTURAL_REGRESSION',
@@ -10617,16 +9768,16 @@
             findings: [
               {
                 findingId: 'manual-f1',
-                detectorId: 'NEW_PACKAGE_CYCLE',
-                title: 'Manual smoke cycle',
+                detectorId: 'DOCUMENTED_RULE',
+                title: 'Manual smoke documented rule',
                 summary: 'Manual smoke summary',
                 affectedComponents: ['com.manual.smoke.Alpha']
               },
               {
                 findingId: 'manual-f2',
-                detectorId: 'WMC_GROWTH',
-                title: 'Manual smoke complexity',
-                summary: 'Manual smoke complexity summary',
+                detectorId: 'NEW_PACKAGE_CYCLE',
+                title: 'Manual smoke legacy cycle',
+                summary: 'Manual smoke legacy summary',
                 affectedComponents: ['com.manual.smoke.Beta']
               }
             ],
@@ -10668,193 +9819,106 @@
             aiReviewErrorMessage: 'Manual smoke failure'
           });
 
-          // --- Step 1: Verify Architecture Review button exists and is visible ---
-          const archBtn = document.getElementById('striffs-arch-review-btn');
-          if (!archBtn) {
-            return { ok: false, reason: 'missing-arch-review-button' };
-          }
-          if (archBtn.style.display === 'none') {
-            return { ok: false, reason: 'arch-review-button-hidden' };
-          }
-
+          const meta = S.extractPRMetadata?.() || null;
           const originalFetchAiReviewStatus = S.fetchAiReviewStatus;
-          // Reset any state left by prior live AI review checks so
-          // triggerArchitectureReview starts enrichment instead of toggling the panel
-          S.__aiReviewStatus = null;
-          S.__lastEnrichmentResult = null;
-          S.closeArchReviewPanel?.();
-          S.updateArchReviewButton?.();
-          try {
-            // --- Step 2: Click Architecture Review button (READY path) ---
-            // Mock fetchAiReviewStatus to return READY immediately
-            let readyCalls = 0;
-            S.fetchAiReviewStatus = async () => {
-              readyCalls += 1;
-              return { ok: true, status: 200, json: readyResult };
-            };
-            S.__lastAiReviewPollAfterMs = 10;
-
-            // Simulate clicking the button
-            S.triggerArchitectureReview?.();
-
-            // Verify button is disabled after click
-            const disabledAfterClick = archBtn.disabled;
-            if (!disabledAfterClick) {
-              return { ok: false, reason: 'button-not-disabled-after-click' };
+          const originalRenderInto = S.renderStriffsInto;
+          let renders = 0;
+          let reads = 0;
+          let readsBeforeRender = -1;
+          S.renderStriffsInto = (target, payload) => {
+            renders += 1;
+            if (readsBeforeRender < 0) readsBeforeRender = reads;
+            return originalRenderInto(target, payload);
+          };
+          const archButton = () => document.getElementById('striffs-arch-review-btn');
+          const panelIsOpen = () => Boolean(document.querySelector('#striffs-arch-review-panel.striffs-arch-review-panel--open'));
+          // The load renders and returns while the review is still running, so the review's own
+          // outcome arrives after it. Waiting for a terminal status here is what the old blocking
+          // render used to do inside renderStriffsResult.
+          const TERMINAL = new Set(['READY', 'FAILED', 'SKIPPED', 'TIMED_OUT', 'UNAVAILABLE']);
+          const waitForReview = async (timeoutMs = 15000) => {
+            const deadline = Date.now() + timeoutMs;
+            while (Date.now() < deadline) {
+              if (TERMINAL.has(String(S.__aiReviewStatus || '').toUpperCase())) return true;
+              await S.sleep(100);
             }
-
-            // Wait for enrichment to complete (READY)
-            const readyOutcome = await new Promise((resolve) => {
-              const started = Date.now();
-              const tick = () => {
-                const enrichedNode = document.querySelector('#striffs-content svg[data-manual-enriched="1"]');
-                const btn = document.querySelector('#striffs-btn');
-                const archBtnNow = document.getElementById('striffs-arch-review-btn');
-                const statusReady = String(S.__aiReviewStatus || '').trim().toUpperCase() === 'READY';
-                const panelOpen = Boolean(document.getElementById('striffs-arch-review-panel'));
-                const buttonLooksReady = !!(btn && (
-                  /check-circle/.test(btn.innerHTML) ||
-                  /view/i.test(btn.title || '') ||
-                  statusReady
-                ));
-                if (enrichedNode && buttonLooksReady && statusReady) {
-                  const panelNode = document.getElementById('striffs-arch-review-panel');
-                  const panelText = String(panelNode?.innerText || '');
-                  resolve({
-                    ok: true,
-                    calls: readyCalls,
-                    html: String(btn?.innerHTML || ''),
-                    title: String(btn?.title || ''),
-                    enriched: true,
-                    pollTimerActive: Boolean(S.__aiReviewPollTimer),
-                    archBtnDisabled: archBtnNow?.disabled,
-                    archBtnText: String(archBtnNow?.textContent || '').trim(),
-                    panelOpen,
-                    panelHasOverview: panelText.includes('OVERVIEW')
-                      && panelText.includes('This is a manual smoke test review.'),
-                    panelHasStructuralChecks: panelText.includes('STRUCTURAL CHECKS'),
-                    panelHasDocumentedRules: panelText.includes('DOCUMENTED RULES'),
-                    // The full 12-check structural roster renders whenever the review ran. The
-                    // doc-tier rows are violation-only, and no doc-tier detector fires in this
-                    // fixture, so they contribute nothing here.
-                    panelCheckRowCount: panelNode
-                      ? panelNode.querySelectorAll('.striffs-arch-review-panel__check').length
-                      : 0,
-                    panelRuleRowCount: panelNode
-                      ? panelNode.querySelectorAll('.striffs-arch-review-panel__rule').length
-                      : 0,
-                    panelFlaggedRowCount: panelNode
-                      ? panelNode.querySelectorAll('.striffs-arch-review-panel__check--flagged').length
-                      : 0,
-                    panelObservedRowCount: panelNode
-                      ? panelNode.querySelectorAll('.striffs-arch-review-panel__check--observed').length
-                      : 0,
-                    // Advisory rows must never carry a pass/fail verdict.
-                    panelAdvisoryHasVerdict: /✅|❌/.test(String(
-                      panelNode?.querySelector('.striffs-arch-review-panel__rule--advisory')?.innerText || ''
-                    ))
-                  });
-                  return;
-                }
-                if (Date.now() - started > 4000) {
-                  resolve({
-                    ok: false,
-                    calls: readyCalls,
-                    html: String(btn?.innerHTML || ''),
-                    title: String(btn?.title || ''),
-                    enriched: Boolean(enrichedNode),
-                    pollTimerActive: Boolean(S.__aiReviewPollTimer),
-                    archBtnDisabled: archBtnNow?.disabled,
-                    archBtnText: String(archBtnNow?.textContent || '').trim(),
-                    panelOpen,
-                    status: String(S.__aiReviewStatus || '')
-                  });
-                  return;
-                }
-                setTimeout(tick, 40);
-              };
-              tick();
-            });
-
-            // --- Step 3: Click AI Review button again (FAILED path) ---
-            // Close panel and re-render base diagram first
-            S.closeArchReviewPanel?.();
-            const baseResult = makeResult(null, originalSvg, { aiReviewId: 'manual-base' });
-            S.syncAiReviewStateFromResult?.(baseResult);
-            S.renderStriffsInto?.(container, baseResult);
-            S.__striffsReady = true;
-            S.__lastEnrichmentResult = null;
-            S.showStriffView?.();
-            S.updateArchReviewButton?.();
-
-            let failedCalls = 0;
+            return false;
+          };
+          // A load of the pending analysis, with the review's status endpoint answering `replies` in turn.
+          const loadWith = async (replies) => {
+            renders = 0;
+            reads = 0;
+            readsBeforeRender = -1;
             S.fetchAiReviewStatus = async () => {
-              failedCalls += 1;
-              return { ok: true, status: 200, json: failedResult };
+              const json = replies[Math.min(reads, replies.length - 1)];
+              reads += 1;
+              return { ok: true, status: 200, json };
             };
-            S.__lastAiReviewPollAfterMs = 10;
+            S.closeArchReviewPanel?.();
+            await renderStriffsResult(pendingResult, meta);
+            const renderedBeforeReview = renders;
+            await waitForReview();
+            S.showStriffView?.();
+            return {
+              rendersBeforeReview: renderedBeforeReview,
+              renders,
+              pollsBeforeRender: readsBeforeRender,
+              status: String(S.__aiReviewStatus || ''),
+              archBtnText: String(archButton()?.textContent || '').trim(),
+              archBtnDisabled: archButton()?.disabled
+            };
+          };
 
-            S.triggerArchitectureReview?.();
+          try {
+            const ready = await loadWith([pendingResult, readyResult]);
+            const panelOpenBeforeClick = panelIsOpen();
+            archButton()?.click();
+            const panelNode = document.getElementById('striffs-arch-review-panel');
+            const panelText = String(panelNode?.innerText || '');
+            const readyOutcome = {
+              ok: ready.renders === 1 && ready.status === 'READY',
+              ...ready,
+              panelOpenBeforeClick,
+              panelOpen: panelIsOpen(),
+              panelHasOverview: panelText.includes('OVERVIEW')
+                && panelText.includes('This is a manual smoke test review.'),
+              // Structural checks are no longer part of the review, and the fixture's
+              // detector finding must not bring the section, or the finding, back.
+              panelHasStructuralChecks: panelText.includes('STRUCTURAL CHECKS'),
+              panelShowsLegacyDetectorFinding: panelText.includes('Manual smoke legacy cycle'),
+              panelHasReviewItems: panelText.includes('REVIEW ITEMS')
+                && panelText.includes('Manual smoke surfaced item'),
+              panelHasDocumentedRules: panelText.includes('DOCUMENTED RULES'),
+              panelRuleRowCount: panelNode
+                ? panelNode.querySelectorAll('.striffs-arch-review-panel__rule').length
+                : 0,
+              // A rule the review could not check is not shown at all.
+              panelShowsUncheckedRule: panelText.includes('manual smoke intention')
+            };
+            archButton()?.click();
+            readyOutcome.panelClosedOnSecondClick = !panelIsOpen();
 
-            const failedOutcome = await new Promise((resolve) => {
-              const started = Date.now();
-              const tick = () => {
-                const enrichedNode = document.querySelector('#striffs-content svg[data-manual-enriched="1"]');
-                const btn = document.querySelector('#striffs-btn');
-                const archBtnNow = document.getElementById('striffs-arch-review-btn');
-                const statusFailed = String(S.__aiReviewStatus || '').trim().toUpperCase() === 'FAILED';
-                const title = String(btn?.title || '');
-                const buttonShowsDone = !!(btn && (/check-circle/.test(btn.innerHTML) || /failed|failure|view/i.test(title)));
-                if (!S.__aiReviewPollTimer && buttonShowsDone && statusFailed) {
-                  resolve({
-                    ok: true,
-                    calls: failedCalls,
-                    title,
-                    enrichedStillPresent: Boolean(enrichedNode),
-                    status: String(S.__aiReviewStatus || ''),
-                    archBtnDisabled: archBtnNow?.disabled,
-                    archBtnText: String(archBtnNow?.textContent || '').trim()
-                  });
-                  return;
-                }
-                if (Date.now() - started > 4000) {
-                  resolve({
-                    ok: false,
-                    calls: failedCalls,
-                    title,
-                    enrichedStillPresent: Boolean(enrichedNode),
-                    status: String(S.__aiReviewStatus || ''),
-                    pollTimerActive: Boolean(S.__aiReviewPollTimer),
-                    archBtnDisabled: archBtnNow?.disabled,
-                    archBtnText: String(archBtnNow?.textContent || '').trim()
-                  });
-                  return;
-                }
-                setTimeout(tick, 40);
-              };
-              tick();
-            });
+            const failed = await loadWith([pendingResult, failedResult]);
+            const failedOutcome = { ok: failed.renders === 1 && failed.status === 'FAILED', ...failed };
 
             return {
-              ok: disabledAfterClick &&
-                readyOutcome?.ok &&
-                readyOutcome.enriched &&
-                readyOutcome.pollTimerActive === false &&
-                failedOutcome?.ok &&
-                failedOutcome.enrichedStillPresent === false &&
-                failedOutcome.archBtnDisabled === false,
-              buttonState: { disabledAfterClick },
+              // The hook ran; the outcomes below carry the verdicts.
+              ok: true,
+              noManualTrigger: typeof S.triggerArchitectureReview !== 'function'
+                && ![ready.archBtnText, failed.archBtnText].includes('AI Review'),
               readyOutcome,
               failedOutcome
             };
           } finally {
             S.fetchAiReviewStatus = originalFetchAiReviewStatus;
+            S.renderStriffsInto = originalRenderInto;
+            S.closeArchReviewPanel?.();
             const restored = makeResult('READY', originalSvg, { aiReviewId: 'manual-restored' });
             S.syncAiReviewStateFromResult?.(restored);
             S.renderStriffsInto?.(container, restored);
             S.__striffsReady = true;
+            S.setReviewState?.('READY', restored);
             S.showStriffView?.();
-            S.updateArchReviewButton?.();
           }
         })())
           .then((result) => {
@@ -10869,21 +9933,18 @@
         Promise.resolve((async () => {
           const timeoutMs = Math.max(1000, Number(data.timeoutMs || 180000));
           const startedAt = Date.now();
-          const currentSvgNode = S.getPrimaryDiagramSvg?.() || null;
-          if (!currentSvgNode) {
+          if (!S.getPrimaryDiagramSvg?.()) {
             return { ok: false, reason: 'missing-base-svg' };
           }
-          const serializer = new XMLSerializer();
-          const baseSvg = serializer.serializeToString(currentSvgNode);
-          const operationId = String(S.__engagementCtx?.operationId || S.__aiReviewOperationId || '').trim();
-          const engagementWriteToken = String(S.__engagementCtx?.engagementWriteToken || '').trim();
-          if (!operationId || !engagementWriteToken) {
+          const operationId = String(S.__operationTokenCtx?.operationId || S.__aiReviewOperationId || '').trim();
+          const operationAccessToken = String(S.__operationTokenCtx?.operationAccessToken || '').trim();
+          if (!operationId || !operationAccessToken) {
             return {
               ok: false,
-              reason: 'missing-engagement-context',
+              reason: 'missing-operation-token-context',
               operationId,
-              hasToken: Boolean(engagementWriteToken),
-              ctxOperationId: String(S.__engagementCtx?.operationId || '').trim() || null,
+              hasToken: Boolean(operationAccessToken),
+              ctxOperationId: String(S.__operationTokenCtx?.operationId || '').trim() || null,
               aiReviewOperationId: String(S.__aiReviewOperationId || '').trim() || null
             };
           }
@@ -10895,7 +9956,7 @@
           while ((Date.now() - startedAt) < timeoutMs) {
             const resp = await S.fetchAiReviewStatus?.({
               operationId,
-              engagementToken: engagementWriteToken,
+              operationToken: operationAccessToken,
               timeoutMs: 15000
             });
             if (!resp?.ok) {
@@ -10905,7 +9966,7 @@
                 status: Number(resp?.status || 0),
                 error: String(resp?.error || ''),
                 operationId,
-                ctxOperationId: String(S.__engagementCtx?.operationId || '').trim() || null,
+                ctxOperationId: String(S.__operationTokenCtx?.operationId || '').trim() || null,
                 aiReviewOperationId: String(S.__aiReviewOperationId || '').trim() || null
               };
             }
@@ -10915,35 +9976,22 @@
             reviewId = String(result?.aiReviewId || result?.ai_review_id || reviewId || '').trim();
 
             if (status === 'READY') {
-              if (Array.isArray(result?.striffs) && result.striffs.length > 0) {
-                const meta = S.extractPRMetadata?.() || null;
-                await S.refreshDiagramWithEnrichment?.(result, meta);
-              }
-              const liveSvgNode = S.getPrimaryDiagramSvg?.() || null;
-              const finalSvg = liveSvgNode ? serializer.serializeToString(liveSvgNode) : '';
-              const hasNote = finalSvg.includes(S.REVIEW_NOTE_PREFIX);
               // No early return when nothing was surfaced. Whether this pull request is worth
-              // flagging is the model's call, but reaching READY, rendering an overview and drawing
-              // the structural-checks roster are not -- and bailing here skipped every one of those
+              // flagging is the model's call, but reaching READY, rendering an overview and rendering
+              // what the server surfaced are not -- and bailing here skipped every one of those
               // assertions on exactly the fixtures where the model happened to stay quiet.
               // Render the panel from the live payload so the report below describes what a
               // reviewer would actually see, not just what the response contained.
-              S.__lastEnrichmentResult = result;
+              S.setReviewState?.('READY', result);
               S.openArchReviewPanel?.(result);
               const panel = document.getElementById('striffs-arch-review-panel');
               const panelText = String(panel?.innerText || '');
               const overview = String(result?.reviewSummary?.overview || '').trim();
               return {
-                // The poll reached a terminal state and handed back a payload. Whether a note was
-                // drawn is reported separately, beside the surfaced count that decides whether one
-                // was owed.
+                // The poll reached a terminal state and handed back a payload.
                 ok: true,
                 status,
                 reviewId,
-                changed: Boolean(finalSvg && finalSvg !== baseSvg),
-                hasNote,
-                baseLength: baseSvg.length,
-                finalLength: finalSvg.length,
                 // The model's account of the change. Before striff-api's architecturalImpact work
                 // this was a placeholder restating two counts already on screen, so a non-empty
                 // overview is not enough on its own — the placeholder shape has to be excluded or
@@ -10955,11 +10003,13 @@
                 findingsCount: Array.isArray(result?.findings) ? result.findings.length : 0,
                 surfacedCount: Array.isArray(result?.surfacedItems) ? result.surfacedItems.length : 0,
                 docVerdictCount: Array.isArray(result?.docFactVerdicts) ? result.docFactVerdicts.length : 0,
-                panelHasStructuralChecks: panelText.includes('STRUCTURAL CHECKS'),
-                panelHasDocumentedRules: panelText.includes('DOCUMENTED RULES'),
-                panelCheckRowCount: panel
-                  ? panel.querySelectorAll('.striffs-arch-review-panel__check').length
+                // Items the panel is meant to show; the server can mark one as not for the extension.
+                extensionItemCount: Array.isArray(result?.surfacedItems)
+                  ? result.surfacedItems.filter(i => i && i.showInExtension !== false).length
                   : 0,
+                panelHasStructuralChecks: panelText.includes('STRUCTURAL CHECKS'),
+                panelHasReviewItems: panelText.includes('REVIEW ITEMS'),
+                panelHasDocumentedRules: panelText.includes('DOCUMENTED RULES'),
                 panelRuleRowCount: panel
                   ? panel.querySelectorAll('.striffs-arch-review-panel__rule').length
                   : 0
@@ -11206,7 +10256,6 @@
       S.__striffsNoChanges = false;
       S.__lastFetchedUpdatedAt = null;
       S.__striffsSvg = null;
-    S.clearReviewNoteFeedback?.();
     S.__striffsPathToComponentId.clear();
     S.__striffsComponentIdToFile.clear();
     S.__striffsComponentIdToDiffId?.clear?.();
@@ -11265,17 +10314,17 @@
       S.updateStriffButton?.({ loading: true, tooltip: "Refreshing Striffs…", phase: "Refreshing" });
       await S.autoFetchStriffs?.();
     } else if (cacheStatus === 'fresh') {
-      // primeDiagramFromCache already restored engagement context from the
+      // primeDiagramFromCache already restored the operation context from the
       // cached payload (Chrome Storage / IndexedDB / localStorage).  If the
       // context is still missing, making a full API call here is wasteful —
-      // the same API response would be missing engagement data too.  Context
-      // will be obtained when the user next triggers Review Architecture.
+      // the same API response would be missing the operation token too.  Context
+      // will be obtained on the next load that reads the review.
       const hasCachedCtx = Boolean(
-        String(S.__engagementCtx?.operationId || '').trim() &&
-        String(S.__engagementCtx?.engagementWriteToken || '').trim()
+        String(S.__operationTokenCtx?.operationId || '').trim() &&
+        String(S.__operationTokenCtx?.operationAccessToken || '').trim()
       );
       if (!hasCachedCtx) {
-        S.cwarn?.('Engagement context missing after cache load — will be obtained on next generation');
+        S.cwarn?.('Operation token missing after cache load — will be obtained on next generation');
       }
     }
 
@@ -11402,7 +10451,8 @@
     lastPath = location.pathname;
 
     try {
-      S.cancelEnrichmentPolling?.("navigation");
+      // No review cancellation here: moving between a PR's own tabs leaves its review wanted, and a
+      // move to a different PR cancels it in resetPrScopedState below.
       // Injected file-menu buttons live in React portals that survive SPA
       // navigation and get reused by unrelated menus; drop them on every
       // route change. They re-inject on the next file-menu open.
@@ -11491,7 +10541,7 @@
 
   S.teardownNavListeners = function teardownNavListeners() {
     if (!S.__navListenersRegistered) return;
-    S.cancelEnrichmentPolling?.("teardown-nav");
+    S.cancelReviewCollection?.("teardown-nav");
     document.removeEventListener('turbo:load', bootIfNeeded);
     document.removeEventListener('turbo:render', bootIfNeeded);
     document.removeEventListener('pjax:end', bootIfNeeded);

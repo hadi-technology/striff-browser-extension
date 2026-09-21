@@ -172,7 +172,7 @@ async function downloadRepoZipAsArrayBuffer(owner, repo, ref, apiBase) {
     // no-cache because `ref` is usually a branch and therefore moves. A stale archive would be
     // analysed and reported as the current revision, which is wrong rather than merely old.
     const res = await fetch(url, { signal: t.signal, cache: 'no-cache' });
-    if (!res.ok) return { ok: false, error: `Failed to download zip: ${res.status}` };
+    if (!res.ok) return { ok: false, status: res.status, error: `Failed to download zip: ${res.status}` };
     if (utils && res.body && typeof utils.filterZipStream === 'function') {
       filtered = await utils.filterZipStream(res.body, manifest, {
         maxKeptBytes: ceiling,
@@ -233,7 +233,7 @@ async function downloadRepoZipAsArrayBuffer(owner, repo, ref, apiBase) {
 
 const readApiErrorResponse = BgUtils.readApiErrorResponse;
 
-async function postIncrementalToLocal(apiUrl, beforeAB, changedFiles = [], { timeoutMs = 120000, apiBase = '' } = {}) {
+async function postIncrementalToLocal(apiUrl, beforeAB, changedFiles = [], { timeoutMs = 120000, apiBase = '', pullRequest = null } = {}) {
   const sanitizedChangedFiles = sanitizeChangedFilesPayload(changedFiles);
 
   // The archive arrives already filtered -- downloadRepoZipAsArrayBuffer is the only source of it
@@ -242,6 +242,10 @@ async function postIncrementalToLocal(apiUrl, beforeAB, changedFiles = [], { tim
   const fd = new FormData();
   fd.append('before', new Blob([beforeAB], { type: 'application/zip' }), 'before.zip');
   fd.append('changed_files', new Blob([JSON.stringify(sanitizedChangedFiles)], { type: 'application/json' }));
+  // Lets the API answer with the GitHub App's analysis of this pull request instead of a second one.
+  for (const [name, value] of BgUtils.pullRequestFormFields?.(pullRequest || {}) || []) {
+    fd.append(name, value);
+  }
 
   const t = abortableTimeout(timeoutMs);
   try {
@@ -682,7 +686,8 @@ const handlers = {
     const {
       baseOwner, baseRepo, baseBranch,
       changedFiles = [],
-      changedFilesStorageKey = ''
+      changedFilesStorageKey = '',
+      pullRequest = null
     } = msg;
 
     if (!baseOwner || !baseRepo || !baseBranch) {
@@ -726,10 +731,13 @@ const handlers = {
         baseError: before.error,
         tooLarge: !!before.tooLarge
       });
+      // codeload answers a private repository with 404, so this is how the tab learns it sent a
+      // private repo down the upload path, and falls back to the token GET.
+      const errorCode = before.tooLarge ? 'ZIP_TOO_LARGE' : before.status === 404 ? 'BASE_ZIP_NOT_FOUND' : null;
       safeReply({
         ok: false,
         error: before.tooLarge ? before.error : `Failed downloading base zip: ${before.error}`,
-        ...(before.tooLarge ? { errorCode: 'ZIP_TOO_LARGE' } : {})
+        ...(errorCode ? { errorCode } : {})
       });
       return;
     }
@@ -749,7 +757,11 @@ const handlers = {
       effectiveChangedFiles,
       // The submit itself is fast now -- it uploads and returns. The long wait is the poll that
       // follows, which carries its own budget, so this timeout covers the upload alone.
-      { timeoutMs: 180000, apiBase }
+      {
+        timeoutMs: 180000,
+        apiBase,
+        pullRequest
+      }
     );
     const postDurationMs = Date.now() - postStart;
     const totalDurationMs = Date.now() - overallStart;
@@ -833,64 +845,16 @@ const handlers = {
       t.cancel();
     }
   },
-  recordEngagementEvent: async (msg, { safeReply }) => {
-    const {
-      operationId,
-      engagementToken,
-      payload,
-      timeoutMs = 12000
-    } = msg || {};
-    const op = String(operationId || "").trim();
-    const token = String(engagementToken || "").trim();
-    if (!op) { safeReply({ ok: false, error: "missing operationId" }); return; }
-    if (!token) { safeReply({ ok: false, error: "missing engagementToken" }); return; }
-    if (!payload || typeof payload !== "object") {
-      safeReply({ ok: false, error: "missing payload" });
-      return;
-    }
-    const apiBase = await getApiBase();
-    const url = `${apiBase}/api/v1/striffs/${encodeURIComponent(op)}/engagement`;
-    const t = abortableTimeout(timeoutMs);
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Striff-Engagement-Token": token
-        },
-        body: JSON.stringify(payload),
-        signal: t.signal,
-        cache: "no-cache"
-      });
-      const status = res.status;
-      if (!res.ok) {
-        const text = await res.text().catch(() => "");
-        debugLog("recordEngagementEvent failed", {
-          operationId: op,
-          status,
-          eventType: payload?.eventType || payload?.event?.type || null
-        });
-        safeReply({ ok: false, status, error: `HTTP ${status}`, body: text });
-        return;
-      }
-      const json = await res.json().catch(() => null);
-      safeReply({ ok: true, status, json });
-    } catch (e) {
-      safeReply({ ok: false, error: String(e?.message || e) });
-    } finally {
-      t.cancel();
-    }
-  },
   fetchAiReviewStatus: async (msg, { safeReply }) => {
     const {
       operationId,
-      engagementToken,
+      operationToken,
       timeoutMs = 15000
     } = msg || {};
     const op = String(operationId || "").trim();
-    const token = String(engagementToken || "").trim();
+    const token = String(operationToken || "").trim();
     if (!op) { safeReply({ ok: false, error: "missing operationId" }); return; }
-    if (!token) { safeReply({ ok: false, error: "missing engagementToken" }); return; }
+    if (!token) { safeReply({ ok: false, error: "missing operationToken" }); return; }
     const apiBase = await getApiBase();
     const url = `${apiBase}/api/v1/striffs/${encodeURIComponent(op)}/ai-review`;
     const t = abortableTimeout(timeoutMs);
@@ -898,7 +862,7 @@ const handlers = {
       const res = await fetch(url, {
         method: "GET",
         headers: {
-          "X-Striff-Engagement-Token": token
+          "X-Striff-Operation-Token": token
         },
         signal: t.signal,
         cache: "no-cache"

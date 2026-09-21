@@ -89,8 +89,11 @@
     const ds = new DecompressionStream('deflate-raw');
     const writer = ds.writable.getWriter();
     const reader = ds.readable.getReader();
-    writer.write(bytes);
-    writer.close();
+    // When bytes trail the compressed data -- and the base64 padding always leaves some -- the stream
+    // errors, and the write and close promises reject with it. The read loop below handles that
+    // error; these two had no handler, so every decode raised two uncaught errors in the page.
+    writer.write(bytes).catch(() => {});
+    writer.close().catch(() => {});
     const chunks = [];
     try {
       while (true) {

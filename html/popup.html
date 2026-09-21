@@ -72,6 +72,17 @@
     button.danger:hover {
       background: #ffebe9;
     }
+    /* An offer, not the popup's main action: it reads as a link's blue rather than competing with
+       the green Save button for "the thing to press". */
+    button.install {
+      color: #0969da;
+      border-color: #0969da;
+      background: #fff;
+      font-weight: 600;
+    }
+    button.install:hover {
+      background: #ddf4ff;
+    }
     .spacer {
       margin-top: 10px;
     }
@@ -151,6 +162,18 @@
   <div class="button-row">
     <button id="saveBtn" type="button" class="primary">Save</button>
     <button id="clearBtn" type="button" class="danger">Clear</button>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Run Striffs on every pull request</div>
+    <div class="section-note">
+      The Striffs GitHub App checks each pull request as it opens. One that already has its check
+      opens with that analysis instead of waiting for a new one, and your reviewers see the result
+      whether or not they have this extension.
+    </div>
+    <div class="button-row">
+      <button id="installAppBtn" type="button" class="install">Install the GitHub App</button>
+    </div>
   </div>
 
   <div class="section">
