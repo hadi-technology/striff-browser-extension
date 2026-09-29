@@ -4643,67 +4643,6 @@
             return map; // Return the map for chaining
     });
   };
-
-  // --- PR refs parsing (robust) ---
-  S.extractHeadBaseRefs = () => {
-    const EMPTY_REF = { owner: "", repo: "", branch: "" };
-
-    // Only an anchor carrying a /tree/<branch> segment can name a branch. The old
-    // repository-hovercard fallback matched plain /owner/repo links, which structurally
-    // cannot -- it returned the right owner/repo with branch:"" and callers then built
-    // ".../blob//<path>?raw=1", which GitHub collapses to ".../blob/<path>" and 404s.
-    // The HTML error page then surfaced as an unreadable "autoFetchStriffs error".
-    // Fork PRs hit this hardest: both repos get their own hovercard link, so the
-    // fallback always found its two anchors. Returning nothing beats returning refs
-    // that look complete but address a branch that does not exist.
-    const parseRef = (anchor) => {
-      if (!anchor) return { ...EMPTY_REF };
-      const href = anchor.getAttribute("href") || "";
-      const parts = href.split("/").filter(Boolean);
-      if (parts[2] !== "tree") return { ...EMPTY_REF };
-      const owner = parts[0] || "";
-      const repo = parts[1] || "";
-      const branch = decodeURIComponent(parts.slice(3).join("/")) || "";
-      if (!owner || !repo || !branch) return { ...EMPTY_REF };
-      return { owner, repo, branch };
-    };
-    const isComplete = (ref) => Boolean(ref?.owner && ref?.repo && ref?.branch);
-
-    // .commit-ref is the PR header's own base/head pair and is authoritative. The
-    // /tree/ sweep is a fallback for layouts that do not render it; it is accepted
-    // only when both ends parse completely, so a stray directory link cannot stand
-    // in for a real ref.
-    const strategies = [
-      () => Array.from(document.querySelectorAll(".commit-ref > a")),
-      () => Array.from(document.querySelectorAll('a[href*="/tree/"]'))
-    ];
-
-    let base = { ...EMPTY_REF };
-    let head = { ...EMPTY_REF };
-    for (const collect of strategies) {
-      const anchors = collect();
-      if (anchors.length < 2) continue;
-      const candidateBase = parseRef(anchors[0]);
-      const candidateHead = parseRef(anchors[1]);
-      if (isComplete(candidateBase) && isComplete(candidateHead)) {
-        base = candidateBase;
-        head = candidateHead;
-        break;
-      }
-    }
-
-    const refs = {
-      baseOwner: base.owner,
-      baseRepo: base.repo,
-      baseBranch: base.branch,
-      headOwner: head.owner,
-      headRepo: head.repo,
-      headBranch: head.branch
-    };
-    S.__debugHeadBaseRefs = refs;
-    S.debugDump?.("head/base refs", refs);
-    return refs;
-  };
 })();
 
 
@@ -8325,14 +8264,6 @@
       .join('/');
   }
 
-  function decodeBase64Utf8(content) {
-    const cleaned = String(content || '').replace(/\s+/g, '');
-    const binary = atob(cleaned);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
-    return new TextDecoder('utf-8').decode(bytes);
-  }
-
   // GitHub answers 401 to a token it no longer accepts, and every caller here falls back -- to the
   // page, to raw files, to the session -- so the user was never told the token they saved had
   // stopped working. Said once per page.
@@ -8575,82 +8506,117 @@
     }
   }
 
-  async function fetchHeadFileContent(refs, path, token) {
+  function headerValue(headers, name) {
+    if (!headers) return null;
+    if (typeof headers.get === 'function') return headers.get(name);
+    const key = Object.keys(headers).find((k) => k.toLowerCase() === name);
+    return key ? headers[key] : null;
+  }
+
+  // GitHub's answer when a quota is used up: 403 or 429, with x-ratelimit-remaining at 0 for the
+  // hourly limit, or a message naming a secondary rate limit, which carries retry-after instead.
+  // Unauthenticated, the hourly limit is 60 requests per IP -- a github.com login does not count,
+  // because the API reads credentials only from the Authorization header.
+  function githubRateLimitError(resp, { token = null } = {}) {
+    const status = Number(resp?.status || 0);
+    if (status !== 403 && status !== 429) return null;
+    const message = typeof resp?.body === 'string' ? resp.body : String(resp?.body?.message || '');
+    const remaining = headerValue(resp?.headers, 'x-ratelimit-remaining');
+    if (String(remaining) !== '0' && !/rate limit/i.test(message)) return null;
+    const resetSeconds = Number(headerValue(resp?.headers, 'x-ratelimit-reset'));
+    const retryAfterSeconds = Number(headerValue(resp?.headers, 'retry-after'));
+    const resetAt = retryAfterSeconds > 0
+      ? Date.now() + retryAfterSeconds * 1000
+      : (resetSeconds > 0 ? resetSeconds * 1000 : null);
+    return Object.assign(new Error(message || 'GitHub API rate limit exceeded'), {
+      status,
+      errorCode: 'GITHUB_RATE_LIMITED',
+      resetAt,
+      withToken: Boolean(token)
+    });
+  }
+
+  async function fetchGitHubApi(url, token) {
+    const resp = await fetchJsonWithTimeout(url, { token, timeoutMs: timeoutFor("githubApi", 20000) });
+    const rateLimited = githubRateLimitError(resp, { token });
+    if (rateLimited) throw rateLimited;
+    if (!resp.ok) {
+      throw Object.assign(
+        new Error(`Could not read this pull request's commits from GitHub (HTTP ${resp.status || 'no response'}).`),
+        { status: resp.status || null, errorCode: 'PULL_REVISIONS_UNAVAILABLE' }
+      );
+    }
+    return resp.body;
+  }
+
+  // The two commits an upload is built from, resolved the way striff-api resolves them for the token
+  // route and the GitHub App: the pull request's head commit, and the merge base of its base and head.
+  // Commits rather than branch names, because a branch name means "wherever the branch is now": after
+  // a merge the head branch is usually deleted, and the base branch already contains the change. The
+  // merge base rather than the base branch tip, because a pull request is a change to where it left
+  // the branch (see mergeBase in striff-api's GitHub.java). Both come from GitHub's API, not the page,
+  // whose markup is undocumented and describes the selected commit range rather than the whole PR.
+  //
+  // Remembered per pull request revision -- updated_at moves on every push -- so a retry or a quiet
+  // refresh does not spend the unauthenticated quota twice.
+  const pullRevisions = new Map();
+  async function resolvePullRevisions(meta, token) {
+    const owner = String(meta?.owner || '').trim();
+    const repo = String(meta?.repo || '').trim();
+    const pullNumber = String(meta?.pull_number || '').trim();
+    const memoKey = meta?.updated_at ? `${owner}/${repo}#${pullNumber}@${meta.updated_at}`.toLowerCase() : null;
+    if (memoKey && pullRevisions.has(memoKey)) return pullRevisions.get(memoKey);
+
+    const repoPath = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+    const pull = await fetchGitHubApi(`${repoPath}/pulls/${encodeURIComponent(pullNumber)}`, token);
+    const baseSha = String(pull?.base?.sha || '').trim();
+    const headSha = String(pull?.head?.sha || '').trim();
+    if (!baseSha || !headSha) {
+      throw Object.assign(new Error("GitHub did not report this pull request's commits."), { errorCode: 'PULL_REVISIONS_UNAVAILABLE' });
+    }
+    const compare = await fetchGitHubApi(`${repoPath}/compare/${baseSha}...${headSha}?per_page=1`, token);
+    const mergeBaseSha = String(compare?.merge_base_commit?.sha || '').trim();
+    if (!mergeBaseSha) {
+      throw Object.assign(new Error("GitHub did not report where this pull request branched from."), { errorCode: 'PULL_REVISIONS_UNAVAILABLE' });
+    }
+
+    // The pull request's own repository serves its head commit whether the head branch, or the fork
+    // it came from, still exists: GitHub keeps every pull request's commits under refs/pull/N/head.
+    const revisions = { owner, repo, headSha, mergeBaseSha };
+    if (memoKey) pullRevisions.set(memoKey, revisions);
+    try {
+      document.documentElement.dataset.striffsHeadSha = headSha;
+      document.documentElement.dataset.striffsMergeBaseSha = mergeBaseSha;
+    } catch {}
+    return revisions;
+  }
+
+  // Only public repositories take the upload route, so raw.githubusercontent.com serves every file
+  // without credentials, and at a commit it never serves stale content.
+  async function fetchHeadFileContent(revisions, path) {
     const normalizedPath = normalizeChangedFilePath(path);
     if (!normalizedPath) return null;
-
-    // Every URL below interpolates these three. An empty branch used to yield
-    // ".../blob//<path>", which GitHub answers with a 404 HTML page that then became
-    // the thrown error's message -- a whole rendered document in the console instead
-    // of a cause. Fail with something actionable while the refs are still in scope.
-    if (!refs?.headOwner || !refs?.headRepo || !refs?.headBranch) {
-      const err = new Error(
-        `Cannot fetch head file content: incomplete PR refs ` +
-        `(owner=${refs?.headOwner || "?"}, repo=${refs?.headRepo || "?"}, branch=${refs?.headBranch || "?"}). ` +
-        `The pull request header had not rendered when Striffs read it.`
-      );
-      err.code = "INCOMPLETE_PR_REFS";
-      throw err;
-    }
-
-    // When no token, use raw.githubusercontent.com directly to avoid API rate limits
-    if (!token) {
-      const rawUrl = `https://raw.githubusercontent.com/${encodeURIComponent(refs.headOwner)}/${encodeURIComponent(refs.headRepo)}/${encodeURIComponent(refs.headBranch)}/${encodeGitHubPath(normalizedPath)}`;
-      const rawResp = await fetchTextWithTimeout(rawUrl, {
-        token: null,
-        timeoutMs: timeoutFor("githubRawDirect", 20000),
-        credentials: 'omit'
-      });
-      if (rawResp.ok && !/text\/html/i.test(rawResp.contentType) && !/^<!doctype html/i.test(rawResp.text.trim())) {
-        return rawResp.text;
-      }
-    }
-
-    const apiUrl = `https://api.github.com/repos/${encodeURIComponent(refs.headOwner)}/${encodeURIComponent(refs.headRepo)}/contents/${encodeGitHubPath(normalizedPath)}?ref=${encodeURIComponent(refs.headBranch)}`;
-    try {
-      const apiResp = await fetchJsonWithTimeout(apiUrl, {
-        token,
-        timeoutMs: timeoutFor("githubContents", 20000)
-      });
-      if (apiResp.ok && apiResp.body && typeof apiResp.body === 'object' && !Array.isArray(apiResp.body)) {
-        if (typeof apiResp.body.content === 'string' && apiResp.body.encoding === 'base64') {
-          return decodeBase64Utf8(apiResp.body.content);
-        }
-        if (typeof apiResp.body.download_url === 'string' && apiResp.body.download_url) {
-          const rawResp = await fetchTextWithTimeout(apiResp.body.download_url, {
-            token,
-            timeoutMs: timeoutFor("githubRawDownload", 20000),
-            credentials: 'omit'
-          });
-          if (rawResp.ok && !/text\/html/i.test(rawResp.contentType) && !/^<!doctype html/i.test(rawResp.text.trim())) {
-            return rawResp.text;
-          }
-        }
-      }
-    } catch {}
-
-    const sessionBlobUrl = `https://github.com/${encodeURIComponent(refs.headOwner)}/${encodeURIComponent(refs.headRepo)}/blob/${encodeURIComponent(refs.headBranch)}/${encodeGitHubPath(normalizedPath)}?raw=1`;
-    // Served from the user's github.com session cookies. The token already had its turn on the API
-    // request above, so it is not sent here alongside them.
-    const rawResp = await fetchTextWithTimeout(sessionBlobUrl, {
+    const rawUrl = `https://raw.githubusercontent.com/${encodeURIComponent(revisions.owner)}/${encodeURIComponent(revisions.repo)}/${revisions.headSha}/${encodeGitHubPath(normalizedPath)}`;
+    const rawResp = await fetchTextWithTimeout(rawUrl, {
       token: null,
-      timeoutMs: timeoutFor("githubRaw", 20000),
-      credentials: 'include'
+      timeoutMs: timeoutFor("githubRawDirect", 20000),
+      credentials: 'omit'
     });
-    if (!rawResp.ok) {
-      const err = new Error(rawResp.text || `Failed fetching file content: ${rawResp.status}`);
-      err.status = rawResp.status;
-      throw err;
+    if (rawResp.status === 429) {
+      throw githubRateLimitError({ status: 429, headers: rawResp.headers, body: 'rate limit' });
     }
-    if (/text\/html/i.test(rawResp.contentType) || /^<!doctype html/i.test(rawResp.text.trim())) {
-      const err = new Error('GitHub returned HTML instead of file content.');
-      err.status = rawResp.status || 401;
-      throw err;
+    if (!rawResp.ok) {
+      // The commit is GitHub's own answer, so a 404 here means the repository cannot be read
+      // anonymously -- a private repository the page and GitHub's answer both misread as public.
+      throw Object.assign(new Error(`Failed fetching ${normalizedPath} at ${revisions.headSha.slice(0, 7)}: ${rawResp.status}`), {
+        status: rawResp.status || null,
+        errorCode: rawResp.status === 404 ? 'HEAD_FILE_NOT_FOUND' : null
+      });
     }
     return rawResp.text;
   }
 
-  async function buildChangedFiles(refs, meta, filterFiles, { token = null } = {}) {
+  async function buildChangedFiles(revisions, meta, filterFiles, { token = null } = {}) {
     const effectiveToken = typeof token === 'string' ? token : await S.getStoredToken();
     const resolvedPrFiles = await resolvePrFilesMetadata(meta, filterFiles, effectiveToken);
 
@@ -8677,7 +8643,7 @@
       }
 
       const normalizedStatus = status === 'added' ? 'added' : 'modified';
-      const content = await fetchHeadFileContent(refs, path, effectiveToken);
+      const content = await fetchHeadFileContent(revisions, path);
       if (typeof content !== 'string' || !content.length) continue;
       changedFiles.push({ path, status: normalizedStatus, content });
     }
@@ -8687,12 +8653,12 @@
 
   async function collectZipRequestArtifacts(meta, { quiet = false, token = null } = {}) {
     const filterFiles = S.getFilterFilesFromNav();
-    const refs = S.extractHeadBaseRefs();
     if (!quiet) {
       S.updateStriffButton({ loading: true, phase: "Fetching", tooltip: "Fetching" });
     }
-    const changedFiles = await buildChangedFiles(refs, meta, filterFiles, { token });
-    return { refs, filterFiles, changedFiles };
+    const revisions = await resolvePullRevisions(meta, token);
+    const changedFiles = await buildChangedFiles(revisions, meta, filterFiles, { token });
+    return { revisions, filterFiles, changedFiles };
   }
 
   async function requestWithZips(meta, { quiet = false } = {}) {
@@ -8701,10 +8667,10 @@
     S.__lastRequestType = 'zips';
     try { document.documentElement.dataset.striffsLastRequestType = 'zips'; } catch {}
     const token = await S.getStoredToken();
-    const { refs, filterFiles, changedFiles } = await collectZipRequestArtifacts(meta, { quiet, token });
+    const { revisions, filterFiles, changedFiles } = await collectZipRequestArtifacts(meta, { quiet, token });
     S.cinfo?.("Striffs request (zips)", {
-      baseOwner: refs.baseOwner, baseRepo: refs.baseRepo, baseBranch: refs.baseBranch,
-      headOwner: refs.headOwner, headRepo: refs.headRepo, headBranch: refs.headBranch,
+      owner: revisions.owner, repo: revisions.repo,
+      headSha: revisions.headSha, mergeBaseSha: revisions.mergeBaseSha,
       filterFilesCount: filterFiles.length,
       filterFilesPreview: filterFiles.slice(0, 20),
       changedFilesCount: changedFiles.length,
@@ -8718,7 +8684,7 @@
     const changedFilesStorageKey = await storeTempChangedFiles(changedFiles);
     const resp = await bgReply({
       type: "generateStriffs",
-      baseOwner: refs.baseOwner, baseRepo: refs.baseRepo, baseBranch: refs.baseBranch,
+      baseOwner: revisions.owner, baseRepo: revisions.repo, baseRef: revisions.mergeBaseSha,
       changedFilesStorageKey,
       pullRequest: { owner: meta.owner, repo: meta.repo, pullNumber: meta.pull_number },
       updated_at,
@@ -8800,12 +8766,13 @@
       .test(String(err?.message || ''));
   }
 
-  // codeload answers 404 for a private repository fetched without credentials, so on the upload path
-  // this means S.isPrivateRepo() read the page wrong. Its signals come from a full page load and can
-  // be missing after GitHub navigates in place -- observed as a first-click failure on a private repo
-  // that a reload cured.
-  function isBaseZipNotFoundError(err) {
-    return String(err?.errorCode || '').trim().toUpperCase() === 'BASE_ZIP_NOT_FOUND';
+  // codeload and raw.githubusercontent.com answer 404 for a private repository fetched without
+  // credentials, so on the upload path this means the repository was misread as public: GitHub could
+  // not be asked, and the page's signals, which come from a full page load, were missing after GitHub
+  // navigated in place -- observed as a first-click failure on a private repo that a reload cured.
+  function isAnonymousNotFoundError(err) {
+    const code = String(err?.errorCode || '').trim().toUpperCase();
+    return code === 'BASE_ZIP_NOT_FOUND' || code === 'HEAD_FILE_NOT_FOUND';
   }
 
   // Whether a pull request's repository is private, asked of GitHub rather than read off the page. The
@@ -8861,8 +8828,8 @@
     try {
       return await requestWithZips(meta, { quiet });
     } catch (err) {
-      if (token && isBaseZipNotFoundError(err)) {
-        S.cinfo?.('Base ZIP not found (private repo?); falling back to token GET');
+      if (token && isAnonymousNotFoundError(err)) {
+        S.cinfo?.('Repository not readable anonymously (private repo?); falling back to token GET');
         return await requestWithToken(token, meta, { quiet });
       }
       if (token && isUploadPathTooLargeError(err)) {
@@ -8902,7 +8869,7 @@
     return s;
   };
 
-  const describeApiError = ({ token, status, errorCode, message }) => {
+  const describeApiError = ({ token, status, errorCode, message, resetAt = null }) => {
     const code = String(errorCode || '').trim().toUpperCase();
     const text = extractHumanMessage(String(message || '').trim() || `API request failed${status ? ` (${status})` : ''}`);
     const isTransportFailure =
@@ -8922,8 +8889,33 @@
       };
     }
 
+    if (code === 'GITHUB_RATE_LIMITED') {
+      const at = Number(resetAt) > Date.now()
+        ? new Date(Number(resetAt)).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        : null;
+      const retry = at ? `reload the page after ${at}` : 'reload the page later';
+      if (token) {
+        return {
+          tooltip: `GitHub's rate limit for your token is used up; ${retry}.`,
+          toast: `<strong>GitHub's rate limit for your token is used up.</strong> Please ${retry}.`,
+          tone: 'neutral',
+          disabled: true,
+          htmlToast: true
+        };
+      }
+      // Saving a token re-enables the button (tokenStateChanged), like a private repository's.
+      return {
+        tooltip: `GitHub's hourly limit for requests without a token is used up. Connect a token, or ${retry}.`,
+        toast: `<strong>GitHub's hourly limit is used up.</strong> Without a token GitHub allows 60 requests an hour. Connect a GitHub token in the extension popup, or ${retry}.`,
+        tone: 'neutral',
+        disabled: true,
+        waitingForToken: true,
+        htmlToast: true
+      };
+    }
+
     // Only reached without a token; with one, requestPrimary has already retried on the token GET.
-    if (code === 'BASE_ZIP_NOT_FOUND' || code === 'PRIVATE_REPO_TOKEN_REQUIRED') {
+    if (isAnonymousNotFoundError({ errorCode: code }) || code === 'PRIVATE_REPO_TOKEN_REQUIRED') {
       return {
         tooltip: "Token required: this repo is private",
         toast: "<strong>This repository looks private.</strong> Connect a GitHub token in the extension popup to analyse it.",
@@ -9293,7 +9285,7 @@
         cerr("autoFetchStriffs error:", extractHumanMessage(message), { status, errorCode });
         S.__striffsReady = false;
 
-        const handled = describeApiError({ token, status, errorCode, message });
+        const handled = describeApiError({ token, status, errorCode, message, resetAt: err?.resetAt ?? null });
         message = handled.tooltip || message;
         if (handled.waitingForToken) {
           S.__waitingForToken = true;

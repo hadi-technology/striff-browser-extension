@@ -904,11 +904,13 @@ const DETECTOR_TRACES = ['STRUCTURAL CHECKS', '✅ clean', '👀', '❗', 'obser
         const toasts = [];
         S.getStoredToken = async () => token;
         S.extractPRMetadata = () => ({ owner: 'acme', repo, pull_number: '1', updated_at: 'u', commit_count: 1 });
-        S.extractHeadBaseRefs = () => ({ baseOwner: 'acme', baseRepo: repo, baseBranch: 'main', headOwner: 'acme', headRepo: repo, headBranch: 'feature' });
         S.getFilterFilesFromNav = () => [];
         S.isPrivateRepo = () => false;
         S.sendMessageWithTimeout = async (msg) => {
           if (msg.type === 'proxyFetch' && /api\.github\.com\/repos\/[^/]+\/[^/?]+$/.test(msg.url)) { calls.push('github:repo'); return github; }
+          // The upload route's two commits: the pull request's head, and where it branched from.
+          if (msg.type === 'proxyFetch' && /\/pulls\/1$/.test(msg.url)) return { ok: true, status: 200, json: { base: { sha: 'b'.repeat(40) }, head: { sha: 'h'.repeat(40) } } };
+          if (msg.type === 'proxyFetch' && /\/compare\//.test(msg.url)) return { ok: true, status: 200, json: { merge_base_commit: { sha: 'm'.repeat(40) } } };
           if (msg.type === 'proxyFetch') return { ok: true, status: 200, json: [] };
           if (msg.type === 'generateStriffs') {
             calls.push('upload');

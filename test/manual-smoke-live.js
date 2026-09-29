@@ -57,6 +57,9 @@
  * - PR_URL: GitHub PR to test (default: striff-lib PR #1)
  * - UNSUPPORTED_PR_URL: PR with no supported files (default: zir0-93.github.io PR #2)
  * - PRIVATE_PR_URL: Private repo PR to test auth requirement (optional)
+ * - MERGED_PR_URL: Merged PR whose head branch is deleted (default: striff-lib PR #3)
+ * - CLOSED_PR_URL: PR closed without merging, head branch deleted (default: striff-lib PR #4)
+ * - RUN_CLOSED_PR_TESTS=0: Skip the merged/closed PR and rate-limit checks
  * - GH_TOKEN: GitHub personal access token (optional but recommended)
  * - HEADLESS=1: Run in headless mode
  * - NEW_UI=1: Test with GitHub's new /changes UI
@@ -85,6 +88,11 @@ const PRODUCTION_API_BASE = envOr('PRODUCTION_API_BASE', 'https://api.striff.io'
 const DEFAULT_PR_URL = 'https://github.com/Zir0-93/striff-lib/pull/1/files';
 const DEFAULT_UNSUPPORTED_PR_URL = 'https://github.com/Zir0-93/zir0-93.github.io/pull/2/files';
 const DEFAULT_PRIVATE_PR_URL = envOr('PRIVATE_PR_URL', '');
+// Fixtures in the same test repository. #3 was merged into smoke/merged-base (so master did not move)
+// and #4 closed unmerged; both head branches were deleted afterwards, which is what they test.
+const DEFAULT_MERGED_PR_URL = 'https://github.com/Zir0-93/striff-lib/pull/3/files';
+const DEFAULT_CLOSED_PR_URL = 'https://github.com/Zir0-93/striff-lib/pull/4/files';
+const RUN_CLOSED_PR_TESTS = envOr('RUN_CLOSED_PR_TESTS', '1') === '1';
 const ONLY_TEST_CONFIG = envOr('ONLY_TEST_CONFIG', '') === '1';
 const HEADED = envOr('HEADED', '') === '1';
 const HEADLESS = HEADED ? false : envOr('HEADLESS', '1') !== '0';
@@ -135,6 +143,11 @@ const PR_URL = normalizePullRequestUrl(envOr('PR_URL', DEFAULT_PR_URL), NEW_UI);
 const UNSUPPORTED_PR_URL = normalizePullRequestUrl(envOr('UNSUPPORTED_PR_URL', DEFAULT_UNSUPPORTED_PR_URL), NEW_UI);
 const PRIVATE_PR_URL = DEFAULT_PRIVATE_PR_URL ? normalizePullRequestUrl(DEFAULT_PRIVATE_PR_URL, NEW_UI) : '';
 const PR_CONVERSATION_URL = envOr('PR_CONVERSATION_URL', toConversationUrl(PR_URL));
+// expectedClass: a type the pull request adds, which the diagram must show.
+const CLOSED_PR_FIXTURES = [
+  { label: 'merged PR', url: normalizePullRequestUrl(envOr('MERGED_PR_URL', DEFAULT_MERGED_PR_URL), NEW_UI), expectedClass: 'DiagramLegend' },
+  { label: 'closed PR', url: normalizePullRequestUrl(envOr('CLOSED_PR_URL', DEFAULT_CLOSED_PR_URL), NEW_UI), expectedClass: 'ChangeSetSummary' }
+];
 const STORAGE_STATE = buildStorageState();
 const loadStorageStatePayload = () => {
   if (!STORAGE_STATE) return null;
@@ -1155,6 +1168,174 @@ const setRemoteConfigUrlData = async (jsonObj) => {
     });
   };
 
+  // What GitHub says the pull request's commits are, asked from Node, to compare with what the
+  // extension used. Authenticated when a token is to hand -- GITHUB_TOKEN too, which the extension
+  // never sees -- because unauthenticated it would spend the browser's per-IP quota of 60 an hour.
+  const fetchPullRevisionsFromGitHub = async (prUrl) => {
+    const m = /github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/.exec(prUrl || '');
+    if (!m) throw new Error(`not a pull request URL: ${prUrl}`);
+    const headers = { Accept: 'application/vnd.github+json' };
+    const nodeToken = (process.env.GH_TOKEN || process.env.GITHUB_TOKEN || '').trim();
+    if (nodeToken) headers.Authorization = `token ${nodeToken}`;
+    const api = `https://api.github.com/repos/${m[1]}/${m[2]}`;
+    const getJson = async (url) => {
+      const res = await fetch(url, { headers });
+      if (!res.ok) throw new Error(`${url} answered ${res.status}`);
+      return res.json();
+    };
+    const pull = await getJson(`${api}/pulls/${m[3]}`);
+    const compare = await getJson(`${api}/compare/${pull.base.sha}...${pull.head.sha}?per_page=1`);
+    const branch = await fetch(`${api}/git/ref/heads/${encodeURIComponent(pull.head.ref)}`, { headers });
+    return {
+      owner: m[1],
+      repo: m[2],
+      state: pull.merged_at ? 'merged' : pull.state,
+      headRef: pull.head.ref,
+      headBranchExists: branch.ok,
+      headSha: pull.head.sha,
+      mergeBaseSha: compare?.merge_base_commit?.sha || null
+    };
+  };
+
+  // Clicks Striffs on the current page and waits for the load to end: a diagram, or the toast a
+  // failed load shows. Returns what the page ended with.
+  const loadStriffsAndWaitForOutcome = async (label) => {
+    await clickStriffsButton(label);
+    const handle = await page.waitForFunction(() => {
+      const svg = document.querySelector('#striff-diagram-view svg');
+      const toast = document.querySelector('#striffs-toast-container .striffs-toast--error, #striffs-toast-container .striffs-toast--neutral');
+      if (!svg && !toast) return null;
+      const d = document.documentElement.dataset;
+      const btn = document.querySelector('#striffs-btn');
+      return {
+        hasSvg: Boolean(svg),
+        svgText: svg ? (svg.textContent || '') : '',
+        toast: toast ? (toast.textContent || '').trim() : '',
+        buttonTitle: btn?.title || '',
+        buttonDisabled: btn?.disabled === true,
+        requestType: d.striffsLastRequestType || null,
+        headSha: d.striffsHeadSha || null,
+        mergeBaseSha: d.striffsMergeBaseSha || null
+      };
+    }, null, { timeout: FIRST_RENDER_TIMEOUT_MS, polling: 500 }).catch(() => null);
+    return handle ? await handle.jsonValue() : null;
+  };
+
+  // Opens a fixture PR on a clean slate. Only the client cache can stand in for the path under test:
+  // a cached diagram renders without resolving or downloading anything. The server's reuse happens
+  // after the extension has resolved the commits, read the files and downloaded the base, so it cannot
+  // hide a regression here -- which is why the commits are asserted directly, not inferred from the
+  // diagram.
+  const openFixturePullRequest = async (fixture) => {
+    try {
+      await page.goto(fixture.url, { waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT_MS });
+    } catch (e) {
+      fail(`Navigation to ${fixture.label} timed out: ${e.message || e}`);
+      return false;
+    }
+    const buttonsOk = await ensureButtonsRenderedWithRecovery(fixture.label, { oldUiAttempts: 1, newUiAttempts: 2 });
+    if (!buttonsOk) {
+      fail(`Striffs buttons not rendered on ${fixture.label}`);
+      return false;
+    }
+    const cleared = await runStriffsTestHook('clearStriffsCache', {}, 5000);
+    if (!cleared?.ok) warn(`${fixture.label}: cache clear returned ${JSON.stringify(cleared)}`);
+    // The clear removes every striffs* key, the API base override among them.
+    await setApiBaseOverride(PRODUCTION_API_BASE);
+    return true;
+  };
+
+  const runClosedPullRequestChecks = async (fixture) => {
+    log(`Testing ${fixture.label}: ${fixture.url}`);
+    let truth;
+    try {
+      truth = await fetchPullRevisionsFromGitHub(fixture.url);
+    } catch (e) {
+      fail(`${fixture.label}: could not read the fixture from GitHub (${e?.message || e})`);
+      return;
+    }
+    log(`${fixture.label} per GitHub`, JSON.stringify(truth));
+    if (truth.state === 'open' || truth.headBranchExists) {
+      // The fixture no longer reproduces the case, so a pass would prove nothing.
+      fail(`${fixture.label} fixture is ${truth.state} with head branch ${truth.headRef} ${truth.headBranchExists ? 'present' : 'deleted'}; it must be merged or closed with the branch deleted`);
+      return;
+    }
+    if (!(await openFixturePullRequest(fixture))) return;
+
+    const outcome = await loadStriffsAndWaitForOutcome(`${fixture.label} load`);
+    log(`${fixture.label} outcome`, JSON.stringify({ ...outcome, svgText: outcome?.svgText?.slice(0, 200) }));
+    if (!outcome) {
+      fail(`${fixture.label}: the load neither rendered a diagram nor reported an error within ${FIRST_RENDER_TIMEOUT_MS}ms`);
+      return;
+    }
+    if (!outcome.hasSvg) {
+      fail(`${fixture.label}: no diagram; the load reported "${outcome.toast || outcome.buttonTitle}"`);
+      return;
+    }
+    pass(`${fixture.label}: diagram rendered with the head branch deleted`);
+    if (outcome.requestType === 'zips') {
+      pass(`${fixture.label}: took the upload route`);
+    } else {
+      fail(`${fixture.label}: expected the upload route, took ${outcome.requestType}`);
+    }
+    if (outcome.headSha === truth.headSha && outcome.mergeBaseSha === truth.mergeBaseSha) {
+      pass(`${fixture.label}: built from the head commit ${truth.headSha.slice(0, 7)} and merge base ${truth.mergeBaseSha.slice(0, 7)}`);
+    } else {
+      fail(`${fixture.label}: built from head ${outcome.headSha} / base ${outcome.mergeBaseSha}, GitHub says ${truth.headSha} / ${truth.mergeBaseSha}`);
+    }
+    if (outcome.svgText.includes(fixture.expectedClass)) {
+      pass(`${fixture.label}: diagram shows ${fixture.expectedClass}, the type the PR adds`);
+    } else {
+      fail(`${fixture.label}: diagram does not show ${fixture.expectedClass}`);
+    }
+  };
+
+  // GitHub's hourly limit, simulated for one pull request: the extension's API calls come from its
+  // service worker, which the context's routes intercept. Without a token the load must stop with a
+  // prompt to connect one, not a raw 403.
+  const runRateLimitCheck = async (fixture) => {
+    const m = /github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/.exec(fixture.url);
+    const pullApi = new RegExp(`^https://api\\.github\\.com/repos/${m[1]}/${m[2]}/pulls/${m[3]}$`, 'i');
+    let intercepted = 0;
+    const resetAt = Math.floor(Date.now() / 1000) + 1800;
+    const handler = (route) => {
+      intercepted += 1;
+      return route.fulfill({
+        status: 403,
+        contentType: 'application/json',
+        headers: { 'x-ratelimit-limit': '60', 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': String(resetAt) },
+        body: JSON.stringify({ message: 'API rate limit exceeded for 203.0.113.9. (But here\'s the good news: Authenticated requests get a higher rate limit.)' })
+      });
+    };
+    log(`Testing the rate-limit prompt on ${fixture.label}`);
+    await context.route(pullApi, handler);
+    try {
+      if (!(await openFixturePullRequest({ ...fixture, label: `${fixture.label} (rate limited)` }))) return;
+      const outcome = await loadStriffsAndWaitForOutcome('rate-limited load');
+      log('Rate-limited outcome', JSON.stringify({ ...outcome, svgText: undefined, intercepted }));
+      if (!intercepted) {
+        fail('Rate-limit check: the route never saw the pull request API call, so nothing was tested');
+        return;
+      }
+      if (!outcome || outcome.hasSvg) {
+        fail(`Rate-limit check: expected the load to stop, got ${outcome ? 'a diagram' : 'no outcome'}`);
+        return;
+      }
+      if (/hourly limit is used up/i.test(outcome.toast) && /connect a github token/i.test(outcome.toast)) {
+        pass(`Rate limit prompts for a token: "${outcome.toast}"`);
+      } else {
+        fail(`Rate limit toast does not prompt for a token: "${outcome.toast}"`);
+      }
+      if (/connect a token/i.test(outcome.buttonTitle)) {
+        pass(`Rate-limited button says so: "${outcome.buttonTitle}"`);
+      } else {
+        fail(`Rate-limited button tooltip: "${outcome.buttonTitle}"`);
+      }
+    } finally {
+      await context.unroute(pullApi, handler).catch(() => {});
+    }
+  };
+
   const clickDiffsButton = async (label = 'diffs click') => {
     await page.click('#diffs-btn', { timeout: 5000 }).catch(async () => {
       let buttonsOk = await ensureButtonsRendered(label, { softFail: true });
@@ -1806,6 +1987,20 @@ const setRemoteConfigUrlData = async (jsonObj) => {
     }
   } else {
     log('Skipping private repo test (PRIVATE_PR_URL not provided)');
+  }
+
+  // --- Merged and closed pull requests, head branch deleted ---
+  // The upload route used to read changed files by head branch name and the base ZIP by base branch
+  // name. After a merge the head branch is usually gone (404), and the base branch already contains
+  // the change. It now resolves the head commit and the merge base from GitHub's API. These run
+  // before the token is set, on the tokenless path that failed.
+  if (RUN_CLOSED_PR_TESTS) {
+    for (const fixture of CLOSED_PR_FIXTURES) {
+      await runClosedPullRequestChecks(fixture);
+    }
+    await runRateLimitCheck(CLOSED_PR_FIXTURES[0]);
+  } else {
+    log('Skipping merged/closed PR tests (RUN_CLOSED_PR_TESTS=0)');
   }
 
   // Return to primary PR to continue flow.
