@@ -1202,9 +1202,12 @@ const setRemoteConfigUrlData = async (jsonObj) => {
   const loadStriffsAndWaitForOutcome = async (label) => {
     await clickStriffsButton(label);
     const handle = await page.waitForFunction(() => {
-      const svg = document.querySelector('#striff-diagram-view svg');
+      // The diagram itself, not the first svg in the view, which is a toolbar icon.
+      const svg = document.querySelector('#striffs-content svg');
       const toast = document.querySelector('#striffs-toast-container .striffs-toast--error, #striffs-toast-container .striffs-toast--neutral');
       if (!svg && !toast) return null;
+      // The element is in the page before its content is: keep waiting for a diagram with text in it.
+      if (svg && !toast && !(svg.textContent || '').trim()) return null;
       const d = document.documentElement.dataset;
       const btn = document.querySelector('#striffs-btn');
       return {
@@ -2914,11 +2917,13 @@ const setRemoteConfigUrlData = async (jsonObj) => {
     }
     pass('Review panel renders no structural checks, even when the response carries detector findings');
 
-    if (!result.readyOutcome?.panelHasReviewItems) {
-      fail(`Review panel missing the surfaced review item (${JSON.stringify(result.readyOutcome)})`);
+    // The fixture still carries a surfaced item, so this proves a response cannot bring the
+    // section back. It was removed in 1.5.0.
+    if (result.readyOutcome?.panelHasReviewItems) {
+      fail(`Review panel rendered a review items section (${JSON.stringify(result.readyOutcome)})`);
       return false;
     }
-    pass('Review panel renders the surfaced review item');
+    pass('Review panel renders no review items section, even when the response carries a surfaced item');
 
     if (!result.readyOutcome?.panelHasDocumentedRules || result.readyOutcome?.panelRuleRowCount < 2) {
       fail(`Documented rules table missing or short (${JSON.stringify(result.readyOutcome)})`);
