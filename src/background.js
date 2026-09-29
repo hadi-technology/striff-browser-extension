@@ -206,6 +206,17 @@ async function downloadRepoZipAsArrayBuffer(owner, repo, ref, apiBase) {
         error: `Repository zip is too large (over ${Math.round(ZIP_RAW_STREAM_MAX_BYTES / 1024 / 1024)} MB) to process in the browser. Try token-based generation.`
       };
     }
+    // The filter stops inflating once what it has kept is past four times the ceiling, so it never
+    // reaches the size check below. It is the same refusal, and it used to leave here as a read
+    // failure with no code: no prompt for a token, and no fallback to the token route for a user who
+    // had one. Observed on paperclipai/paperclip, 23 MiB of source against a 15 MiB ceiling.
+    if (filtered.reason === 'kept-content-exceeds-ceiling') {
+      return {
+        ok: false,
+        tooLarge: true,
+        error: `This repository has more analysable source and documentation than the ${Math.round(ceiling / 1024 / 1024)} MB limit. Try token-based generation.`
+      };
+    }
     return { ok: false, error: `Failed reading repository zip: ${filtered.reason}` };
   }
 
