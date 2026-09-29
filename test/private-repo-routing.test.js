@@ -28,7 +28,7 @@ function extractFunction(source, name) {
 }
 
 const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'striffs.js'), 'utf8');
-const code = ['isBaseZipNotFoundError', 'isUploadPathTooLargeError', 'requestPrimary']
+const code = ['isAnonymousNotFoundError', 'isUploadPathTooLargeError', 'requestPrimary']
   .map((name) => extractFunction(src, name))
   .join('\n');
 

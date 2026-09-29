@@ -4643,67 +4643,6 @@
             return map; // Return the map for chaining
     });
   };
-
-  // --- PR refs parsing (robust) ---
-  S.extractHeadBaseRefs = () => {
-    const EMPTY_REF = { owner: "", repo: "", branch: "" };
-
-    // Only an anchor carrying a /tree/<branch> segment can name a branch. The old
-    // repository-hovercard fallback matched plain /owner/repo links, which structurally
-    // cannot -- it returned the right owner/repo with branch:"" and callers then built
-    // ".../blob//<path>?raw=1", which GitHub collapses to ".../blob/<path>" and 404s.
-    // The HTML error page then surfaced as an unreadable "autoFetchStriffs error".
-    // Fork PRs hit this hardest: both repos get their own hovercard link, so the
-    // fallback always found its two anchors. Returning nothing beats returning refs
-    // that look complete but address a branch that does not exist.
-    const parseRef = (anchor) => {
-      if (!anchor) return { ...EMPTY_REF };
-      const href = anchor.getAttribute("href") || "";
-      const parts = href.split("/").filter(Boolean);
-      if (parts[2] !== "tree") return { ...EMPTY_REF };
-      const owner = parts[0] || "";
-      const repo = parts[1] || "";
-      const branch = decodeURIComponent(parts.slice(3).join("/")) || "";
-      if (!owner || !repo || !branch) return { ...EMPTY_REF };
-      return { owner, repo, branch };
-    };
-    const isComplete = (ref) => Boolean(ref?.owner && ref?.repo && ref?.branch);
-
-    // .commit-ref is the PR header's own base/head pair and is authoritative. The
-    // /tree/ sweep is a fallback for layouts that do not render it; it is accepted
-    // only when both ends parse completely, so a stray directory link cannot stand
-    // in for a real ref.
-    const strategies = [
-      () => Array.from(document.querySelectorAll(".commit-ref > a")),
-      () => Array.from(document.querySelectorAll('a[href*="/tree/"]'))
-    ];
-
-    let base = { ...EMPTY_REF };
-    let head = { ...EMPTY_REF };
-    for (const collect of strategies) {
-      const anchors = collect();
-      if (anchors.length < 2) continue;
-      const candidateBase = parseRef(anchors[0]);
-      const candidateHead = parseRef(anchors[1]);
-      if (isComplete(candidateBase) && isComplete(candidateHead)) {
-        base = candidateBase;
-        head = candidateHead;
-        break;
-      }
-    }
-
-    const refs = {
-      baseOwner: base.owner,
-      baseRepo: base.repo,
-      baseBranch: base.branch,
-      headOwner: head.owner,
-      headRepo: head.repo,
-      headBranch: head.branch
-    };
-    S.__debugHeadBaseRefs = refs;
-    S.debugDump?.("head/base refs", refs);
-    return refs;
-  };
 })();
 
 
@@ -6808,97 +6747,6 @@
         left:0;
         color:var(--fgColor-muted,#6e7781);
       }
-      .striffs-arch-review-panel__item{
-        display:flex;
-        flex-direction:column;
-        gap:8px;
-        padding:14px 15px;
-        border:1px solid rgba(15,23,42,.08);
-        border-radius:10px;
-        margin-bottom:10px;
-        background:#f8fafc;
-      }
-      .striffs-arch-review-panel__item--HIGH,
-      .striffs-arch-review-panel__item--CRITICAL{
-        border-color:rgba(207,34,46,.15);
-        background:#fef2f2;
-      }
-      .striffs-arch-review-panel__item--MEDIUM{
-        border-color:rgba(154,103,0,.15);
-        background:#fffbeb;
-      }
-      /* Doc conflicts get their own colour rather than a severity tint -- "your own docs say
-         otherwise" is a different kind of claim than "this looks risky", and the distinction
-         is the whole point of the signal. */
-      .striffs-arch-review-panel__item--DOC{
-        border-color:rgba(130,80,223,.2);
-        background:#faf5ff;
-      }
-      .striffs-arch-review-panel__item-header{
-        display:flex;
-        align-items:center;
-        gap:8px;
-        min-width:0;
-      }
-      .striffs-arch-review-panel__item-severity{
-        display:inline-flex;
-        align-items:center;
-        gap:4px;
-        padding:4px 11px;
-        border-radius:999px;
-        font-size:12px;
-        font-weight:800;
-        text-transform:uppercase;
-        letter-spacing:.05em;
-        flex-shrink:0;
-      }
-      #striff-diagram-view .striffs-arch-review-panel__item-severity-icon{
-        width:12px;
-        height:12px;
-        flex-shrink:0;
-      }
-      .striffs-arch-review-panel__code{
-        font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",Menlo,monospace;
-        font-weight:700;
-        font-size:85%;
-        background:rgba(175,184,193,.2);
-        padding:.1em .4em;
-        border-radius:6px;
-        white-space:break-spaces;
-      }
-      .striffs-arch-review-panel__item-severity--HIGH,
-      .striffs-arch-review-panel__item-severity--CRITICAL{background:rgba(207,34,46,.1);color:#cf222e;}
-      .striffs-arch-review-panel__item-severity--MEDIUM{background:rgba(154,103,0,.1);color:#92400e;}
-      .striffs-arch-review-panel__item-severity--LOW{background:rgba(26,127,55,.1);color:#1a7f37;}
-      .striffs-arch-review-panel__item-severity--DOC{background:rgba(130,80,223,.1);color:#8250df;}
-      .striffs-arch-review-panel__item-docs{
-        font-size:15px;
-        line-height:1.6;
-        color:#8250df;
-        margin-top:4px;
-      }
-      .striffs-arch-review-panel__item-body{
-        min-width:0;
-      }
-      .striffs-arch-review-panel__item-title{
-        font-weight:700;
-        font-size:16px;
-        line-height:1.35;
-        color:var(--fgColor-default,#1f2328);
-        min-width:0;
-      }
-      .striffs-arch-review-panel__item-text{
-        font-size:15px;
-        line-height:1.6;
-        color:var(--fgColor-muted,#6e7781);
-        margin-top:4px;
-      }
-      .striffs-arch-review-panel__item-action{
-        font-size:15px;
-        line-height:1.6;
-        color:var(--fgColor-accent,#0969da);
-        margin-top:4px;
-      }
       .striffs-arch-review-panel__good{
         text-align:center;
         padding:32px 16px;
@@ -7884,25 +7732,6 @@
     return d.innerHTML;
   }
 
-  const SEVERITY_ICON_SVG = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" class="striffs-arch-review-panel__item-severity-icon"><path d="M8 1L1 14h14L8 1z"/><path d="M8 6v4M8 12h.01"/></svg>';
-
-  const DOC_CONFLICT_ICON_SVG = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" class="striffs-arch-review-panel__item-severity-icon"><path d="M9.5 1.5H4a1 1 0 0 0-1 1v11a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V5L9.5 1.5z"/><path d="M9.5 1.5V5H13"/></svg>';
-  const DOC_CONFLICT_LABEL = "Doc Conflict";
-
-  // SurfacedReviewItem.priority is a canonical label (ADR-015: no P1/P2/P3 codes), not a
-  // HIGH/MEDIUM/LOW severity tier. Map it to a severity tier for badge styling while keeping
-  // the canonical label as the badge text.
-  const SURFACED_PRIORITY_SEVERITY = {
-    STRUCTURAL_REGRESSION: "HIGH",
-    REVIEW_HOTSPOT: "MEDIUM",
-    INFORMATIONAL_SIGNAL: "LOW"
-  };
-  const SURFACED_PRIORITY_LABEL = {
-    STRUCTURAL_REGRESSION: "Structural Regression",
-    REVIEW_HOTSPOT: "Review Hotspot",
-    INFORMATIONAL_SIGNAL: "Informational Signal"
-  };
-
   function escHtmlWithCode(s) {
     return escHtml(s).replace(/`([^`]+)`/g, '<code class="striffs-arch-review-panel__code">$1</code>');
   }
@@ -8083,21 +7912,11 @@
 
   function buildArchReviewPanelHtml(result) {
     const summary = result?.reviewSummary || {};
-    const surfacedItems = Array.isArray(result?.surfacedItems) ? result.surfacedItems : [];
-
-    const extensionItems = surfacedItems
-      .filter(i => i.showInExtension !== false)
-      // Doc conflicts sort to the front: the repo's own documentation contradicting the change
-      // is the highest-trust signal available, so it never sits below a lower-trust item. Same
-      // rule the GitHub check run applies (CheckRunFormatter), so both surfaces lead with the
-      // same item. sort() is stable, so the server's rank order holds within each group.
-      .sort((a, b) => Number(b.docConflict === true) - Number(a.docConflict === true));
-
     let bodyHtml = "";
 
     // Overview is narrative, not a finding. striff-api keeps facts and narrative in disjoint
-    // regions (ADR-023) and this panel does the same -- the overview renders alongside items
-    // and never as one, so it shows whether or not anything surfaced.
+    // regions (ADR-023) and this panel does the same -- the overview renders alongside the rules
+    // and never as one, so it shows whether or not anything was checked.
     if (summary.overview) {
       bodyHtml += `<div class="striffs-arch-review-panel__section">
         <div class="striffs-arch-review-panel__section-title">Overview</div>
@@ -8105,86 +7924,48 @@
       </div>`;
     }
 
-    if (extensionItems.length > 0) {
-      bodyHtml += `<div class="striffs-arch-review-panel__section">
-        <div class="striffs-arch-review-panel__section-title">Review Items</div>
-        ${extensionItems.map(item => {
-          const isDocConflict = item.docConflict === true;
-          const rawPriority = String(item.priority || "").toUpperCase();
-          const severity = SURFACED_PRIORITY_SEVERITY[rawPriority]
-            || String(item.priority || item.severity || "LOW").toUpperCase();
-          const sevClass = ["HIGH","CRITICAL"].includes(severity) ? severity : severity === "MEDIUM" ? "MEDIUM" : "LOW";
-          // A doc conflict replaces the priority badge instead of sitting beside it, so the
-          // reviewer reads "your own docs say otherwise" before any severity wording.
-          const styleClass = isDocConflict ? "DOC" : sevClass;
-          const badgeLabel = isDocConflict ? DOC_CONFLICT_LABEL : (SURFACED_PRIORITY_LABEL[rawPriority] || sevClass);
-          const badgeIcon = isDocConflict ? DOC_CONFLICT_ICON_SVG : SEVERITY_ICON_SVG;
-          // Short basenames, never full repo paths -- the API sends them pre-shortened.
-          const conflictingDocs = isDocConflict && Array.isArray(item.conflictingDocs)
-            ? item.conflictingDocs.filter(Boolean)
-            : [];
-          return `<div class="striffs-arch-review-panel__item striffs-arch-review-panel__item--${styleClass}">
-            <div class="striffs-arch-review-panel__item-header">
-              <span class="striffs-arch-review-panel__item-severity striffs-arch-review-panel__item-severity--${styleClass}">${badgeIcon}${badgeLabel}</span>
-            </div>
-            <div class="striffs-arch-review-panel__item-title">${escHtmlWithCode(item.title || "") || ""}</div>
-            <div class="striffs-arch-review-panel__item-body">
-              ${conflictingDocs.length ? `<div class="striffs-arch-review-panel__item-docs">Conflicts with ${conflictingDocs.map(doc => `<code class="striffs-arch-review-panel__code">${escHtml(doc)}</code>`).join(", ")}</div>` : ""}
-              ${item.whyShown ? `<div class="striffs-arch-review-panel__item-text">${escHtmlWithCode(item.whyShown) || ""}</div>` : ""}
-              ${item.reviewAction ? `<div class="striffs-arch-review-panel__item-action">→ ${escHtmlWithCode(item.reviewAction) || ""}</div>` : ""}
-              ${item.suggestedDirection && item.suggestedDirection !== item.reviewAction ? `<div class="striffs-arch-review-panel__item-action">💡 ${escHtmlWithCode(item.suggestedDirection) || ""}</div>` : ""}
-            </div>
-          </div>`;
-        }).join("")}
-      </div>`;
-    } else {
-      // An empty item list is a real "nothing to flag" result, not a gap to backfill: items are
-      // the server's surfacing decision, and an empty review is a legitimate outcome.
-      //
-      // Findings are never rendered here. The ones worth showing arrive as items, and every
-      // documented rule is shown again as a verdict in its own section below. Older API versions
-      // also send structural-detector findings in the same array; those are neither shown nor
-      // counted. Counting documented-rule findings is still what keeps the empty state honest: one
-      // held below the surfacing gate means "nothing met the bar to show you", not "nothing found".
-      const heldBack = docRuleFindings(result).length;
-      // Rules the review could not check are not shown, so they are not counted here either.
-      const verdictCount = shownVerdicts(result).length;
-      if (!reviewRan(result)) {
-        // Nothing was checked, so no cleanliness claim is available to make: "we found nothing"
-        // against an analysis that never ran is a green tick nobody earned, in the one place a
-        // reviewer would most trust it.
-        bodyHtml += `<div class="striffs-arch-review-panel__good">
+    // Surfaced review items were removed in 1.5.0. The analysis stopped populating them -- every
+    // review arrived with an empty list -- so the only thing the section ever produced was a
+    // banner announcing its own emptiness, directly above the documented rules that carry the
+    // actual result. The rules are the review now.
+    //
+    // The two states kept below are the ones that say something a reader could not otherwise
+    // know. "No review recorded" distinguishes a review that never ran from one that ran and
+    // found nothing, which is the one claim this panel must never blur. "Nothing surfaced for
+    // review" reports documented-rule findings that were recorded but held below the bar, which
+    // is not the same as there being none. A review that ran and simply has rules to show adds
+    // no banner at all: the rules speak for themselves.
+    const heldBack = docRuleFindings(result).length;
+    if (!reviewRan(result)) {
+      bodyHtml += `<div class="striffs-arch-review-panel__good">
         <div class="striffs-arch-review-panel__good-icon">–</div>
         <div style="font-size:15px;font-weight:600;margin-bottom:6px;">No review recorded</div>
         <div>No review is available for this changeset, so there is nothing to report either way.</div>
       </div>`;
-      } else if (heldBack > 0) {
-        bodyHtml += `<div class="striffs-arch-review-panel__good">
+    } else if (heldBack > 0) {
+      bodyHtml += `<div class="striffs-arch-review-panel__good">
         <div class="striffs-arch-review-panel__good-icon">✓</div>
         <div style="font-size:15px;font-weight:600;margin-bottom:6px;">Nothing surfaced for review</div>
         <div>${heldBack === 1
           ? "1 documented-rule finding was recorded, but it did not meet the bar to raise here."
           : `${heldBack} documented-rule findings were recorded, but none met the bar to raise here.`}</div>
       </div>`;
-      } else if (verdictCount > 0) {
-        // The rules below carry the verdict. A tick here beside a rule the change breaks, or one
-        // that was already broken, would contradict the section it introduces.
-        const atRisk = computeDocRuleCoverage(result).atRisk > 0;
-        bodyHtml += `<div class="striffs-arch-review-panel__good">
+    } else if (shownVerdicts(result).length > 0) {
+      // The rules' own verdict, in one line. This is what the removed "No review items" banner was
+      // actually carrying: its icon was decided by the rules, not by the items it was named after --
+      // a tick only when every rule shown holds, and a dash the moment one does not, so a clean
+      // result is never claimed over a rule this change breaks or left already broken. Dropping it
+      // with the items would have taken the summary with the section that never had anything in it.
+      const atRisk = computeDocRuleCoverage(result).atRisk > 0;
+      bodyHtml += `<div class="striffs-arch-review-panel__good">
         <div class="striffs-arch-review-panel__good-icon">${atRisk ? "–" : "✓"}</div>
-        <div style="font-size:15px;font-weight:600;margin-bottom:6px;">No review items</div>
-        <div>Nothing in this changeset was raised for review. The documented rules below show how it fared against this repository's docs.</div>
+        <div style="font-size:15px;font-weight:600;margin-bottom:6px;">${atRisk
+          ? "Documented rules at risk"
+          : "Documented rules hold"}</div>
+        <div>${atRisk
+          ? "This changeset is checked against this repository's docs below."
+          : "Every documented rule checked against this changeset still holds."}</div>
       </div>`;
-      } else {
-        // The review checks a change against what the repository's own docs state, not against
-        // general structural heuristics. With no documented rule to check, "no concerns were
-        // found" would claim a check that never happened.
-        bodyHtml += `<div class="striffs-arch-review-panel__good">
-        <div class="striffs-arch-review-panel__good-icon">–</div>
-        <div style="font-size:15px;font-weight:600;margin-bottom:6px;">No review items</div>
-        <div>Nothing was raised for review, and no documented rules were checked against this changeset.</div>
-      </div>`;
-      }
     }
 
     // Documented rules below the items: the same order the check run uses, so a reviewer moving
@@ -8483,14 +8264,6 @@
       .join('/');
   }
 
-  function decodeBase64Utf8(content) {
-    const cleaned = String(content || '').replace(/\s+/g, '');
-    const binary = atob(cleaned);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
-    return new TextDecoder('utf-8').decode(bytes);
-  }
-
   // GitHub answers 401 to a token it no longer accepts, and every caller here falls back -- to the
   // page, to raw files, to the session -- so the user was never told the token they saved had
   // stopped working. Said once per page.
@@ -8733,82 +8506,117 @@
     }
   }
 
-  async function fetchHeadFileContent(refs, path, token) {
+  function headerValue(headers, name) {
+    if (!headers) return null;
+    if (typeof headers.get === 'function') return headers.get(name);
+    const key = Object.keys(headers).find((k) => k.toLowerCase() === name);
+    return key ? headers[key] : null;
+  }
+
+  // GitHub's answer when a quota is used up: 403 or 429, with x-ratelimit-remaining at 0 for the
+  // hourly limit, or a message naming a secondary rate limit, which carries retry-after instead.
+  // Unauthenticated, the hourly limit is 60 requests per IP -- a github.com login does not count,
+  // because the API reads credentials only from the Authorization header.
+  function githubRateLimitError(resp, { token = null } = {}) {
+    const status = Number(resp?.status || 0);
+    if (status !== 403 && status !== 429) return null;
+    const message = typeof resp?.body === 'string' ? resp.body : String(resp?.body?.message || '');
+    const remaining = headerValue(resp?.headers, 'x-ratelimit-remaining');
+    if (String(remaining) !== '0' && !/rate limit/i.test(message)) return null;
+    const resetSeconds = Number(headerValue(resp?.headers, 'x-ratelimit-reset'));
+    const retryAfterSeconds = Number(headerValue(resp?.headers, 'retry-after'));
+    const resetAt = retryAfterSeconds > 0
+      ? Date.now() + retryAfterSeconds * 1000
+      : (resetSeconds > 0 ? resetSeconds * 1000 : null);
+    return Object.assign(new Error(message || 'GitHub API rate limit exceeded'), {
+      status,
+      errorCode: 'GITHUB_RATE_LIMITED',
+      resetAt,
+      withToken: Boolean(token)
+    });
+  }
+
+  async function fetchGitHubApi(url, token) {
+    const resp = await fetchJsonWithTimeout(url, { token, timeoutMs: timeoutFor("githubApi", 20000) });
+    const rateLimited = githubRateLimitError(resp, { token });
+    if (rateLimited) throw rateLimited;
+    if (!resp.ok) {
+      throw Object.assign(
+        new Error(`Could not read this pull request's commits from GitHub (HTTP ${resp.status || 'no response'}).`),
+        { status: resp.status || null, errorCode: 'PULL_REVISIONS_UNAVAILABLE' }
+      );
+    }
+    return resp.body;
+  }
+
+  // The two commits an upload is built from, resolved the way striff-api resolves them for the token
+  // route and the GitHub App: the pull request's head commit, and the merge base of its base and head.
+  // Commits rather than branch names, because a branch name means "wherever the branch is now": after
+  // a merge the head branch is usually deleted, and the base branch already contains the change. The
+  // merge base rather than the base branch tip, because a pull request is a change to where it left
+  // the branch (see mergeBase in striff-api's GitHub.java). Both come from GitHub's API, not the page,
+  // whose markup is undocumented and describes the selected commit range rather than the whole PR.
+  //
+  // Remembered per pull request revision -- updated_at moves on every push -- so a retry or a quiet
+  // refresh does not spend the unauthenticated quota twice.
+  const pullRevisions = new Map();
+  async function resolvePullRevisions(meta, token) {
+    const owner = String(meta?.owner || '').trim();
+    const repo = String(meta?.repo || '').trim();
+    const pullNumber = String(meta?.pull_number || '').trim();
+    const memoKey = meta?.updated_at ? `${owner}/${repo}#${pullNumber}@${meta.updated_at}`.toLowerCase() : null;
+    if (memoKey && pullRevisions.has(memoKey)) return pullRevisions.get(memoKey);
+
+    const repoPath = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+    const pull = await fetchGitHubApi(`${repoPath}/pulls/${encodeURIComponent(pullNumber)}`, token);
+    const baseSha = String(pull?.base?.sha || '').trim();
+    const headSha = String(pull?.head?.sha || '').trim();
+    if (!baseSha || !headSha) {
+      throw Object.assign(new Error("GitHub did not report this pull request's commits."), { errorCode: 'PULL_REVISIONS_UNAVAILABLE' });
+    }
+    const compare = await fetchGitHubApi(`${repoPath}/compare/${baseSha}...${headSha}?per_page=1`, token);
+    const mergeBaseSha = String(compare?.merge_base_commit?.sha || '').trim();
+    if (!mergeBaseSha) {
+      throw Object.assign(new Error("GitHub did not report where this pull request branched from."), { errorCode: 'PULL_REVISIONS_UNAVAILABLE' });
+    }
+
+    // The pull request's own repository serves its head commit whether the head branch, or the fork
+    // it came from, still exists: GitHub keeps every pull request's commits under refs/pull/N/head.
+    const revisions = { owner, repo, headSha, mergeBaseSha };
+    if (memoKey) pullRevisions.set(memoKey, revisions);
+    try {
+      document.documentElement.dataset.striffsHeadSha = headSha;
+      document.documentElement.dataset.striffsMergeBaseSha = mergeBaseSha;
+    } catch {}
+    return revisions;
+  }
+
+  // Only public repositories take the upload route, so raw.githubusercontent.com serves every file
+  // without credentials, and at a commit it never serves stale content.
+  async function fetchHeadFileContent(revisions, path) {
     const normalizedPath = normalizeChangedFilePath(path);
     if (!normalizedPath) return null;
-
-    // Every URL below interpolates these three. An empty branch used to yield
-    // ".../blob//<path>", which GitHub answers with a 404 HTML page that then became
-    // the thrown error's message -- a whole rendered document in the console instead
-    // of a cause. Fail with something actionable while the refs are still in scope.
-    if (!refs?.headOwner || !refs?.headRepo || !refs?.headBranch) {
-      const err = new Error(
-        `Cannot fetch head file content: incomplete PR refs ` +
-        `(owner=${refs?.headOwner || "?"}, repo=${refs?.headRepo || "?"}, branch=${refs?.headBranch || "?"}). ` +
-        `The pull request header had not rendered when Striffs read it.`
-      );
-      err.code = "INCOMPLETE_PR_REFS";
-      throw err;
-    }
-
-    // When no token, use raw.githubusercontent.com directly to avoid API rate limits
-    if (!token) {
-      const rawUrl = `https://raw.githubusercontent.com/${encodeURIComponent(refs.headOwner)}/${encodeURIComponent(refs.headRepo)}/${encodeURIComponent(refs.headBranch)}/${encodeGitHubPath(normalizedPath)}`;
-      const rawResp = await fetchTextWithTimeout(rawUrl, {
-        token: null,
-        timeoutMs: timeoutFor("githubRawDirect", 20000),
-        credentials: 'omit'
-      });
-      if (rawResp.ok && !/text\/html/i.test(rawResp.contentType) && !/^<!doctype html/i.test(rawResp.text.trim())) {
-        return rawResp.text;
-      }
-    }
-
-    const apiUrl = `https://api.github.com/repos/${encodeURIComponent(refs.headOwner)}/${encodeURIComponent(refs.headRepo)}/contents/${encodeGitHubPath(normalizedPath)}?ref=${encodeURIComponent(refs.headBranch)}`;
-    try {
-      const apiResp = await fetchJsonWithTimeout(apiUrl, {
-        token,
-        timeoutMs: timeoutFor("githubContents", 20000)
-      });
-      if (apiResp.ok && apiResp.body && typeof apiResp.body === 'object' && !Array.isArray(apiResp.body)) {
-        if (typeof apiResp.body.content === 'string' && apiResp.body.encoding === 'base64') {
-          return decodeBase64Utf8(apiResp.body.content);
-        }
-        if (typeof apiResp.body.download_url === 'string' && apiResp.body.download_url) {
-          const rawResp = await fetchTextWithTimeout(apiResp.body.download_url, {
-            token,
-            timeoutMs: timeoutFor("githubRawDownload", 20000),
-            credentials: 'omit'
-          });
-          if (rawResp.ok && !/text\/html/i.test(rawResp.contentType) && !/^<!doctype html/i.test(rawResp.text.trim())) {
-            return rawResp.text;
-          }
-        }
-      }
-    } catch {}
-
-    const sessionBlobUrl = `https://github.com/${encodeURIComponent(refs.headOwner)}/${encodeURIComponent(refs.headRepo)}/blob/${encodeURIComponent(refs.headBranch)}/${encodeGitHubPath(normalizedPath)}?raw=1`;
-    // Served from the user's github.com session cookies. The token already had its turn on the API
-    // request above, so it is not sent here alongside them.
-    const rawResp = await fetchTextWithTimeout(sessionBlobUrl, {
+    const rawUrl = `https://raw.githubusercontent.com/${encodeURIComponent(revisions.owner)}/${encodeURIComponent(revisions.repo)}/${revisions.headSha}/${encodeGitHubPath(normalizedPath)}`;
+    const rawResp = await fetchTextWithTimeout(rawUrl, {
       token: null,
-      timeoutMs: timeoutFor("githubRaw", 20000),
-      credentials: 'include'
+      timeoutMs: timeoutFor("githubRawDirect", 20000),
+      credentials: 'omit'
     });
-    if (!rawResp.ok) {
-      const err = new Error(rawResp.text || `Failed fetching file content: ${rawResp.status}`);
-      err.status = rawResp.status;
-      throw err;
+    if (rawResp.status === 429) {
+      throw githubRateLimitError({ status: 429, headers: rawResp.headers, body: 'rate limit' });
     }
-    if (/text\/html/i.test(rawResp.contentType) || /^<!doctype html/i.test(rawResp.text.trim())) {
-      const err = new Error('GitHub returned HTML instead of file content.');
-      err.status = rawResp.status || 401;
-      throw err;
+    if (!rawResp.ok) {
+      // The commit is GitHub's own answer, so a 404 here means the repository cannot be read
+      // anonymously -- a private repository the page and GitHub's answer both misread as public.
+      throw Object.assign(new Error(`Failed fetching ${normalizedPath} at ${revisions.headSha.slice(0, 7)}: ${rawResp.status}`), {
+        status: rawResp.status || null,
+        errorCode: rawResp.status === 404 ? 'HEAD_FILE_NOT_FOUND' : null
+      });
     }
     return rawResp.text;
   }
 
-  async function buildChangedFiles(refs, meta, filterFiles, { token = null } = {}) {
+  async function buildChangedFiles(revisions, meta, filterFiles, { token = null } = {}) {
     const effectiveToken = typeof token === 'string' ? token : await S.getStoredToken();
     const resolvedPrFiles = await resolvePrFilesMetadata(meta, filterFiles, effectiveToken);
 
@@ -8835,7 +8643,7 @@
       }
 
       const normalizedStatus = status === 'added' ? 'added' : 'modified';
-      const content = await fetchHeadFileContent(refs, path, effectiveToken);
+      const content = await fetchHeadFileContent(revisions, path);
       if (typeof content !== 'string' || !content.length) continue;
       changedFiles.push({ path, status: normalizedStatus, content });
     }
@@ -8845,12 +8653,12 @@
 
   async function collectZipRequestArtifacts(meta, { quiet = false, token = null } = {}) {
     const filterFiles = S.getFilterFilesFromNav();
-    const refs = S.extractHeadBaseRefs();
     if (!quiet) {
       S.updateStriffButton({ loading: true, phase: "Fetching", tooltip: "Fetching" });
     }
-    const changedFiles = await buildChangedFiles(refs, meta, filterFiles, { token });
-    return { refs, filterFiles, changedFiles };
+    const revisions = await resolvePullRevisions(meta, token);
+    const changedFiles = await buildChangedFiles(revisions, meta, filterFiles, { token });
+    return { revisions, filterFiles, changedFiles };
   }
 
   async function requestWithZips(meta, { quiet = false } = {}) {
@@ -8859,10 +8667,10 @@
     S.__lastRequestType = 'zips';
     try { document.documentElement.dataset.striffsLastRequestType = 'zips'; } catch {}
     const token = await S.getStoredToken();
-    const { refs, filterFiles, changedFiles } = await collectZipRequestArtifacts(meta, { quiet, token });
+    const { revisions, filterFiles, changedFiles } = await collectZipRequestArtifacts(meta, { quiet, token });
     S.cinfo?.("Striffs request (zips)", {
-      baseOwner: refs.baseOwner, baseRepo: refs.baseRepo, baseBranch: refs.baseBranch,
-      headOwner: refs.headOwner, headRepo: refs.headRepo, headBranch: refs.headBranch,
+      owner: revisions.owner, repo: revisions.repo,
+      headSha: revisions.headSha, mergeBaseSha: revisions.mergeBaseSha,
       filterFilesCount: filterFiles.length,
       filterFilesPreview: filterFiles.slice(0, 20),
       changedFilesCount: changedFiles.length,
@@ -8876,7 +8684,7 @@
     const changedFilesStorageKey = await storeTempChangedFiles(changedFiles);
     const resp = await bgReply({
       type: "generateStriffs",
-      baseOwner: refs.baseOwner, baseRepo: refs.baseRepo, baseBranch: refs.baseBranch,
+      baseOwner: revisions.owner, baseRepo: revisions.repo, baseRef: revisions.mergeBaseSha,
       changedFilesStorageKey,
       pullRequest: { owner: meta.owner, repo: meta.repo, pullNumber: meta.pull_number },
       updated_at,
@@ -8958,12 +8766,13 @@
       .test(String(err?.message || ''));
   }
 
-  // codeload answers 404 for a private repository fetched without credentials, so on the upload path
-  // this means S.isPrivateRepo() read the page wrong. Its signals come from a full page load and can
-  // be missing after GitHub navigates in place -- observed as a first-click failure on a private repo
-  // that a reload cured.
-  function isBaseZipNotFoundError(err) {
-    return String(err?.errorCode || '').trim().toUpperCase() === 'BASE_ZIP_NOT_FOUND';
+  // codeload and raw.githubusercontent.com answer 404 for a private repository fetched without
+  // credentials, so on the upload path this means the repository was misread as public: GitHub could
+  // not be asked, and the page's signals, which come from a full page load, were missing after GitHub
+  // navigated in place -- observed as a first-click failure on a private repo that a reload cured.
+  function isAnonymousNotFoundError(err) {
+    const code = String(err?.errorCode || '').trim().toUpperCase();
+    return code === 'BASE_ZIP_NOT_FOUND' || code === 'HEAD_FILE_NOT_FOUND';
   }
 
   // Whether a pull request's repository is private, asked of GitHub rather than read off the page. The
@@ -9019,8 +8828,8 @@
     try {
       return await requestWithZips(meta, { quiet });
     } catch (err) {
-      if (token && isBaseZipNotFoundError(err)) {
-        S.cinfo?.('Base ZIP not found (private repo?); falling back to token GET');
+      if (token && isAnonymousNotFoundError(err)) {
+        S.cinfo?.('Repository not readable anonymously (private repo?); falling back to token GET');
         return await requestWithToken(token, meta, { quiet });
       }
       if (token && isUploadPathTooLargeError(err)) {
@@ -9060,7 +8869,7 @@
     return s;
   };
 
-  const describeApiError = ({ token, status, errorCode, message }) => {
+  const describeApiError = ({ token, status, errorCode, message, resetAt = null }) => {
     const code = String(errorCode || '').trim().toUpperCase();
     const text = extractHumanMessage(String(message || '').trim() || `API request failed${status ? ` (${status})` : ''}`);
     const isTransportFailure =
@@ -9080,8 +8889,33 @@
       };
     }
 
+    if (code === 'GITHUB_RATE_LIMITED') {
+      const at = Number(resetAt) > Date.now()
+        ? new Date(Number(resetAt)).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        : null;
+      const retry = at ? `reload the page after ${at}` : 'reload the page later';
+      if (token) {
+        return {
+          tooltip: `GitHub's rate limit for your token is used up; ${retry}.`,
+          toast: `<strong>GitHub's rate limit for your token is used up.</strong> Please ${retry}.`,
+          tone: 'neutral',
+          disabled: true,
+          htmlToast: true
+        };
+      }
+      // Saving a token re-enables the button (tokenStateChanged), like a private repository's.
+      return {
+        tooltip: `GitHub's hourly limit for requests without a token is used up. Connect a token, or ${retry}.`,
+        toast: `<strong>GitHub's hourly limit is used up.</strong> Without a token GitHub allows 60 requests an hour. Connect a GitHub token in the extension popup, or ${retry}.`,
+        tone: 'neutral',
+        disabled: true,
+        waitingForToken: true,
+        htmlToast: true
+      };
+    }
+
     // Only reached without a token; with one, requestPrimary has already retried on the token GET.
-    if (code === 'BASE_ZIP_NOT_FOUND' || code === 'PRIVATE_REPO_TOKEN_REQUIRED') {
+    if (isAnonymousNotFoundError({ errorCode: code }) || code === 'PRIVATE_REPO_TOKEN_REQUIRED') {
       return {
         tooltip: "Token required: this repo is private",
         toast: "<strong>This repository looks private.</strong> Connect a GitHub token in the extension popup to analyse it.",
@@ -9451,7 +9285,7 @@
         cerr("autoFetchStriffs error:", extractHumanMessage(message), { status, errorCode });
         S.__striffsReady = false;
 
-        const handled = describeApiError({ token, status, errorCode, message });
+        const handled = describeApiError({ token, status, errorCode, message, resetAt: err?.resetAt ?? null });
         message = handled.tooltip || message;
         if (handled.waitingForToken) {
           S.__waitingForToken = true;
@@ -9737,7 +9571,6 @@
               changedComponents: 1,
               totalComponents: 1
             } : undefined),
-            surfacedItems: extras.surfacedItems || [],
             // Findings and doc verdicts are fixtures rather than live data on purpose: a real PR may
             // legitimately produce neither, so asserting against the live payload alone could never
             // tell an empty result apart from a section that stopped rendering.
@@ -9755,16 +9588,8 @@
           const pendingResult = makeResult('PENDING', originalSvg, { aiReviewId: 'manual-pending' });
           const readyResult = makeResult('READY', originalSvg, {
             aiReviewId: 'manual-ready',
-            // One surfaced documented-rule item, plus a structural-detector finding of the kind
-            // older API versions still send: the panel has to show the first and ignore the second.
-            surfacedItems: [{
-              itemId: 'manual-f1',
-              priority: 'STRUCTURAL_REGRESSION',
-              title: 'Manual smoke surfaced item',
-              whyShown: 'Manual smoke why',
-              reviewAction: 'Manual smoke action',
-              docConflict: false
-            }],
+            // A documented-rule finding, plus a structural-detector finding of the kind older API
+            // versions still send: the panel counts the first and ignores the second.
             findings: [
               {
                 findingId: 'manual-f1',
@@ -10001,13 +9826,10 @@
                 overviewIsCountsPlaceholder: /^Reviewed \d+ components? and \d+ relationships?/i.test(overview),
                 overviewRendered: overview.length > 0 && panelText.includes('OVERVIEW'),
                 findingsCount: Array.isArray(result?.findings) ? result.findings.length : 0,
-                surfacedCount: Array.isArray(result?.surfacedItems) ? result.surfacedItems.length : 0,
                 docVerdictCount: Array.isArray(result?.docFactVerdicts) ? result.docFactVerdicts.length : 0,
-                // Items the panel is meant to show; the server can mark one as not for the extension.
-                extensionItemCount: Array.isArray(result?.surfacedItems)
-                  ? result.surfacedItems.filter(i => i && i.showInExtension !== false).length
-                  : 0,
                 panelHasStructuralChecks: panelText.includes('STRUCTURAL CHECKS'),
+                // Both sections were removed; a published extension meeting an older API that still
+                // sends their data must render neither.
                 panelHasReviewItems: panelText.includes('REVIEW ITEMS'),
                 panelHasDocumentedRules: panelText.includes('DOCUMENTED RULES'),
                 panelRuleRowCount: panel

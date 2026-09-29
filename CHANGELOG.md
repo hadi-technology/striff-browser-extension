@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.5.0
+
+- Striffs works on merged and closed pull requests. Without a token it read the changed files by
+  head branch name and the base by base branch name, and after a merge the head branch is usually
+  deleted, so the load failed saying the code did not exist. Where the branch survived, it was
+  worse: the base branch already contained the change, so the diagram compared the pull request
+  against itself. It now asks GitHub for the pull request's head commit and the merge base of its
+  base and head, and reads both at those commits, the same way the token route and the GitHub App
+  always have. Open pull requests benefit too: one whose base branch has moved on is now compared
+  against where it branched from rather than against commits it never saw.
+- When GitHub's hourly limit for requests without a token (60 an hour) runs out, Striffs says so and
+  asks you to connect a token, instead of failing with GitHub's raw error.
+- The review panel no longer has a Review Items section. The analysis stopped surfacing items, so
+  every review arrived with an empty list and the only thing the section produced was a banner
+  announcing its own emptiness — "No review items" — directly above the documented rules that carry
+  the actual result. The rules are the review, and they are unchanged: what this change breaks,
+  restores, leaves holding or finds already broken, along with the note when a doc edit retires or
+  restores rules. A review that ran and has rules to show now goes straight to them.
+- Two states are kept, because each says something the rules cannot. "No review recorded" still
+  distinguishes a review that never ran from one that ran and found nothing, and "Nothing surfaced
+  for review" still reports documented-rule findings that were recorded but held below the bar.
+
 ## 1.4.0
 
 - The diagram no longer waits for the architecture review. It used to be held back for up to two and

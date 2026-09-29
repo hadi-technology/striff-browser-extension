@@ -169,9 +169,8 @@ async function downloadRepoZipAsArrayBuffer(owner, repo, ref, apiBase) {
   const t = abortableTimeout(60000);
   let filtered = null;
   try {
-    // no-cache because `ref` is usually a branch and therefore moves. A stale archive would be
-    // analysed and reported as the current revision, which is wrong rather than merely old.
-    const res = await fetch(url, { signal: t.signal, cache: 'no-cache' });
+    // `ref` is a commit, so the archive at it never changes and the HTTP cache may serve it.
+    const res = await fetch(url, { signal: t.signal });
     if (!res.ok) return { ok: false, status: res.status, error: `Failed to download zip: ${res.status}` };
     if (utils && res.body && typeof utils.filterZipStream === 'function') {
       filtered = await utils.filterZipStream(res.body, manifest, {
@@ -684,13 +683,13 @@ const handlers = {
   },
   generateStriffs: async (msg, { safeReply }) => {
     const {
-      baseOwner, baseRepo, baseBranch,
+      baseOwner, baseRepo, baseRef,
       changedFiles = [],
       changedFilesStorageKey = '',
       pullRequest = null
     } = msg;
 
-    if (!baseOwner || !baseRepo || !baseBranch) {
+    if (!baseOwner || !baseRepo || !baseRef) {
       safeReply({ ok: false, error: 'missing repo/ref args' });
       return;
     }
@@ -706,7 +705,7 @@ const handlers = {
     }
 
     debugLog('generateStriffs start', {
-      baseOwner, baseRepo, baseBranch,
+      baseOwner, baseRepo, baseRef,
       changedFilesCount: Array.isArray(effectiveChangedFiles) ? effectiveChangedFiles.length : 0,
       changedFilesPreview: Array.isArray(effectiveChangedFiles) ? effectiveChangedFiles.slice(0, 10).map((f) => ({
         path: f?.path || '',
@@ -719,7 +718,7 @@ const handlers = {
     const downloadStart = Date.now();
     const beforeStarted = Date.now();
     const apiBaseForZip = await getApiBase();
-    const before = await downloadRepoZipAsArrayBuffer(baseOwner, baseRepo, baseBranch, apiBaseForZip);
+    const before = await downloadRepoZipAsArrayBuffer(baseOwner, baseRepo, baseRef, apiBaseForZip);
     before.durationMs = Date.now() - beforeStarted;
     const downloadDurationMs = Date.now() - downloadStart;
 
