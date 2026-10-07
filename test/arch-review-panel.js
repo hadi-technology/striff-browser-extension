@@ -35,6 +35,7 @@ const fs = require('fs');
 const SRC = fs.readFileSync(path.resolve(__dirname, '..', 'src', 'striffs.js'), 'utf8');
 // Loaded ahead of the content script, as the manifest does.
 const REVIEW_STATE_SRC = fs.readFileSync(path.resolve(__dirname, '..', 'src', 'review-state-utils.js'), 'utf8');
+const INLINE_MARKDOWN_SRC = fs.readFileSync(path.resolve(__dirname, '..', 'src', 'inline-markdown-utils.js'), 'utf8');
 
 let failures = 0;
 let passes = 0;
@@ -143,6 +144,7 @@ const DETECTOR_TRACES = ['STRUCTURAL CHECKS', '✅ clean', '👀', '❗', 'obser
     };
   });
   await page.addScriptTag({ content: REVIEW_STATE_SRC });
+  await page.addScriptTag({ content: INLINE_MARKDOWN_SRC });
   await page.addScriptTag({ content: SRC });
 
   const ready = await page.evaluate(() => typeof window.Striffs?.openArchReviewPanel === 'function');

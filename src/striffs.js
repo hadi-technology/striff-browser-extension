@@ -6835,6 +6835,13 @@
         color:var(--fgColor-muted,#6e7781);
         overflow-wrap:anywhere;
       }
+      .striffs-arch-review-panel__checked{
+        font-weight:600;
+        color:var(--fgColor-default,#1f2328);
+        box-shadow:inset 0 -0.42em 0 var(--bgColor-accent-muted,rgba(84,174,255,0.25));
+        -webkit-box-decoration-break:clone;
+        box-decoration-break:clone;
+      }
       .striffs-arch-review-panel__advisory-note{
         font-size:12px;
         line-height:1.45;
@@ -7737,20 +7744,18 @@
   }
 
   /**
-   * A rule's sentence with the words the rule checks in bold. The server sends them as UTF-16
-   * offsets into the quote it sends (checkedFrom/checkedTo), verified against that quote and never
-   * cutting a code span; anything that does not fit shows the sentence plain, as before.
+   * A rule's sentence as the reader should see it: its inline Markdown read rather than shown, and
+   * the words the rule checks in bold. The server sends those words as UTF-16 offsets into the raw
+   * quote (checkedFrom/checkedTo); the renderer applies them per visible character, so a span inside
+   * or across the document's own bold never breaks a pair of marks. No span shows the sentence plain.
    */
   function quoteWithCheckedWords(v) {
-    const quote = v.quote || "";
-    const from = v.checkedFrom;
-    const to = v.checkedTo;
-    const fits = Number.isInteger(from) && Number.isInteger(to) && from >= 0 && to > from
-      && to <= quote.length;
-    if (!fits) return escHtmlWithCode(quote);
-    return escHtmlWithCode(quote.slice(0, from))
-      + `<strong class="striffs-arch-review-panel__checked">${escHtmlWithCode(quote.slice(from, to))}</strong>`
-      + escHtmlWithCode(quote.slice(to));
+    return globalThis.StriffsInlineMarkdown.inlineMarkdownHtml(v.quote || "", {
+      checkedFrom: v.checkedFrom,
+      checkedTo: v.checkedTo,
+      codeClass: "striffs-arch-review-panel__code",
+      checkedClass: "striffs-arch-review-panel__checked",
+    });
   }
 
   // Finding kinds that come from the repository's documented rules. Older API versions also send
