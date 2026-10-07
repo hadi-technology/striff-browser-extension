@@ -6756,6 +6756,14 @@
         font-size:36px;
         margin-bottom:12px;
       }
+      .striffs-arch-review-panel__repo-rules > summary{
+        cursor:pointer;
+      }
+      .striffs-arch-review-panel__repo-rules-count{
+        text-transform:none;
+        letter-spacing:0;
+        font-weight:400;
+      }
       .striffs-arch-review-panel__section-note{
         font-size:12px;
         line-height:1.45;
@@ -7732,8 +7740,12 @@
     return d.innerHTML;
   }
 
+  // Rule statements are quoted out of Markdown docs, so one can arrive as `**Never ...**`. Code
+  // spans and bold are rendered; bold markers inside a code span stay literal.
   function escHtmlWithCode(s) {
-    return escHtml(s).replace(/`([^`]+)`/g, '<code class="striffs-arch-review-panel__code">$1</code>');
+    return escHtml(s).split(/(`[^`]+`)/g).map((part, i) => i % 2
+      ? `<code class="striffs-arch-review-panel__code">${part.slice(1, -1)}</code>`
+      : part.replace(/\*\*(?=\S)(.+?)(?<=\S)\*\*/g, "<strong>$1</strong>")).join("");
   }
 
   // Finding kinds that come from the repository's documented rules. Older API versions also send
@@ -7769,10 +7781,24 @@
   // A rule the review could not check -- UNCLEAR, or any status this extension does not know -- is not
   // shown at all, and so can never be shown as holding.
   const SHOWN_RULE_STATUSES = new Set(["VIOLATED", "RESTORED", "PRE_EXISTING", "MAINTAINED"]);
+
   function shownVerdicts(result) {
     const verdicts = Array.isArray(result?.docFactVerdicts) ? result.docFactVerdicts : [];
     return verdicts.filter(v => v && SHOWN_RULE_STATUSES.has(String(v.status || "").trim().toUpperCase()));
   }
+
+  // Whether a shown rule is about the code this PR touched. A rule it broke or restored is, by
+  // construction. One that holds, or was already broken, is only when the change came near it --
+  // as the check run decides which held rules take a row: "not broken by this change" says nothing
+  // about a rule the change never approached, and a README's worth of such rows buries the one that
+  // fired. Those go to the rest of the repository instead. touchesChange is absent on older
+  // records, which read as touched -- the server's bias too.
+  function isAboutThisChange(v) {
+    const status = String(v?.status || "").trim().toUpperCase();
+    return status === "VIOLATED" || status === "RESTORED" || v.touchesChange !== false;
+  }
+  const changeVerdicts = (result) => shownVerdicts(result).filter(isAboutThisChange);
+  const repoVerdicts = (result) => shownVerdicts(result).filter(v => !isAboutThisChange(v));
 
   // Documented rules a doc edit retired or restored, grouped by doc in the order they arrive.
   // Optional: older API versions do not send it. Informational: a retired rule is one its doc no
@@ -7823,38 +7849,16 @@
     }).join("");
   }
 
-  /**
-   * The repository's own documentation, and how this change fared against it.
-   *
-   * One list, because there is now one kind of row: every rule here was quoted out of the docs and
-   * judged by the model against this change. An earlier design split these into a deterministically
-   * checked tier and a judged tier; the server collapsed them, and the split left behind here went
-   * on filtering for a `tier` and a `RAISED` status that no longer arrive -- so every row, including
-   * violations, rendered as "nothing stood out".
-   *
-   * Four outcomes are shown: broken by this change, restored by it, already broken, and holding. The
-   * review is best-effort, and a reader is shown what it checked, not what it could not: a rule it
-   * could not check is left out. Above all, such a rule never renders as holding -- an abstention
-   * shown as a pass is a clean bill of health nobody earned. "Already broken" stays distinct from
-   * "holds" for the same reason.
-   *
-   * Absent entirely when no rule is shown and no doc edit changed any -- an empty section implies the
-   * docs were consulted and found silent, which is a different claim from not having consulted them.
-   */
-  function buildDocumentedRulesHtml(result) {
-    const verdicts = shownVerdicts(result);
-    const changes = docRuleChangesByDoc(result);
-    if (verdicts.length === 0 && changes.length === 0) return "";
+  // What this PR did, together: what it broke, then what it fixed. Then the debt it inherited,
+  // then what it left standing -- the check run's order, so the two surfaces do not disagree about
+  // what matters.
+  const RULE_ORDER = { VIOLATED: 0, RESTORED: 1, PRE_EXISTING: 2, MAINTAINED: 3 };
+  const ruleStatusOf = v => String(v.status || "").trim().toUpperCase();
 
-    // What this PR did, together: what it broke, then what it fixed. Then the debt it inherited,
-    // then what it left standing -- the check run's order, so the two surfaces do not disagree about
-    // what matters.
-    const ORDER = { VIOLATED: 0, RESTORED: 1, PRE_EXISTING: 2, MAINTAINED: 3 };
-    const statusOf = v => String(v.status || "").trim().toUpperCase();
-    const sorted = verdicts.slice().sort((a, b) => ORDER[statusOf(a)] - ORDER[statusOf(b)]);
-
-    const html = sorted.map(v => {
-      const status = statusOf(v);
+  function buildRuleRowsHtml(verdicts) {
+    const sorted = verdicts.slice().sort((a, b) => RULE_ORDER[ruleStatusOf(a)] - RULE_ORDER[ruleStatusOf(b)]);
+    return sorted.map(v => {
+      const status = ruleStatusOf(v);
       const violated = status === "VIOLATED";
       const alreadyBroken = status === "PRE_EXISTING";
       // RESTORED: the document asserted something the code lacked, and this change supplied it.
@@ -7878,31 +7882,85 @@
           ${detail ? `<div class="striffs-arch-review-panel__rule-detail">${escHtmlWithCode(detail)}</div>` : ""}
         </div>`;
     }).join("");
-
-    const note = verdicts.length
-      ? `<div class="striffs-arch-review-panel__section-note">Rules quoted from this repository's own docs and checked against the dependency graph this PR produces. A rule shown as holding is not broken by this PR, which says nothing about the rest of the codebase; one shown as already broken is broken in the code checked, but not by this PR; one shown as restored was broken before this PR and is not now.</div>`
-      : "";
-    return `<div class="striffs-arch-review-panel__section">
-      <div class="striffs-arch-review-panel__section-title">Documented Rules</div>
-      ${note}
-      ${html}
-      ${buildDocRuleChangesHtml(changes)}
-    </div>`;
   }
 
   /**
-   * Counts over the documented rules the panel shows; the findings button shows the total. Pure -- no
-   * DOM, no side effects -- so it can be unit-tested directly.
+   * The repository's own documentation, and how this change fared against it.
+   *
+   * One kind of row: every rule here was quoted out of the docs and judged by the model against
+   * this change. An earlier design split these into a deterministically checked tier and a judged
+   * tier; the server collapsed them, and the split left behind here went on filtering for a `tier`
+   * and a `RAISED` status that no longer arrive -- so every row, including violations, rendered as
+   * "nothing stood out".
+   *
+   * Four outcomes are shown: broken by this change, restored by it, already broken, and holding. The
+   * review is best-effort, and a reader is shown what it checked, not what it could not: a rule it
+   * could not check is left out. Above all, such a rule never renders as holding -- an abstention
+   * shown as a pass is a clean bill of health nobody earned. "Already broken" stays distinct from
+   * "holds" for the same reason.
+   *
+   * Two sections. This pull request comes first: what it broke or restored, and the rules about the
+   * code it touched. The rest of the repository follows, collapsed: rules from the same docs about
+   * code the change never came near. They were checked, so they are not hidden, but they are not
+   * what a reviewer opened the panel for -- on yegor256/takes#1733 they were 41 rows of README
+   * claims about classes the PR did not touch, and nothing about the three it did. Only documents
+   * bearing on the change are read at all, so the second section is never the whole repository's
+   * docs, and says so.
+   *
+   * Absent entirely when no rule is shown and no doc edit changed any -- an empty section implies the
+   * docs were consulted and found silent, which is a different claim from not having consulted them.
+   */
+  function buildDocumentedRulesHtml(result) {
+    const mine = changeVerdicts(result);
+    const rest = repoVerdicts(result);
+    const changes = docRuleChangesByDoc(result);
+    let out = "";
+
+    if (mine.length > 0 || changes.length > 0) {
+      const note = mine.length
+        ? `<div class="striffs-arch-review-panel__section-note">Rules from this repository's docs about the code this PR touches. “Holds” means this PR doesn't break it.</div>`
+        : "";
+      out += `<div class="striffs-arch-review-panel__section">
+      <div class="striffs-arch-review-panel__section-title">Documented Rules — This Pull Request</div>
+      ${note}
+      ${buildRuleRowsHtml(mine)}
+      ${buildDocRuleChangesHtml(changes)}
+    </div>`;
+    }
+
+    if (rest.length > 0) {
+      const brokenCount = rest.filter(v => ruleStatusOf(v) === "PRE_EXISTING").length;
+      const heldCount = rest.length - brokenCount;
+      const counts = [
+        brokenCount ? `${brokenCount} already broken` : "",
+        heldCount ? `${heldCount} hold${heldCount === 1 ? "s" : ""}` : ""
+      ].filter(Boolean).join(", ");
+      out += `<details class="striffs-arch-review-panel__section striffs-arch-review-panel__repo-rules">
+      <summary class="striffs-arch-review-panel__section-title">Documented Rules — Rest of the Repository <span class="striffs-arch-review-panel__repo-rules-count">(${counts})</span></summary>
+      <div class="striffs-arch-review-panel__section-note">Rules from the same docs about code this PR does not touch. Only the docs that bear on this change were read, so this is not every rule in the repository.</div>
+      ${buildRuleRowsHtml(rest)}
+    </details>`;
+    }
+    return out;
+  }
+
+  /**
+   * Counts over the documented rules the panel shows for this pull request; the findings button
+   * shows the total. Pure -- no DOM, no side effects, nothing from outside it -- so it can be
+   * unit-tested directly.
    *
    * A shown rule is "at risk" when VIOLATED (broken by this change) or PRE_EXISTING (already broken),
    * and "upheld" when MAINTAINED (holds) or RESTORED (fixed by this change). A rule the review could
-   * not check is not shown, so it is not counted either.
+   * not check is not shown, so it is not counted either; nor is one in the rest-of-the-repository
+   * section -- held or already broken, about code the change never came near (isAboutThisChange).
    */
   function computeDocRuleCoverage(result) {
     const verdicts = Array.isArray(result?.docFactVerdicts) ? result.docFactVerdicts.filter(Boolean) : [];
     let atRisk = 0, upheld = 0;
     for (const v of verdicts) {
       const status = String(v?.status || "").trim().toUpperCase();
+      const aboutThisChange = status === "VIOLATED" || status === "RESTORED" || v.touchesChange !== false;
+      if (!aboutThisChange) continue;
       if (status === "VIOLATED" || status === "PRE_EXISTING") atRisk += 1;
       else if (status === "MAINTAINED" || status === "RESTORED") upheld += 1;
     }
@@ -7950,21 +8008,19 @@
           ? "1 documented-rule finding was recorded, but it did not meet the bar to raise here."
           : `${heldBack} documented-rule findings were recorded, but none met the bar to raise here.`}</div>
       </div>`;
-    } else if (shownVerdicts(result).length > 0) {
-      // The rules' own verdict, in one line. This is what the removed "No review items" banner was
-      // actually carrying: its icon was decided by the rules, not by the items it was named after --
-      // a tick only when every rule shown holds, and a dash the moment one does not, so a clean
-      // result is never claimed over a rule this change breaks or left already broken. Dropping it
-      // with the items would have taken the summary with the section that never had anything in it.
-      const atRisk = computeDocRuleCoverage(result).atRisk > 0;
+    } else if (changeVerdicts(result).length === 0 && repoVerdicts(result).length > 0) {
+      // Every rule checked is about code this change never came near. Saying so keeps "the docs were
+      // checked" distinct from "this repository has no docs", which an empty top section blurs. The
+      // tick is withheld when any of them is already broken: true of the PR, but not a clean result.
+      const rest = repoVerdicts(result);
+      const anyBroken = rest.some(v => ruleStatusOf(v) === "PRE_EXISTING");
       bodyHtml += `<div class="striffs-arch-review-panel__good">
-        <div class="striffs-arch-review-panel__good-icon">${atRisk ? "–" : "✓"}</div>
-        <div style="font-size:15px;font-weight:600;margin-bottom:6px;">${atRisk
-          ? "Documented rules at risk"
-          : "Documented rules hold"}</div>
-        <div>${atRisk
-          ? "This changeset is checked against this repository's docs below."
-          : "Every documented rule checked against this changeset still holds."}</div>
+        <div class="striffs-arch-review-panel__good-icon">${anyBroken ? "–" : "✓"}</div>
+        <div style="font-size:15px;font-weight:600;margin-bottom:6px;">No documented rule is about this change</div>
+        <div>${rest.length === 1
+          ? "1 documented rule from this repository's docs was checked, and this change does not break it."
+          : `${rest.length} documented rules from this repository's docs were checked, and this change breaks none of them.`}
+          ${rest.length === 1 ? "It is" : "They are"} about code this change does not touch, so ${rest.length === 1 ? "it is" : "they are"} listed under the rest of the repository.</div>
       </div>`;
     }
 

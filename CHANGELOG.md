@@ -8,6 +8,16 @@
   kept-content-exceeds-ceiling", which offered no token and skipped the token route for a user who
   already had one. The upload carries the whole repository's source, not only the changed files, so
   a pull request of three files can still be over it.
+- The architecture review splits documented rules in two: this pull request first, with what it
+  broke or restored and the rules about the code it touches, and the rest of the repository below,
+  collapsed, with the rules from the same docs about code it never came near. The findings button
+  counts only the first. Every rule from a doc the change bore on used to be listed and counted
+  together, so yegor256/takes#1733 showed "Findings (41 rules)" for 41 README claims that held,
+  none about the three classes it edited. The GitHub check run already left those rules out.
+- The "Documented rules hold" banner is gone, and the note above the rules is one sentence. The
+  rows already say what held and what broke.
+- Bold in a documented rule (`**…**`, quoted from the doc's Markdown) renders as bold instead of
+  showing the asterisks.
 
 ## 1.5.0
 

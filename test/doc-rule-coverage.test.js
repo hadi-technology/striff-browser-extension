@@ -69,3 +69,18 @@ test('computeDocRuleCoverage never counts an unchecked rule as upheld', () => {
   const c = computeDocRuleCoverage({ docFactVerdicts: [{ status: 'MAINTAINED' }, { status: 'UNCLEAR' }] });
   assert.deepEqual(c, { total: 1, atRisk: 0, upheld: 1 });
 });
+
+test('computeDocRuleCoverage counts only this pull request\'s rules, not the rest of the repository\'s', () => {
+  const c = computeDocRuleCoverage({
+    docFactVerdicts: [
+      { status: 'MAINTAINED', touchesChange: false }, // rest of the repository
+      { status: 'PRE_EXISTING', touchesChange: false }, // rest of the repository
+      { status: 'MAINTAINED', touchesChange: true },
+      { status: 'MAINTAINED' }, // older record without the flag: read as touched
+      { status: 'PRE_EXISTING', touchesChange: true },
+      { status: 'VIOLATED', touchesChange: false }, // this PR's by construction
+      { status: 'RESTORED', touchesChange: false },
+    ],
+  });
+  assert.deepEqual(c, { total: 5, atRisk: 2, upheld: 3 });
+});
