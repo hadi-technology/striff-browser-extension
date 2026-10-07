@@ -1,13 +1,7 @@
 # Changelog
 
-## 1.5.1
+## 1.6.0
 
-- A repository with more source and documentation than the upload limit allows is now reported as
-  too large, with a prompt to connect a GitHub token, and a saved token is used automatically. When
-  the repository was far enough over the limit, the refusal left as "Failed reading repository zip:
-  kept-content-exceeds-ceiling", which offered no token and skipped the token route for a user who
-  already had one. The upload carries the whole repository's source, not only the changed files, so
-  a pull request of three files can still be over it.
 - The architecture review splits documented rules in two: this pull request first, with what it
   broke or restored and the rules about the code it touches, and the rest of the repository below,
   collapsed, with the rules from the same docs about code it never came near. The findings button
@@ -20,6 +14,15 @@
   showing the asterisks.
 - The popup's install button opens the GitHub App at its new address, github.com/apps/striffs. The
   old one, github.com/apps/striff-app, no longer exists.
+
+## 1.5.1
+
+- A repository with more source and documentation than the upload limit allows is now reported as
+  too large, with a prompt to connect a GitHub token, and a saved token is used automatically. When
+  the repository was far enough over the limit, the refusal left as "Failed reading repository zip:
+  kept-content-exceeds-ceiling", which offered no token and skipped the token route for a user who
+  already had one. The upload carries the whole repository's source, not only the changed files, so
+  a pull request of three files can still be over it.
 
 ## 1.5.0
 
