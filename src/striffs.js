@@ -7736,6 +7736,23 @@
     return escHtml(s).replace(/`([^`]+)`/g, '<code class="striffs-arch-review-panel__code">$1</code>');
   }
 
+  /**
+   * A rule's sentence with the words the rule checks in bold. The server sends them as UTF-16
+   * offsets into the quote it sends (checkedFrom/checkedTo), verified against that quote and never
+   * cutting a code span; anything that does not fit shows the sentence plain, as before.
+   */
+  function quoteWithCheckedWords(v) {
+    const quote = v.quote || "";
+    const from = v.checkedFrom;
+    const to = v.checkedTo;
+    const fits = Number.isInteger(from) && Number.isInteger(to) && from >= 0 && to > from
+      && to <= quote.length;
+    if (!fits) return escHtmlWithCode(quote);
+    return escHtmlWithCode(quote.slice(0, from))
+      + `<strong class="striffs-arch-review-panel__checked">${escHtmlWithCode(quote.slice(from, to))}</strong>`
+      + escHtmlWithCode(quote.slice(to));
+  }
+
   // Finding kinds that come from the repository's documented rules. Older API versions also send
   // structural-detector findings in the same array; the panel no longer shows those, so a finding
   // of any other kind is ignored. DOC_DEPENDENCY_RULE is an earlier name for a documented-rule
@@ -7866,16 +7883,16 @@
         : "✅ holds";
       // A pre-existing violation carries its witnessing edges too -- they are the whole value of
       // the row. The last entry is the edge; the first is the explanatory note.
-      const detail = (violated || alreadyBroken || restored) && Array.isArray(v.evidence) && v.evidence.length > 0
-        ? v.evidence[v.evidence.length - 1]
-        : v.quote;
+      const witnessed = (violated || alreadyBroken || restored) && Array.isArray(v.evidence) && v.evidence.length > 0;
+      const detail = witnessed ? escHtmlWithCode(v.evidence[v.evidence.length - 1])
+        : v.quote ? quoteWithCheckedWords(v) : "";
       return `<div class="striffs-arch-review-panel__rule striffs-arch-review-panel__rule--${modifier}">
           <div class="striffs-arch-review-panel__rule-head">
             <span class="striffs-arch-review-panel__rule-verdict">${verdict}</span>
             <span class="striffs-arch-review-panel__rule-source">${escHtml(shortDocPath(v.sourceDocPath))}</span>
           </div>
           <div class="striffs-arch-review-panel__rule-statement">${escHtmlWithCode(v.statement || "")}</div>
-          ${detail ? `<div class="striffs-arch-review-panel__rule-detail">${escHtmlWithCode(detail)}</div>` : ""}
+          ${detail ? `<div class="striffs-arch-review-panel__rule-detail">${detail}</div>` : ""}
         </div>`;
     }).join("");
 
