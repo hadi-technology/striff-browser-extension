@@ -3,7 +3,7 @@
 const DEBUG_KEY = "striffsDebug";
 // GitHub's own install flow for the App. /installations/new picks the account or organisation to
 // install onto; it sends a signed-out user through the login first and back here afterwards.
-const APP_INSTALL_URL = "https://github.com/apps/striff-app/installations/new";
+const APP_INSTALL_URL = "https://github.com/apps/striffs/installations/new";
 const shared = window.StriffsUiShared;
 
 // Status display

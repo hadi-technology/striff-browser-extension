@@ -18,6 +18,8 @@
   rows already say what held and what broke.
 - Bold in a documented rule (`**…**`, quoted from the doc's Markdown) renders as bold instead of
   showing the asterisks.
+- The popup's install button opens the GitHub App at its new address, github.com/apps/striffs. The
+  old one, github.com/apps/striff-app, no longer exists.
 
 ## 1.5.0
 
