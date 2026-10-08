@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.6.1
+
+- A documented rule's sentence is shown whole, with the words the rule actually checks in bold, so
+  a reader can tell which part of the sentence the verdict is about. Where Striff can't place those
+  words in the sentence, it is shown plain, as before.
+- The sentence's own Markdown (bold, emphasis, code, links) is rendered instead of showing the
+  asterisks, backticks and brackets.
+
 ## 1.6.0
 
 - The architecture review splits documented rules in two: this pull request first, with what it
@@ -10,11 +18,8 @@
   none about the three classes it edited. The GitHub check run already left those rules out.
 - The "Documented rules hold" banner is gone, and the note above the rules is one sentence. The
   rows already say what held and what broke.
-- A documented rule's sentence is shown whole, with the words the rule actually checks in bold, so
-  a reader can tell which part of the sentence the verdict is about. Where Striff can't place those
-  words in the sentence, it is shown plain, as before.
-- The sentence's own Markdown (bold, emphasis, code, links) is rendered instead of showing the
-  asterisks, backticks and brackets.
+- Bold in a documented rule (`**…**`, quoted from the doc's Markdown) renders as bold instead of
+  showing the asterisks.
 - The popup's install button opens the GitHub App at its new address, github.com/apps/striffs. The
   old one, github.com/apps/striff-app, no longer exists.
 
