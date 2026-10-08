@@ -6843,6 +6843,13 @@
         color:var(--fgColor-muted,#6e7781);
         overflow-wrap:anywhere;
       }
+      .striffs-arch-review-panel__checked{
+        font-weight:600;
+        color:var(--fgColor-default,#1f2328);
+        box-shadow:inset 0 -0.42em 0 var(--bgColor-accent-muted,rgba(84,174,255,0.25));
+        -webkit-box-decoration-break:clone;
+        box-decoration-break:clone;
+      }
       .striffs-arch-review-panel__advisory-note{
         font-size:12px;
         line-height:1.45;
@@ -7748,6 +7755,21 @@
       : part.replace(/\*\*(?=\S)(.+?)(?<=\S)\*\*/g, "<strong>$1</strong>")).join("");
   }
 
+  /**
+   * A rule's sentence as the reader should see it: its inline Markdown read rather than shown, and
+   * the words the rule checks in bold. The server sends those words as UTF-16 offsets into the raw
+   * quote (checkedFrom/checkedTo); the renderer applies them per visible character, so a span inside
+   * or across the document's own bold never breaks a pair of marks. No span shows the sentence plain.
+   */
+  function quoteWithCheckedWords(v) {
+    return globalThis.StriffsInlineMarkdown.inlineMarkdownHtml(v.quote || "", {
+      checkedFrom: v.checkedFrom,
+      checkedTo: v.checkedTo,
+      codeClass: "striffs-arch-review-panel__code",
+      checkedClass: "striffs-arch-review-panel__checked",
+    });
+  }
+
   // Finding kinds that come from the repository's documented rules. Older API versions also send
   // structural-detector findings in the same array; the panel no longer shows those, so a finding
   // of any other kind is ignored. DOC_DEPENDENCY_RULE is an earlier name for a documented-rule
@@ -7870,16 +7892,16 @@
         : "✅ holds";
       // A pre-existing violation carries its witnessing edges too -- they are the whole value of
       // the row. The last entry is the edge; the first is the explanatory note.
-      const detail = (violated || alreadyBroken || restored) && Array.isArray(v.evidence) && v.evidence.length > 0
-        ? v.evidence[v.evidence.length - 1]
-        : v.quote;
+      const witnessed = (violated || alreadyBroken || restored) && Array.isArray(v.evidence) && v.evidence.length > 0;
+      const detail = witnessed ? escHtmlWithCode(v.evidence[v.evidence.length - 1])
+        : v.quote ? quoteWithCheckedWords(v) : "";
       return `<div class="striffs-arch-review-panel__rule striffs-arch-review-panel__rule--${modifier}">
           <div class="striffs-arch-review-panel__rule-head">
             <span class="striffs-arch-review-panel__rule-verdict">${verdict}</span>
             <span class="striffs-arch-review-panel__rule-source">${escHtml(shortDocPath(v.sourceDocPath))}</span>
           </div>
           <div class="striffs-arch-review-panel__rule-statement">${escHtmlWithCode(v.statement || "")}</div>
-          ${detail ? `<div class="striffs-arch-review-panel__rule-detail">${escHtmlWithCode(detail)}</div>` : ""}
+          ${detail ? `<div class="striffs-arch-review-panel__rule-detail">${detail}</div>` : ""}
         </div>`;
     }).join("");
   }

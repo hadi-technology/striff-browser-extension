@@ -31,6 +31,7 @@
         "src/striffs-config-utils.js",
         "src/plantuml-utils.js",
         "src/review-state-utils.js",
+        "src/inline-markdown-utils.js",
         "src/striffs.js"
       ],
       "run_at": "document_idle"
