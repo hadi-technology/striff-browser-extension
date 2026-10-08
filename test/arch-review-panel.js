@@ -35,6 +35,7 @@ const fs = require('fs');
 const SRC = fs.readFileSync(path.resolve(__dirname, '..', 'src', 'striffs.js'), 'utf8');
 // Loaded ahead of the content script, as the manifest does.
 const REVIEW_STATE_SRC = fs.readFileSync(path.resolve(__dirname, '..', 'src', 'review-state-utils.js'), 'utf8');
+const INLINE_MARKDOWN_SRC = fs.readFileSync(path.resolve(__dirname, '..', 'src', 'inline-markdown-utils.js'), 'utf8');
 
 let failures = 0;
 let passes = 0;
@@ -143,6 +144,7 @@ const DETECTOR_TRACES = ['STRUCTURAL CHECKS', '✅ clean', '👀', '❗', 'obser
     };
   });
   await page.addScriptTag({ content: REVIEW_STATE_SRC });
+  await page.addScriptTag({ content: INLINE_MARKDOWN_SRC });
   await page.addScriptTag({ content: SRC });
 
   const ready = await page.evaluate(() => typeof window.Striffs?.openArchReviewPanel === 'function');
@@ -203,11 +205,7 @@ const DETECTOR_TRACES = ['STRUCTURAL CHECKS', '✅ clean', '👀', '❗', 'obser
         && text.indexOf('✨ restored by this change') < text.indexOf('✅ holds'));
     // "Holds" is a claim about this pull request only, never about the rest of the codebase.
     check('the section defines holding as not broken by this PR',
-      text.includes('A rule shown as holding is not broken by this PR, which says nothing about the rest of the codebase')
-        && text.includes('one shown as already broken is broken in the code checked, but not by this PR')
-        && !/anywhere/i.test(text), text);
-    check('the section says it checked the dependency graph',
-      text.includes('dependency graph this PR produces'));
+      text.includes('“Holds” means this PR doesn\'t break it.') && !/anywhere/i.test(text), text);
     check('source doc shown as basename only', text.includes('adr-001-layering.md') && !text.includes('docs/architecture/adr-001'));
     check('no structural checks section', detectorTracesIn(text).length === 0, detectorTracesIn(text).join(', '));
   }
@@ -680,19 +678,63 @@ const DETECTOR_TRACES = ['STRUCTURAL CHECKS', '✅ clean', '👀', '❗', 'obser
     check('and never as holding', !onlyUnchecked.text.includes('✅') && !onlyUnchecked.text.includes('✓'), onlyUnchecked.text);
 
     // Docs that could not be read and rules that could not be re-checked are not reported, and do not
-    // stand in the way of a clean result: the tick is decided by the rules shown.
+    // add a banner over the rules: the rows say what held and what broke.
     const gaps = { docsUnread: ['docs/a.md'], docsNotRechecked: [{ docPath: 'docs/rules.md', ruleCount: 2 }] };
     const allHeld = await render({ ...CURRENT, surfacedItems: [], findings: [], docFactVerdicts: [DOC_VERDICTS[0]], ...gaps });
     check('no warning about unread docs or rules not re-checked',
       !/could not be read|re-checked|unread/i.test(allHeld.text), allHeld.text);
-    check('rules that all held earn their tick', allHeld.text.includes('✓'), allHeld.text);
+    check('rules that all held show as rows, with no banner over them', allHeld.text.includes('✅ holds')
+      && !allHeld.text.includes('Documented rules hold') && !allHeld.text.includes('✓'), allHeld.text);
     const broken = await render({ ...CURRENT, surfacedItems: [], findings: [], ...gaps });
-    check('a broken rule still withholds it', !broken.text.includes('✓'), broken.text);
+    check('a broken rule shows as its row, with no banner either', broken.text.includes('❌ broken by this change')
+      && !broken.text.includes('Documented rules at risk') && !broken.text.includes('✓'), broken.text);
 
     const loaded = await loadSettled({ result: analysis('PENDING', gaps), replies: [readyReply(CURRENT)] }, 'Findings (');
     check('the findings button counts only the rules shown', loaded.text === 'Findings (4 rules)' && !loaded.disabled, loaded.text);
     check('and its tooltip says nothing of what was not checked',
       !/could not be read|re-checked|unread/i.test(loaded.title), loaded.title);
+  }
+
+  console.log('\nrules about this pull request come first; the rest of the repository below, collapsed');
+  {
+    // yegor256/takes#1733: a README's worth of rules, all holding, none about what the PR edited.
+    const far = { ...DOC_VERDICTS[0], factId: 'f1', statement: 'FtBasic implements Front', touchesChange: false };
+    const near = { ...DOC_VERDICTS[0], factId: 'f2', statement: 'Printable is a contract', touchesChange: true };
+    const farBroken = { ...DOC_VERDICTS[3], factId: 'f4', statement: 'every take is final', touchesChange: false };
+    const quiet = { ...CURRENT, surfacedItems: [], findings: [] };
+    const repoSection = (html) => {
+      const d = document.createElement('div');
+      d.innerHTML = html;
+      const el = d.querySelector('.striffs-arch-review-panel__repo-rules');
+      return el ? { open: el.open, text: el.textContent } : null;
+    };
+
+    const mixed = await render({ ...quiet, docFactVerdicts: [far, near, DOC_VERDICTS[1], farBroken, DOC_VERDICTS[2]] });
+    const top = mixed.text.split('DOCUMENTED RULES — REST OF THE REPOSITORY')[0];
+    check('this PR\'s section holds what it broke and the rules about what it touched',
+      top.includes('DOCUMENTED RULES — THIS PULL REQUEST') && top.includes('❌ broken by this change')
+        && top.includes('Printable is a contract') && !top.includes('FtBasic implements Front'), mixed.text);
+    const rest = await page.evaluate(repoSection, mixed.html);
+    check('the rest of the repository is collapsed, with its counts on the summary', rest && !rest.open
+      && mixed.text.includes('DOCUMENTED RULES — REST OF THE REPOSITORY (1 already broken, 1 holds)'), mixed.text);
+    check('and holds the rules about code the PR does not touch', rest
+      && rest.text.includes('FtBasic implements Front') && rest.text.includes('every take is final')
+      && !rest.text.includes('Printable is a contract'), rest && rest.text);
+    check('with rules about this PR, no banner sits above them', !mixed.text.includes('Documented rules at risk')
+      && !mixed.text.includes('No documented rule is about this change'), mixed.text);
+
+    const onlyFar = await render({ ...quiet, docFactVerdicts: [far, { ...far, factId: 'f3' }, DOC_VERDICTS[2]] });
+    check('with nothing about this PR, there is no section for it',
+      !onlyFar.text.includes('THIS PULL REQUEST') && onlyFar.text.includes('REST OF THE REPOSITORY (2 hold)'), onlyFar.text);
+    check('and the banner says the rules were checked, counting only those that held',
+      onlyFar.text.includes('2 documented rules from this repository\'s docs were checked, and this change breaks none of them.')
+        && onlyFar.text.includes('✓'), onlyFar.text);
+    const farOnlyBroken = await render({ ...quiet, docFactVerdicts: [far, farBroken] });
+    check('but withholds the tick when one of them is already broken', !farOnlyBroken.text.includes('✓'), farOnlyBroken.text);
+
+    const loaded = await loadSettled({ result: analysis('PENDING'), replies: [readyReply({ ...quiet,
+      docFactVerdicts: [far, farBroken, near, DOC_VERDICTS[1]] })] }, 'Findings (');
+    check('the findings button counts this PR\'s rules only', loaded.text === 'Findings (2 rules)', loaded.text);
   }
 
   console.log('\ndocumented rules a doc edit retired or restored');
@@ -718,7 +760,8 @@ const DETECTOR_TRACES = ['STRUCTURAL CHECKS', '✅ clean', '👀', '❗', 'obser
 
     const allHeld = await render({ ...CURRENT, surfacedItems: [], findings: [],
       docFactVerdicts: [DOC_VERDICTS[0]], docRuleChanges: CHANGES });
-    check('it is a note, not a failure: a clean result keeps its tick', allHeld.text.includes('✓'), allHeld.text);
+    check('it is a note, not a failure: a clean result stays clean', allHeld.text.includes('✅ holds')
+      && !allHeld.text.includes('❌'), allHeld.text);
 
     const none = await render({ ...QUIET, docRuleChanges: CHANGES.slice(0, 1) });
     check('shows the note even when no rule was evaluated', none.text.includes('DOCUMENTED RULES')

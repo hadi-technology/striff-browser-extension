@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Striffs for GitHub",
   "description": "An architecture diagram of every GitHub pull request, checked against the rules in the repository's own docs.",
-  "version": "1.5.1",
+  "version": "1.6.0",
   "minimum_chrome_version": "111",
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self'"
@@ -31,6 +31,7 @@
         "src/striffs-config-utils.js",
         "src/plantuml-utils.js",
         "src/review-state-utils.js",
+        "src/inline-markdown-utils.js",
         "src/striffs.js"
       ],
       "run_at": "document_idle"

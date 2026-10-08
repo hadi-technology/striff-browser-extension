@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.6.0
+
+- The architecture review splits documented rules in two: this pull request first, with what it
+  broke or restored and the rules about the code it touches, and the rest of the repository below,
+  collapsed, with the rules from the same docs about code it never came near. The findings button
+  counts only the first. Every rule from a doc the change bore on used to be listed and counted
+  together, so yegor256/takes#1733 showed "Findings (41 rules)" for 41 README claims that held,
+  none about the three classes it edited. The GitHub check run already left those rules out.
+- The "Documented rules hold" banner is gone, and the note above the rules is one sentence. The
+  rows already say what held and what broke.
+- A documented rule's sentence is shown whole, with the words the rule actually checks in bold, so
+  a reader can tell which part of the sentence the verdict is about. Where Striff can't place those
+  words in the sentence, it is shown plain, as before.
+- The sentence's own Markdown (bold, emphasis, code, links) is rendered instead of showing the
+  asterisks, backticks and brackets.
+- The popup's install button opens the GitHub App at its new address, github.com/apps/striffs. The
+  old one, github.com/apps/striff-app, no longer exists.
+
 ## 1.5.1
 
 - A repository with more source and documentation than the upload limit allows is now reported as
