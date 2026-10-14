@@ -1140,7 +1140,24 @@ const setRemoteConfigUrlData = async (jsonObj) => {
     return buttonsOk;
   };
 
+  // GitHub's /changes page re-renders its whole toolbar ~0.5s after the first paint, and the
+  // extension remounts its buttons into the new one. A click in that window lands on a button
+  // that is about to be detached, so wait until the same button has stayed attached for a while.
+  const waitForSettledStriffsButton = async (settleMs = 1500, timeoutMs = 10000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const btn = await page.$('#striffs-btn');
+      if (btn) {
+        await page.waitForTimeout(settleMs);
+        if (await btn.evaluate((el) => el.isConnected && el === document.getElementById('striffs-btn')).catch(() => false)) return;
+      } else {
+        await page.waitForTimeout(250);
+      }
+    }
+  };
+
   const clickStriffsButton = async (label) => {
+    await waitForSettledStriffsButton();
     await page.click('#striffs-btn', { timeout: 5000 }).catch(async () => {
       let buttonsOk = await ensureButtonsRendered(label, { softFail: true });
       if (!buttonsOk && NEW_UI) {
@@ -4373,7 +4390,8 @@ const setRemoteConfigUrlData = async (jsonObj) => {
     await page.waitForFunction(() => {
       return Boolean(window.Striffs?.__striffsReady && window.Striffs?.__striffsSvg);
     }, undefined, { timeout: 15000 }).catch(() => null);
-    await sBtn.click();
+    // Not sBtn: GitHub may have replaced the toolbar (and the button with it) since it was found.
+    await page.click('#striffs-btn', { timeout: 5000 });
     await page.waitForFunction(() => {
       const el = document.querySelector('#striff-diagram-view');
       const svg = el?.querySelector('svg');
@@ -4404,7 +4422,19 @@ const setRemoteConfigUrlData = async (jsonObj) => {
   });
 
   if (!initialRects) {
-    fail('Resize check unavailable (missing view/svg)');
+    const viewState = await page.evaluate(() => {
+      const view = document.querySelector('#striff-diagram-view');
+      return {
+        href: location.href,
+        views: document.querySelectorAll('#striff-diagram-view').length,
+        parent: view?.parentElement ? `${view.parentElement.tagName.toLowerCase()}#${view.parentElement.id}[${view.parentElement.getAttribute('data-testid') || ''}]` : null,
+        display: view ? getComputedStyle(view).display : null,
+        width: view?.offsetWidth ?? null,
+        activeBtn: document.querySelector('.is-active')?.id || null,
+        content: (view?.querySelector('#striffs-content')?.innerHTML || '').slice(0, 160)
+      };
+    }).catch((e) => ({ error: String(e?.message || e) }));
+    fail(`Resize check unavailable (missing view/svg) ${JSON.stringify(viewState)}`);
   } else {
     await page.setViewportSize({ width: 1200, height: 720 });
     await page.waitForTimeout(500);
