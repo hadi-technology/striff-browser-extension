@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.6.2
+
+- On GitHub's new "Files changed" page (`/changes`), the diagram opens in place of the diffs again.
+  GitHub renamed the page's diff classes, so the extension stopped finding the diffs, left them on
+  screen, and mounted the diagram inside the file tree on the left, where it was squeezed into the
+  sidebar and its comment panel covered its own buttons.
+
 ## 1.6.1
 
 - A documented rule's sentence is shown whole, with the words the rule actually checks in bold, so
