@@ -237,10 +237,11 @@
       '[data-testid="file-diff-split"]',
       '[data-testid="file-diff-unified"]',
       'div[class*="Diff-module__diff"]',
+      'div[data-testid="progressive-diffs-list"] > div:not(#striff-diagram-view)',
       '.js-diff-progressive-container',
       'div.js-file[data-file-type="file"]'
     ],
-    newUiDiff: 'div[class*="Diff-module__diff"], .js-diff-progressive-container, div.js-file[data-file-type="file"]',
+    newUiDiff: 'div[class*="Diff-module__diff"], div[data-testid="progressive-diffs-list"] > div:not(#striff-diagram-view), .js-diff-progressive-container, div.js-file[data-file-type="file"]',
     fileLinks: [
       ".file-info a.Link--primary",
       '[data-testid="file-header"] a.Link--primary',
@@ -2807,6 +2808,10 @@
     // ---------- Containers / Show-Hide ----------
 
     function getNewUIDiffWrapper() {
+        // /changes (2026-10): CSS-module classes lost their "Diff-module__" prefix
+        // (now e.g. diffEntry__YLOXdm); the diffs list keeps a stable test id.
+        const list = document.querySelector('div[data-testid="progressive-diffs-list"]');
+        if (list) return list;
         const diff = document.querySelector('div[class*="Diff-module__diff"]');
         if (!diff) return null;
 
@@ -2827,7 +2832,6 @@
             'div[data-testid="files-changed"]',
             'div[data-view-component="true"][data-testid="pull-requests-files"]',
             'main[aria-label="Content"] #files',
-            '#pr-file-tree',
         ]);
 
     S.getStriffsScrollMarkup = (contentHtml = '<p>Loading Striffs...</p>') => `
